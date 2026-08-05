@@ -1,0 +1,124 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  market-data-service:
+    build: ./services/market-data-service
+    ports:
+      - "8001:8001"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+
+  technical-analysis-service:
+    build: ./services/technical-analysis-service
+    ports:
+      - "8002:8002"
+    environment:
+      MARKET_DATA_URL: http://market-data-service:8001
+    depends_on:
+      - market-data-service
+
+  fundamental-analysis-service:
+    build: ./services/fundamental-analysis-service
+    ports:
+      - "8003:8003"
+    environment:
+      MARKET_DATA_URL: http://market-data-service:8001
+    depends_on:
+      - market-data-service
+
+  news-intelligence-service:
+    build: ./services/news-intelligence-service
+    ports:
+      - "8005:8005"
+
+  event-tracker-service:
+    build: ./services/event-tracker-service
+    ports:
+      - "8006:8006"
+    volumes:
+      - ./data/event-tracker:/app/state
+
+  prediction-service:
+    build: ./services/prediction-service
+    ports:
+      - "8007:8007"
+    environment:
+      MARKET_DATA_URL: http://market-data-service:8001
+    volumes:
+      - ./data/prediction-model:/app/model-store
+    depends_on:
+      - market-data-service
+    # Model file lives at services/prediction-service/model.pkl after you run:
+    #   docker compose run --rm prediction-service python train.py
+    # Until then, /predict returns an honest "model not trained yet" response.
+
+  notification-service:
+    build: ./services/notification-service
+    ports:
+      - "8008:8008"
+    environment:
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+
+  decision-engine-service:
+    build: ./services/decision-engine-service
+    ports:
+      - "8004:8004"
+    environment:
+      TECHNICAL_URL: http://technical-analysis-service:8002
+      FUNDAMENTAL_URL: http://fundamental-analysis-service:8003
+      NEWS_URL: http://news-intelligence-service:8005
+      EVENT_URL: http://event-tracker-service:8006
+      PREDICTION_URL: http://prediction-service:8007
+    depends_on:
+      - technical-analysis-service
+      - fundamental-analysis-service
+      - news-intelligence-service
+      - event-tracker-service
+      - prediction-service
+
+  api-gateway:
+    build: ./services/api-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      DECISION_URL: http://decision-engine-service:8004
+    depends_on:
+      - decision-engine-service
+
+  scheduler-service:
+    build: ./services/scheduler-service
+    environment:
+      API_GATEWAY_URL: http://api-gateway:8000
+      EVENT_TRACKER_URL: http://event-tracker-service:8006
+      NOTIFICATION_URL: http://notification-service:8008
+      SCAN_INTERVAL_MINUTES: "30"
+    volumes:
+      - ./reports:/app/reports
+    depends_on:
+      - api-gateway
+      - event-tracker-service
+      - notification-service
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:8000
+    depends_on:
+      - api-gateway
