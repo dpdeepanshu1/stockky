@@ -100,10 +100,14 @@ def get_quote(symbol: str):
 
     try:
         ticker = yf.Ticker(sym)
+        ticker._tz = "Asia/Kolkata"
         info = ticker.fast_info
         full_info = {}
         try:
+            try:
             full_info = ticker.info
+        except Exception:
+            full_info = {}
         except Exception:
             pass  # fast_info is enough to still return a usable quote
 
@@ -147,7 +151,9 @@ def get_history(
         return cached
 
     try:
-        df = yf.Ticker(sym).history(period=period, interval=interval)
+        ticker = yf.Ticker(sym)
+        ticker._tz = "Asia/Kolkata"  # pre-set NSE timezone, avoids a Yahoo API call that fails on cold start
+        df = ticker.history(period=period, interval=interval, auto_adjust=True)
         if df.empty:
             raise HTTPException(status_code=404, detail=f"No history found for {sym}")
 
