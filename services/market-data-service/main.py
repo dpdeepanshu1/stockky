@@ -25,8 +25,8 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("market-data-service")
 
-UPSTASH_URL   = os.getenv("https://adapted-lion-167573.upstash.io")
-UPSTASH_TOKEN = os.getenv("gQAAAAAAAo6VAAIgcDEzN2UwNWRkYmYwMWU0OWE4YjYxYjY1ZDQ5NWM2ZDgxMw")
+UPSTASH_URL   = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 min
 
 app = FastAPI(title="Stockky Market Data Service", version="0.1.0")
