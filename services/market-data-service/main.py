@@ -104,7 +104,6 @@ def get_quote(symbol: str):
         info = ticker.fast_info
         full_info = {}
         try:
-            try:
             full_info = ticker.info
         except Exception:
             full_info = {}
