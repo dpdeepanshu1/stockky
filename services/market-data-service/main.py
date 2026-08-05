@@ -103,7 +103,7 @@ def get_quote(symbol: str):
         info = ticker.fast_info
         full_info = {}
         try:
-            full_info = ticker.get_info()
+            full_info = ticker.info
         except Exception:
             pass  # fast_info is enough to still return a usable quote
 
@@ -183,7 +183,7 @@ def get_fundamentals_raw(symbol: str):
         return cached
 
     try:
-        info = yf.Ticker(sym).get_info()
+        info = yf.Ticker(sym).info
         if not info:
             raise HTTPException(status_code=404, detail=f"No fundamentals for {sym}")
 
