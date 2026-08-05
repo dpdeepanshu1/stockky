@@ -16,7 +16,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
-import redis
+from upstash_redis import Redis
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +25,8 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("market-data-service")
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+UPSTASH_URL   = os.getenv("https://adapted-lion-167573.upstash.io")
+UPSTASH_TOKEN = os.getenv("gQAAAAAAAo6VAAIgcDEzN2UwNWRkYmYwMWU0OWE4YjYxYjY1ZDQ5NWM2ZDgxMw")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 min
 
 app = FastAPI(title="Stockky Market Data Service", version="0.1.0")
@@ -37,10 +38,13 @@ app.add_middleware(
 )
 
 try:
-    cache = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    cache.ping()
-    logger.info("Connected to Redis at %s", REDIS_URL)
-except Exception as e:  # pragma: no cover - degrade gracefully without cache
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        cache = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+        cache.ping()
+        logger.info("Connected to Upstash Redis")
+    else:
+        raise ValueError("Upstash credentials not set")
+except Exception as e:
     logger.warning("Redis unavailable (%s). Running without cache.", e)
     cache = None
 
