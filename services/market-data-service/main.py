@@ -13,6 +13,7 @@ import os
 import time
 import json
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -22,12 +23,20 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+def _safe(val, decimals=2):
+    try:
+        f = float(val)
+        return round(f, decimals) if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        return None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("market-data-service")
 
 UPSTASH_URL   = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 min
+
 
 app = FastAPI(title="Stockky Market Data Service", version="0.1.0")
 app.add_middleware(
@@ -157,16 +166,17 @@ def get_history(
             raise HTTPException(status_code=404, detail=f"No history found for {sym}")
 
         candles = [
-            {
-                "date": idx.strftime("%Y-%m-%d %H:%M"),
-                "open": round(row["Open"], 2),
-                "high": round(row["High"], 2),
-                "low": round(row["Low"], 2),
-                "close": round(row["Close"], 2),
-                "volume": int(row["Volume"]),
-            }
-            for idx, row in df.iterrows()
-        ]
+    {
+        "date": idx.strftime("%Y-%m-%d %H:%M"),
+        "open": _safe(row["Open"]),
+        "high": _safe(row["High"]),
+        "low": _safe(row["Low"]),
+        "close": _safe(row["Close"]),
+        "volume": int(row["Volume"]) if math.isfinite(float(row["Volume"])) else 0,
+    }
+    for idx, row in df.iterrows()
+    if _safe(row["Close"]) is not None  # skip entirely broken rows
+]
         result = {"symbol": sym, "period": period, "interval": interval, "candles": candles}
         _cache_set(cache_key, result, ttl=900)  # history changes less often
         return result
