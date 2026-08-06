@@ -23,20 +23,24 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+
 def _safe(val, decimals=2):
+    """Convert to float, round, handle NaN/Inf."""
     try:
         f = float(val)
-        return round(f, decimals) if math.isfinite(f) else None
+        if math.isnan(f) or not math.isfinite(f):
+            return None
+        return round(f, decimals)
     except (TypeError, ValueError):
         return None
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("market-data-service")
 
-UPSTASH_URL   = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 min
-
 
 app = FastAPI(title="Stockky Market Data Service", version="0.1.0")
 app.add_middleware(
@@ -46,6 +50,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- Redis cache ----------
 try:
     if UPSTASH_URL and UPSTASH_TOKEN:
         cache = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
@@ -93,6 +98,24 @@ class QuoteResponse(BaseModel):
     fetched_at: str
 
 
+# ---------- ROOT ROUTE ----------
+@app.get("/")
+async def root():
+    return {
+        "service": "Stockky Market Data Service",
+        "version": "0.1.0",
+        "status": "running",
+        "cache_enabled": bool(cache),
+        "endpoints": {
+            "/health": "GET – health check",
+            "/quote/{symbol}": "GET – latest quote",
+            "/history/{symbol}": "GET – OHLCV candles (period, interval)",
+            "/fundamentals/{symbol}": "GET – raw fundamental data",
+            "/docs": "Swagger UI documentation",
+        },
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "market-data-service", "cache": bool(cache)}
@@ -114,8 +137,6 @@ def get_quote(symbol: str):
         full_info = {}
         try:
             full_info = ticker.info
-        except Exception:
-            full_info = {}
         except Exception:
             pass  # fast_info is enough to still return a usable quote
 
@@ -160,26 +181,33 @@ def get_history(
 
     try:
         ticker = yf.Ticker(sym)
-        ticker._tz = "Asia/Kolkata"  # pre-set NSE timezone, avoids a Yahoo API call that fails on cold start
+        ticker._tz = "Asia/Kolkata"
         df = ticker.history(period=period, interval=interval, auto_adjust=True)
+
         if df.empty:
             raise HTTPException(status_code=404, detail=f"No history found for {sym}")
 
-        candles = [
-    {
-        "date": idx.strftime("%Y-%m-%d %H:%M"),
-        "open": _safe(row["Open"]),
-        "high": _safe(row["High"]),
-        "low": _safe(row["Low"]),
-        "close": _safe(row["Close"]),
-        "volume": int(row["Volume"]) if math.isfinite(float(row["Volume"])) else 0,
-    }
-    for idx, row in df.iterrows()
-    if _safe(row["Close"]) is not None  # skip entirely broken rows
-]
+        candles = []
+        for idx, row in df.iterrows():
+            # Skip rows where Close is NaN (bad data)
+            if _safe(row["Close"]) is None:
+                continue
+            candles.append({
+                "date": idx.strftime("%Y-%m-%d %H:%M"),
+                "open": _safe(row["Open"]),
+                "high": _safe(row["High"]),
+                "low": _safe(row["Low"]),
+                "close": _safe(row["Close"]),
+                "volume": int(row["Volume"]) if math.isfinite(float(row["Volume"])) else 0,
+            })
+
+        if not candles:
+            raise HTTPException(status_code=404, detail=f"No valid candles for {sym}")
+
         result = {"symbol": sym, "period": period, "interval": interval, "candles": candles}
         _cache_set(cache_key, result, ttl=900)  # history changes less often
         return result
+
     except HTTPException:
         raise
     except Exception as e:
@@ -233,4 +261,6 @@ def get_fundamentals_raw(symbol: str):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
+    # Render provides $PORT – always use it
+    port = int(os.environ.get("PORT", 8001))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
