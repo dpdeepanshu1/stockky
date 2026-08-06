@@ -20,6 +20,7 @@ import os
 import json
 import math
 import logging
+from upstash_redis import Redis
 from datetime import datetime
 from typing import List
 
@@ -43,12 +44,10 @@ try:
         token=os.getenv("UPSTASH_REDIS_REST_TOKEN"),
     )
     _redis.ping()
-    logger.info("Connected to Upstash Redis")
 except Exception as e:
-    logger.warning("Redis unavailable — state will not persist across restarts: %s", e)
+    logger.warning("Redis unavailable, state will not persist: %s", e)
 
 STATE_KEY = "stockky:event_state"
-
 
 def _load_state() -> dict:
     if _redis:
@@ -56,19 +55,17 @@ def _load_state() -> dict:
             val = _redis.get(STATE_KEY)
             if val:
                 return json.loads(val)
-        except Exception as e:
-            logger.warning("Failed to load state from Redis: %s", e)
+        except Exception:
+            pass
     return {"subscriptions": [], "last_known": {}}
-
 
 def _save_state(state: dict):
     if _redis:
         try:
             _redis.set(STATE_KEY, json.dumps(state, default=str))
         except Exception as e:
-            logger.warning("Failed to save state to Redis: %s", e)
-
-
+            logger.warning("Failed to persist state: %s", e)
+            
 # ── Helpers ────────────────────────────────────────────────────────────────────
 class SubscribeRequest(BaseModel):
     symbols: List[str]
