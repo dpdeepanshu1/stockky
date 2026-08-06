@@ -4,7 +4,6 @@ import Pipeline from "./components/Pipeline";
 import DecisionCard from "./components/DecisionCard";
 import ScanPanel from "./components/ScanPanel";
 import WatchlistManager from "./components/WatchlistManager";
-import NotificationsPanel from "./components/NotificationsPanel";
 
 type ViewState =
   | { mode: "idle" }
