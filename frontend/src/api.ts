@@ -1,4 +1,5 @@
-const STORAGE_KEY = "stockky:api_url";
+const STORAGE_KEY = "https://api-gateway-wizr.onrender.com";
+const DEFAULT_API_URL = import.meta.env.VITE_API_URL || "https://api-gateway-wizr.onrender.com";
 
 /**
  * Vite bakes VITE_API_URL into the static bundle at BUILD time. If the
@@ -13,7 +14,7 @@ const STORAGE_KEY = "stockky:api_url";
 export function getApiUrl(): string {
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored) return stored;
-  return (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+  return DEFAULT_API_URL.replace(/\/$/, "");
 }
 
 export function setApiUrl(url: string) {
