@@ -1,22 +1,25 @@
 """
 Technical Analysis Service
 ---------------------------
-Single responsibility: turn OHLCV candles into a technical score (0-100)
-plus the underlying indicator values and a human-readable list of reasons.
-Now fetches data directly from Yahoo Finance (no external service dependency).
+Single responsibility: turn OHLCV candles (fetched from Market Data Service)
+into a technical score (0-100) plus the underlying indicator values and a
+human-readable list of reasons. The Decision Engine consumes this score —
+this service never makes a buy/sell call itself.
 """
 import os
 import logging
 from typing import List
 
+import httpx
 import pandas as pd
-import yfinance as yf
 import ta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("technical-analysis-service")
+
+MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data-service:8001")
 
 app = FastAPI(title="Stockky Technical Analysis Service", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -28,25 +31,21 @@ def health():
 
 
 def _fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
-    """
-    Fetch OHLCV data directly from Yahoo Finance.
-    Tries .NS suffix for NSE stocks, falls back to plain symbol.
-    """
-    tickers = [f"{symbol}.NS", f"{symbol}.BO", symbol]
-    df = pd.DataFrame()
-    for ticker in tickers:
-        try:
-            df = yf.download(ticker, period=period, interval="1d",
-                             auto_adjust=True, progress=False, threads=False)
-            if not df.empty and "Close" in df.columns:
-                logger.info("Fetched %s from yfinance using %s", symbol, ticker)
-                break
-        except Exception:
-            continue
-    if df.empty:
-        raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
-    # Rename columns to title case for consistency
-    df.rename(columns=str.title, inplace=True)
+    try:
+        resp = httpx.get(f"{MARKET_DATA_URL}/history/{symbol}", params={"period": period}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Market data service unreachable: {e}")
+
+    candles = data.get("candles", [])
+    if len(candles) < 30:
+        raise HTTPException(status_code=422, detail="Not enough history to compute indicators")
+
+    df = pd.DataFrame(candles)
+    df["date"] = pd.to_datetime(df["date"])
+    df.set_index("date", inplace=True)
+    df.rename(columns=str.title, inplace=True)  # Open/High/Low/Close/Volume
     return df
 
 
@@ -187,5 +186,4 @@ def analyze(symbol: str):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8002))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=True)
