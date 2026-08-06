@@ -5,3 +5,6 @@ __pycache__/
 reports/*.json
 dist/
 .DS_Store
+.venv/
+venv/
+*.egg-info/
