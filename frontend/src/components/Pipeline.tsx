@@ -1,72 +1,68 @@
 import { useEffect, useState } from "react";
 
 const STAGES = [
-  "Market data collection",
-  "Validation",
-  "Fundamental analysis",
-  "Technical analysis",
-  "Decision synthesis",
+  { label: "Market data", detail: "Fetching live price & history" },
+  { label: "Technical analysis", detail: "RSI, MACD, EMA, ADX…" },
+  { label: "Fundamental analysis", detail: "P/E, P/B, growth, valuation…" },
+  { label: "News intelligence", detail: "Sentiment scoring" },
+  { label: "AI prediction", detail: "XGBoost model inference" },
+  { label: "Decision synthesis", detail: "Combining all signals" },
 ];
 
 export default function Pipeline({ running }: { running: boolean }) {
   const [activeIndex, setActiveIndex] = useState(-1);
 
   useEffect(() => {
-    if (!running) {
-      setActiveIndex(-1);
-      return;
-    }
+    if (!running) { setActiveIndex(-1); return; }
     setActiveIndex(0);
     const interval = setInterval(() => {
       setActiveIndex((i) => {
-        if (i >= STAGES.length - 1) {
-          clearInterval(interval);
-          return i;
-        }
+        if (i >= STAGES.length - 1) { clearInterval(interval); return i; }
         return i + 1;
       });
-    }, 380);
+    }, 420);
     return () => clearInterval(interval);
   }, [running]);
 
   return (
     <div className="flex flex-col gap-0">
       {STAGES.map((stage, i) => {
-        const state = !running ? "idle" : i < activeIndex ? "done" : i === activeIndex ? "running" : "waiting";
+        const state = !running
+          ? "idle"
+          : i < activeIndex
+          ? "done"
+          : i === activeIndex
+          ? "running"
+          : "waiting";
         return (
-          <div key={stage} className="flex items-center gap-3 py-1.5">
-            <div className="flex flex-col items-center">
-              <span
-                className={
-                  "h-2 w-2 rounded-full transition-all duration-300 " +
-                  (state === "done"
-                    ? "bg-signal-buy scale-100"
-                    : state === "running"
-                    ? "bg-signal-prepare scale-125 animate-pulse"
-                    : "bg-slate scale-90")
-                }
-              />
+          <div key={stage.label} className="flex items-start gap-3 py-2">
+            <div className="flex flex-col items-center pt-0.5">
+              <span className={
+                "h-2 w-2 rounded-full transition-all duration-300 " +
+                (state === "done" ? "bg-signal-buy" :
+                 state === "running" ? "bg-signal-prepare animate-pulse scale-125" :
+                 "bg-slate")
+              } />
               {i < STAGES.length - 1 && (
-                <span
-                  className={
-                    "w-px h-6 transition-colors duration-300 " +
-                    (state === "done" ? "bg-signal-buy/50" : "bg-slate")
-                  }
-                />
+                <span className={
+                  "w-px h-6 mt-1 transition-colors duration-500 " +
+                  (state === "done" ? "bg-signal-buy/40" : "bg-slate/40")
+                } />
               )}
             </div>
-            <span
-              className={
+            <div>
+              <div className={
                 "font-mono text-xs tracking-wide transition-colors duration-300 " +
-                (state === "done"
-                  ? "text-mist"
-                  : state === "running"
-                  ? "text-paper"
-                  : "text-mist/40")
-              }
-            >
-              {stage}
-            </span>
+                (state === "done" ? "text-mist" :
+                 state === "running" ? "text-paper" :
+                 "text-mist/30")
+              }>
+                {stage.label}
+              </div>
+              {state === "running" && (
+                <div className="font-mono text-[10px] text-mist/50 mt-0.5">{stage.detail}</div>
+              )}
+            </div>
           </div>
         );
       })}

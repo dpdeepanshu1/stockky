@@ -47,9 +47,17 @@ async function handle<T>(res: Response): Promise<T> {
 
 export const api = {
   getStock: (symbol: string, alreadyOwned = false) =>
-    fetch(`${API_URL}/stock/${symbol}?already_owned=${alreadyOwned}`).then((r) => handle<Decision>(r)),
-
-  runScan: () => fetch(`${API_URL}/scan`).then((r) => handle<ScanResult>(r)),
-
-  getWatchlist: () => fetch(`${API_URL}/watchlist`).then((r) => handle<{ symbols: string[] }>(r)),
+    fetch(`${API_URL}/stock/${symbol}?already_owned=${alreadyOwned}`).then((r) =>
+      handle<Decision>(r)
+    ),
+  runScan: () =>
+    fetch(`${API_URL}/scan`).then((r) => handle<ScanResult>(r)),
+  getWatchlist: () =>
+    fetch(`${API_URL}/watchlist`).then((r) => handle<{ symbols: string[] }>(r)),
+  setWatchlist: (symbols: string[]) =>
+    fetch(`${API_URL}/watchlist`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbols }),
+    }).then((r) => handle<{ symbols: string[] }>(r)),
 };
