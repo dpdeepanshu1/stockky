@@ -45,6 +45,24 @@ else:
     logger.warning("No trained model found at %s — run train.py first. Serving fallback responses.", MODEL_PATH)
 
 
+# ---------- ROOT ROUTE ----------
+@app.get("/")
+async def root():
+    return {
+        "service": "Stockky Prediction Service",
+        "version": "0.1.0",
+        "status": "running",
+        "model_loaded": _model is not None,
+        "endpoints": {
+            "/health": "GET – health check",
+            "/predict/{symbol}": "GET – get prediction for a symbol",
+            "/docs": "Swagger UI documentation",
+            "/openapi.json": "OpenAPI schema"
+        },
+        "note": "If model is not loaded, prediction returns a neutral fallback (no signal). Run 'python train.py' to train the model."
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "prediction-service", "model_loaded": _model is not None}
