@@ -1,31 +1,19 @@
 version: "3.9"
-
 services:
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   market-data-service:
     build: ./services/market-data-service
     ports:
       - "8001:8001"
     environment:
-      REDIS_URL: redis://redis:6379/0
-    depends_on:
-      - redis
+      UPSTASH_REDIS_REST_URL: "https://adapted-lion-167573.upstash.io"
+      UPSTASH_REDIS_REST_TOKEN: "gQAAAAAAAo6VAAIgcDEzN2UwNWRkYmYwMWU0OWE4YjYxYjY1ZDQ5NWM2ZDgxMw"
 
   technical-analysis-service:
     build: ./services/technical-analysis-service
     ports:
       - "8002:8002"
     environment:
-      MARKET_DATA_URL: http://market-data-service:8001
+      MARKET_DATA_URL: https://stockky-market-data.onrender.com
     depends_on:
       - market-data-service
 
@@ -34,7 +22,7 @@ services:
     ports:
       - "8003:8003"
     environment:
-      MARKET_DATA_URL: http://market-data-service:8001
+      MARKET_DATA_URL: https://stockky-market-data.onrender.com
     depends_on:
       - market-data-service
 
@@ -47,22 +35,20 @@ services:
     build: ./services/event-tracker-service
     ports:
       - "8006:8006"
-    volumes:
-      - ./data/event-tracker:/app/state
+    environment:
+      UPSTASH_REDIS_REST_URL: "https://adapted-lion-167573.upstash.io"
+      UPSTASH_REDIS_REST_TOKEN: "gQAAAAAAAo6VAAIgcDEzN2UwNWRkYmYwMWU0OWE4YjYxYjY1ZDQ5NWM2ZDgxMw"
 
   prediction-service:
     build: ./services/prediction-service
     ports:
       - "8007:8007"
     environment:
-      MARKET_DATA_URL: http://market-data-service:8001
+      MARKET_DATA_URL: https://stockky-market-data.onrender.com
     volumes:
       - ./data/prediction-model:/app/model-store
     depends_on:
       - market-data-service
-    # Model file lives at services/prediction-service/model.pkl after you run:
-    #   docker compose run --rm prediction-service python train.py
-    # Until then, /predict returns an honest "model not trained yet" response.
 
   notification-service:
     build: ./services/notification-service
@@ -73,17 +59,19 @@ services:
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      UPSTASH_REDIS_REST_URL: "https://adapted-lion-167573.upstash.io"
+      UPSTASH_REDIS_REST_TOKEN: "gQAAAAAAAo6VAAIgcDEzN2UwNWRkYmYwMWU0OWE4YjYxYjY1ZDQ5NWM2ZDgxMw"
 
   decision-engine-service:
     build: ./services/decision-engine-service
     ports:
       - "8004:8004"
     environment:
-      TECHNICAL_URL: http://technical-analysis-service:8002
-      FUNDAMENTAL_URL: http://fundamental-analysis-service:8003
-      NEWS_URL: http://news-intelligence-service:8005
-      EVENT_URL: http://event-tracker-service:8006
-      PREDICTION_URL: http://prediction-service:8007
+      TECHNICAL_URL: https://technical-analysis-service-zhnc.onrender.com
+      FUNDAMENTAL_URL: https://fundamental-analysis-service.onrender.com
+      NEWS_URL: https://news-intelligence-service.onrender.com
+      EVENT_URL: https://event-tracker-service-m1lw.onrender.com
+      PREDICTION_URL: https://prediction-service-wowb.onrender.com
     depends_on:
       - technical-analysis-service
       - fundamental-analysis-service
@@ -96,16 +84,20 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DECISION_URL: http://decision-engine-service:8004
+      DECISION_URL: https://decision-engine-service-0hg6.onrender.com
+      NOTIFICATION_URL: https://notification-service-36py.onrender.com
+      UPSTASH_REDIS_REST_URL: "https://adapted-lion-167573.upstash.io"
+      UPSTASH_REDIS_REST_TOKEN: "gQAAAAAAAo6VAAIgcDEzN2UwNWRkYmYwMWU0OWE4YjYxYjY1ZDQ5NWM2ZDgxMw"
     depends_on:
       - decision-engine-service
+      - notification-service
 
   scheduler-service:
     build: ./services/scheduler-service
     environment:
-      API_GATEWAY_URL: http://api-gateway:8000
-      EVENT_TRACKER_URL: http://event-tracker-service:8006
-      NOTIFICATION_URL: http://notification-service:8008
+      API_GATEWAY_URL: https://api-gateway-wizr.onrender.com
+      EVENT_TRACKER_URL: https://event-tracker-service-m1lw.onrender.com
+      NOTIFICATION_URL: https://notification-service-36py.onrender.com
       SCAN_INTERVAL_MINUTES: "30"
     volumes:
       - ./reports:/app/reports
@@ -119,6 +111,6 @@ services:
     ports:
       - "5173:5173"
     environment:
-      VITE_API_URL: http://localhost:8000
+      VITE_API_URL: https://api-gateway-wizr.onrender.com
     depends_on:
       - api-gateway
