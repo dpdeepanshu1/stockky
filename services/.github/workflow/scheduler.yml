@@ -1,0 +1,32 @@
+name: Stockky Scheduler
+
+on:
+  schedule:
+    # Every 30 min, 02:00-11:30 UTC = 07:30-17:00 IST, Mon-Fri.
+    # run_once.py itself only acts within 08:15-16:30 IST, so the extra
+    # ticks near the edges of this window are harmless no-ops — this is
+    # just here to comfortably cover the whole trading day.
+    - cron: "0,30 2-11 * * 1-5"
+  workflow_dispatch: {} # lets you trigger a run manually from the Actions tab
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r services/scheduler-service/requirements.txt
+
+      - name: Run scheduler tick
+        env:
+          API_GATEWAY_URL: ${{ secrets.API_GATEWAY_URL }}
+          EVENT_TRACKER_URL: ${{ secrets.EVENT_TRACKER_URL }}
+          NOTIFICATION_URL: ${{ secrets.NOTIFICATION_URL }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python services/scheduler-service/run_once.py
