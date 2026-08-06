@@ -36,11 +36,11 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("decision-engine-service")
 
-TECHNICAL_URL = os.getenv("TECHNICAL_URL", "http://technical-analysis-service:8002")
-FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "http://fundamental-analysis-service:8003")
-NEWS_URL = os.getenv("NEWS_URL", "http://news-intelligence-service:8005")
-EVENT_URL = os.getenv("EVENT_URL", "http://event-tracker-service:8006")
-PREDICTION_URL = os.getenv("PREDICTION_URL", "http://prediction-service:8007")
+TECHNICAL_URL = os.getenv("TECHNICAL_URL", "https://technical-analysis-service-zhnc.onrender.com")
+FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-service.onrender.com")
+NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")
+EVENT_URL = os.getenv("EVENT_URL", "https://event-tracker-service-m1lw.onrender.com")
+PREDICTION_URL = os.getenv("PREDICTION_URL", "https://prediction-service-wowb.onrender.com")
 
 EVENT_RISK_WINDOW_DAYS = 3  # downgrade BUY NOW if earnings are this close
 

@@ -18,7 +18,7 @@ from upstash_redis import Redis
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api-gateway")
 
-DECISION_URL = os.getenv("DECISION_URL", "http://decision-engine-service:8004")
+DECISION_URL = os.getenv("DECISION_URL", "https://decision-engine-service-0hg6.onrender.com")
 
 app = FastAPI(title="Stockky API Gateway", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])

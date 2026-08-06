@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("technical-analysis-service")
 
-MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data-service:8001")
+MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
 
 app = FastAPI(title="Stockky Technical Analysis Service", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
