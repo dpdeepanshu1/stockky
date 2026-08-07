@@ -33,8 +33,8 @@ API_GATEWAY_URL   = os.getenv("API_GATEWAY_URL",   "https://api-gateway-wizr.onr
 EVENT_TRACKER_URL = os.getenv("EVENT_TRACKER_URL", "https://event-tracker-service-m1lw.onrender.com")
 NOTIFICATION_URL  = os.getenv("NOTIFICATION_URL",  "https://notification-service-36py.onrender.com")
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
-REPORTS_DIR  = os.getenv("REPORTS_DIR", "/app/reports")
-STATE_PATH   = os.getenv("SCHEDULER_STATE_PATH", "/app/reports/last_decisions.json")
+REPORTS_DIR  = os.getenv("REPORTS_DIR", "/tmp/reports")
+STATE_PATH   = os.getenv("SCHEDULER_STATE_PATH", "/tmp/reports/last_decisions.json")
 IST = ZoneInfo("Asia/Kolkata")
 
 SCAN_WINDOW_START = dtime(8, 15)   # 1hr before market open (09:15 IST)
