@@ -4,8 +4,8 @@ Scheduler Service
 Single responsibility: trigger the API Gateway's /scan on a timer during
 Indian market hours, detect decision changes worth notifying about, poll
 the Event Tracker for material corporate events, and write the end-of-day
-report. This service has no HTTP API of its own — it's a background worker
-container.
+report. This service now runs as a web service (with FastAPI) so it can
+bind to a port — the scheduler runs in a background thread.
 
 Market hours (NSE): 09:15-15:30 IST. Per the spec, scans run from 1 hour
 before open to 1 hour after close, every 30-60 minutes.
@@ -20,11 +20,14 @@ instances never spin down during the day.
 import os
 import json
 import logging
+import threading
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 import httpx
-from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import FastAPI
+import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scheduler-service")
@@ -58,6 +61,14 @@ KEEPALIVE_ENDPOINTS = [
 ]
 
 
+# ---------- FastAPI app ----------
+app = FastAPI(title="Stockky Scheduler Service", version="1.0.0")
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "scheduler-service"}
+
+# ---------- Job functions (unchanged) ----------
 def within_market_window(now: datetime) -> bool:
     if now.weekday() >= 5:  # Sat/Sun — NSE closed
         return False
@@ -110,7 +121,6 @@ def _check_decision_changes(all_results: list):
     _save_last_decisions(current)
 
 
-# ── Keep-alive ─────────────────────────────────────────────────────────────────
 def run_keepalive_job():
     """Ping every service health endpoint every 14 minutes.
     Render free tier spins down after 15 minutes of inactivity —
@@ -126,7 +136,6 @@ def run_keepalive_job():
     logger.info("Keep-alive ping at %s IST: %s", now.strftime("%H:%M"), " | ".join(results))
 
 
-# ── Market scan ────────────────────────────────────────────────────────────────
 def run_scan_job():
     now = datetime.now(IST)
     if not within_market_window(now):
@@ -143,7 +152,6 @@ def run_scan_job():
         logger.error("Scan failed: %s", e)
 
 
-# ── Event check ────────────────────────────────────────────────────────────────
 def run_event_check_job():
     """Poll the Event Tracker for anything that changed on subscribed
     symbols (new dividend, split, or updated earnings date) and notify."""
@@ -165,7 +173,6 @@ def run_event_check_job():
         logger.warning("Event check failed (non-fatal): %s", e)
 
 
-# ── Watchlist sync ─────────────────────────────────────────────────────────────
 def sync_event_subscriptions():
     """Make sure the Event Tracker is watching the same symbols as the
     scan watchlist. Runs once at startup."""
@@ -181,7 +188,6 @@ def sync_event_subscriptions():
         logger.warning("Could not sync event subscriptions at startup (non-fatal): %s", e)
 
 
-# ── End-of-day report ──────────────────────────────────────────────────────────
 def run_end_of_day_report():
     now = datetime.now(IST)
     if now.weekday() >= 5:
@@ -217,29 +223,36 @@ def run_end_of_day_report():
     )
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+# ---------- Scheduler startup in background thread ----------
+def start_scheduler():
     sync_event_subscriptions()
+    run_keepalive_job()  # warm up at startup
 
-    # Warm up all services immediately at startup
-    run_keepalive_job()
-
-    scheduler = BlockingScheduler(timezone=IST)
-
-    # Keep all Render free-tier services awake — every 14 minutes, always
+    scheduler = BackgroundScheduler(timezone=IST)
     scheduler.add_job(run_keepalive_job, "interval", minutes=14, id="keepalive")
-
-    # Market scan — every N minutes during market hours
     scheduler.add_job(run_scan_job, "interval", minutes=SCAN_INTERVAL_MINUTES, id="market_scan")
-
-    # Event check — every 2 hours on weekdays
     scheduler.add_job(run_event_check_job, "interval", hours=2, id="event_check")
-
-    # End-of-day report — 4pm IST Mon-Fri
     scheduler.add_job(run_end_of_day_report, "cron", hour=16, minute=0, day_of_week="mon-fri", id="eod_report")
 
+    scheduler.start()
     logger.info(
         "Scheduler started. Keep-alive every 14min. Market scan every %s min during IST market hours.",
         SCAN_INTERVAL_MINUTES,
     )
-    scheduler.start()
+    # Keep the thread alive (BackgroundScheduler runs in its own threads, so we just wait)
+    # Since this runs in a daemon thread, we need to prevent it from exiting immediately.
+    # We'll use an infinite loop or a lock. A simple join on a dummy event works.
+    import threading
+    event = threading.Event()
+    event.wait()  # Wait forever; the thread will be daemon so it exits when main exits.
+
+
+# ---------- Entry point ----------
+if __name__ == "__main__":
+    # Start the scheduler in a daemon thread so it doesn't block uvicorn
+    scheduler_thread = threading.Thread(target=start_scheduler, daemon=True)
+    scheduler_thread.start()
+
+    # Run the web server
+    port = int(os.environ.get("PORT", 8009))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
