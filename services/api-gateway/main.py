@@ -20,6 +20,7 @@ import yfinance as yf
 import feedparser
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from upstash_redis import Redis
 
@@ -70,6 +71,20 @@ async def add_cors_header(request, call_next):
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
+# --- Global Exception Handler (ensures CORS headers on all errors) ---
+@app.exception_handler(Exception)
+async def universal_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {str(exc)}"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*"
+        }
+    )
+
 # ── Redis ──────────────────────────────────────────────────────────────────────
 _redis = None
 try:
@@ -91,8 +106,8 @@ SCAN_TASK_PREFIX    = "stockky:scan_task:"
 
 # ── Symbol Alias Mapping (old → new) ──────────────────────────────────────
 SYMBOL_ALIASES: Dict[str, Union[str, List[str]]] = {
-    "TATAMOTORS": "TMCV",
-    "TATAMOTER": "TMPV",
+    "TATAMOTORS": "TMPV",
+    "TATAMOTER": "TMCV",
     "TATAMOT": "TMPV",
     "LTIM": "LTM",
     "LTIMIND": "LTM",
@@ -206,8 +221,7 @@ def _get_momentum_movers() -> List[str]:
     """Fetch top 10 gainers and top 10 losers from Nifty 50 (real-time)."""
     movers = []
     try:
-        # We need price data – we'll use yfinance on Nifty 50 constituents
-        nifty_symbols = _get_nifty_indices()[:50]  # take first 50 (Nifty 50)
+        nifty_symbols = _get_nifty_indices()[:50]
         performances = []
         for sym in nifty_symbols:
             try:
@@ -232,9 +246,8 @@ def _get_news_mentioned_symbols() -> List[str]:
             "https://news.google.com/rss/search?q=NSE+stock+bulk+deal+earnings+results&hl=en-IN&gl=IN&ceid=IN:en"
         )
         text = " ".join(e.title for e in feed.entries[:30]).upper()
-        # Use all symbols from NSE securities as the search space
         all_symbols = _get_all_nse_securities()
-        for sym in all_symbols[:200]:  # limit to avoid slowness
+        for sym in all_symbols[:200]:
             if sym in text:
                 mentioned.append(sym)
     except Exception as e:
@@ -502,8 +515,7 @@ async def run_scan_async(task_id: str, universe: List[str]):
 
 # ── Market Movers ──────────────────────────────────────────────────────────
 def _get_nifty50_data() -> List[dict]:
-    """Fetch real-time Nifty 50 stock data (from yfinance)."""
-    nifty_symbols = _get_nifty_indices()[:50]  # first 50 are Nifty 50
+    nifty_symbols = _get_nifty_indices()[:50]
     data = []
     for sym in nifty_symbols:
         try:
@@ -783,16 +795,20 @@ def run_scan(force_refresh: bool = False):
 # ── Async scan endpoints ──────────────────────────────────────────────────
 @app.post("/scan/start")
 def start_scan(force_refresh: bool = False, background_tasks: BackgroundTasks = None):
-    if force_refresh and _redis:
-        try:
-            _redis.delete(SCAN_UNIVERSE_KEY)
-        except Exception:
-            pass
+    try:
+        if force_refresh and _redis:
+            try:
+                _redis.delete(SCAN_UNIVERSE_KEY)
+            except Exception:
+                pass
 
-    universe = _build_scan_universe()
-    task_id = str(uuid.uuid4())
-    background_tasks.add_task(run_scan_async, task_id, universe)
-    return {"task_id": task_id}
+        universe = _build_scan_universe()
+        task_id = str(uuid.uuid4())
+        background_tasks.add_task(run_scan_async, task_id, universe)
+        return {"task_id": task_id}
+    except Exception as e:
+        logger.error(f"Scan start failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
 
 @app.get("/scan/status/{task_id}")
 def get_scan_status(task_id: str):

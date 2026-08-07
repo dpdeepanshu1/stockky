@@ -52,7 +52,7 @@ def analyze(symbol: str):
     score = 50
     reasons = []
 
-    # Extract metrics (using the same keys as market-data-service)
+    # Extract metrics
     rev_growth = f.get("revenue_growth")
     earnings_growth = f.get("earnings_growth")
     roe = f.get("roe")
@@ -169,7 +169,7 @@ def analyze(symbol: str):
         "sector": f.get("sector"),
         "industry": f.get("industry"),
         "reasons": reasons,
-        "metrics": metrics,          # <-- KEY: include raw metrics
+        "metrics": metrics,
         "raw": f,
     }
 

@@ -38,7 +38,6 @@ session.headers.update({
 try:
     yf.set_session(session)
 except AttributeError:
-    # Fallback for older yfinance versions (unlikely)
     try:
         yf.shared._session = session
     except AttributeError:
@@ -263,22 +262,28 @@ def get_fundamentals_raw(symbol: str):
         except Exception as e:
             logger.warning(f"Could not fetch info for {sym}: {e}")
 
-        # Get financials, balance sheet, cashflow with retry
+        # Get financials, balance sheet, cashflow with retry - safely handle None
         financials = None
         balance = None
         cashflow = None
+        
         try:
             financials = _with_retry(lambda: ticker.financials, max_retries=2, base_delay=1)
         except Exception as e:
             logger.warning(f"Could not fetch financials for {sym}: {e}")
+            financials = None
+        
         try:
             balance = _with_retry(lambda: ticker.balance_sheet, max_retries=2, base_delay=1)
         except Exception as e:
             logger.warning(f"Could not fetch balance sheet for {sym}: {e}")
+            balance = None
+        
         try:
             cashflow = _with_retry(lambda: ticker.cashflow, max_retries=2, base_delay=1)
         except Exception as e:
             logger.warning(f"Could not fetch cashflow for {sym}: {e}")
+            cashflow = None
 
         def _safe_info(key):
             val = info.get(key)
@@ -289,9 +294,14 @@ def get_fundamentals_raw(symbol: str):
             except (ValueError, TypeError):
                 return None
 
+        # SAFE: Check if financials is not None and not empty before accessing .index
+        financials_available = financials is not None and not financials.empty
+        balance_available = balance is not None and not balance.empty
+        cashflow_available = cashflow is not None and not cashflow.empty
+
         # Revenue growth (from financials)
         revenue_growth = None
-        if financials is not None and not financials.empty and "Total Revenue" in financials.index:
+        if financials_available and "Total Revenue" in financials.index:
             rev_series = financials.loc["Total Revenue"]
             if len(rev_series) >= 2:
                 current_rev = rev_series.iloc[0]
@@ -300,7 +310,7 @@ def get_fundamentals_raw(symbol: str):
 
         # Earnings growth (Net Income)
         earnings_growth = None
-        if financials is not None and not financials.empty and "Net Income" in financials.index:
+        if financials_available and "Net Income" in financials.index:
             earnings_series = financials.loc["Net Income"]
             if len(earnings_series) >= 2:
                 current_earn = earnings_series.iloc[0]
@@ -311,9 +321,9 @@ def get_fundamentals_raw(symbol: str):
         roe = None
         if "returnOnEquity" in info:
             roe = _safe_info("returnOnEquity") * 100 if _safe_info("returnOnEquity") else None
-        elif balance is not None and not balance.empty and "Total Equity Gross Minority Interest" in balance.index:
+        elif balance_available and "Total Equity Gross Minority Interest" in balance.index:
             equity = balance.loc["Total Equity Gross Minority Interest"].iloc[0]
-            if financials is not None and not financials.empty and "Net Income" in financials.index:
+            if financials_available and "Net Income" in financials.index:
                 net_income = financials.loc["Net Income"].iloc[0]
                 if equity != 0:
                     roe = (net_income / equity) * 100
@@ -322,7 +332,7 @@ def get_fundamentals_raw(symbol: str):
         debt_to_equity = None
         if "debtToEquity" in info:
             debt_to_equity = _safe_info("debtToEquity")
-        elif balance is not None and not balance.empty and "Total Debt" in balance.index and "Total Equity Gross Minority Interest" in balance.index:
+        elif balance_available and "Total Debt" in balance.index and "Total Equity Gross Minority Interest" in balance.index:
             total_debt = balance.loc["Total Debt"].iloc[0]
             equity = balance.loc["Total Equity Gross Minority Interest"].iloc[0]
             if equity != 0:
@@ -332,7 +342,7 @@ def get_fundamentals_raw(symbol: str):
         free_cashflow = None
         if "freeCashflow" in info:
             free_cashflow = _safe_info("freeCashflow")
-        elif cashflow is not None and not cashflow.empty and "Free Cash Flow" in cashflow.index:
+        elif cashflow_available and "Free Cash Flow" in cashflow.index:
             free_cashflow = cashflow.loc["Free Cash Flow"].iloc[0]
 
         # Profit Margins
@@ -340,7 +350,7 @@ def get_fundamentals_raw(symbol: str):
         if "profitMargins" in info:
             profit_margins = _safe_info("profitMargins") * 100
         else:
-            if financials is not None and not financials.empty and "Net Income" in financials.index and "Total Revenue" in financials.index:
+            if financials_available and "Net Income" in financials.index and "Total Revenue" in financials.index:
                 net_income = financials.loc["Net Income"].iloc[0]
                 revenue = financials.loc["Total Revenue"].iloc[0]
                 if revenue != 0:
