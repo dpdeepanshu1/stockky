@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api-gateway")
 
 DECISION_URL = os.getenv("DECISION_URL", "https://decision-engine-service-0hg6.onrender.com")
+NOTIFICATION_URL = os.getenv("NOTIFICATION_URL", "https://notification-service-36py.onrender.com")  # <-- ADDED
 
 app = FastAPI(title="Stockky API Gateway", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -79,6 +80,9 @@ def root():
             "/watchlist/{symbol}": "DELETE – remove symbol",
             "/stock/{symbol}": "GET – get decision for a symbol",
             "/scan": "GET – scan watchlist",
+            "/notifications/config": "GET/POST – get/update notification config",       # <-- UPDATED
+            "/notifications/config/{channel}": "DELETE – clear a channel",             # <-- UPDATED
+            "/notifications/test": "POST – test notifications",                        # <-- UPDATED
             "/docs": "Swagger UI documentation",
         },
     }
@@ -166,6 +170,48 @@ def run_scan():
         "all_results": results,
         "errors": errors,
     }
+
+
+# ---------- NOTIFICATION PROXY ROUTES (ADDED) ----------
+@app.get("/notifications/config")
+def get_notification_config():
+    """Proxy to get notification configuration from Notification Service."""
+    try:
+        resp = httpx.get(f"{NOTIFICATION_URL}/config", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
+
+@app.post("/notifications/config")
+def update_notification_config(update: dict):
+    """Proxy to update notification configuration."""
+    try:
+        resp = httpx.post(f"{NOTIFICATION_URL}/config", json=update, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
+
+@app.delete("/notifications/config/{channel}")
+def clear_notification_channel(channel: str):
+    """Proxy to clear a notification channel."""
+    try:
+        resp = httpx.delete(f"{NOTIFICATION_URL}/config/{channel}", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
+
+@app.post("/notifications/test")
+def test_notifications():
+    """Proxy to test notification delivery."""
+    try:
+        resp = httpx.post(f"{NOTIFICATION_URL}/test", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
 
 
 if __name__ == "__main__":
