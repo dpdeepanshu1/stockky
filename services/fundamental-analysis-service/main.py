@@ -67,7 +67,7 @@ def analyze(symbol: str):
     pe = f.get("pe_ratio")
     forward_pe = f.get("forward_pe")
 
-    # Build metrics dict
+    # Build metrics dict (always include, even if None)
     metrics = {
         "revenue_growth": rev_growth,
         "earnings_growth": earnings_growth,
@@ -174,7 +174,7 @@ def analyze(symbol: str):
         "sector": f.get("sector"),
         "industry": f.get("industry"),
         "reasons": reasons,
-        "metrics": metrics,          # <-- include the raw metrics
+        "metrics": metrics,          # <-- INCLUDE METRICS
         "raw": f,
     }
 

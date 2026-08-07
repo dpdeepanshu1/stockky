@@ -17,7 +17,6 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("decision-engine-service")
 
-# ---- Live Render URLs (default) ----
 TECHNICAL_URL = os.getenv("TECHNICAL_URL", "https://technical-analysis-service-zhnc.onrender.com")
 FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-service.onrender.com")
 NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")
