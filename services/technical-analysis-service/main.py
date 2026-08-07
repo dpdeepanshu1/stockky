@@ -27,13 +27,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # --- 配置 requests session 以提升稳定性 ---
 def get_yfinance_session():
     session = requests.Session()
-    # 伪装成真实浏览器，降低被屏蔽的风险[reference:10]
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
         "Accept": "application/json",
         "Accept-Language": "en-US,en;q=0.9",
     })
-    # 配置重试策略，应对临时性网络错误[reference:11]
     retry_strategy = Retry(
         total=3,
         backoff_factor=1,
@@ -45,9 +43,15 @@ def get_yfinance_session():
     session.mount("https://", adapter)
     return session
 
-# 应用自定义 session
+# 应用自定义 session（兼容新旧版 yfinance）
 yf_session = get_yfinance_session()
-yf.set_session(yf_session)
+try:
+    yf.set_session(yf_session)
+except AttributeError:
+    try:
+        yf.shared._session = yf_session
+    except AttributeError:
+        pass
 
 # 全局异常处理器
 @app.exception_handler(Exception)
@@ -96,7 +100,6 @@ def analyze(symbol: str):
     try:
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
-        # 添加超时控制，避免请求卡死[reference:12]
         hist = ticker.history(period="1y", timeout=30)
         if hist.empty or len(hist) < 30:
             raise HTTPException(status_code=404, detail=f"Insufficient price data for {sym}")
