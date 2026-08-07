@@ -22,6 +22,7 @@ import yfinance as yf
 from upstash_redis import Redis
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # --- Patch yfinance session with a proper User-Agent ---
@@ -34,7 +35,6 @@ session.headers.update({
     "Connection": "keep-alive",
 })
 
-# Set session for yfinance (newer versions use set_session)
 try:
     yf.set_session(session)
 except AttributeError:
@@ -43,14 +43,12 @@ except AttributeError:
     except AttributeError:
         pass
 
-# Optionally set tz cache location
 try:
     yf.set_tz_cache_location("/tmp/yfinance_tz")
 except AttributeError:
     pass
 
 def _safe(val, decimals=2):
-    """Convert to float, round, handle NaN/Inf."""
     try:
         f = float(val)
         if math.isnan(f) or not math.isfinite(f):
@@ -71,7 +69,6 @@ def _compute_growth(current, previous):
     return ((current - previous) / previous) * 100
 
 def _with_retry(func, max_retries=3, base_delay=2):
-    """Retry a function with exponential backoff."""
     for attempt in range(max_retries):
         try:
             return func()
@@ -96,6 +93,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal error: {str(exc)}"},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
 # ---------- Redis cache ----------
 try:
@@ -255,35 +261,27 @@ def get_fundamentals_raw(symbol: str):
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
 
-        # Get info with retry
         info = {}
         try:
             info = _with_retry(lambda: ticker.info, max_retries=3, base_delay=2)
         except Exception as e:
             logger.warning(f"Could not fetch info for {sym}: {e}")
 
-        # Get financials, balance sheet, cashflow with retry - safely handle None
         financials = None
         balance = None
         cashflow = None
-        
         try:
             financials = _with_retry(lambda: ticker.financials, max_retries=2, base_delay=1)
         except Exception as e:
             logger.warning(f"Could not fetch financials for {sym}: {e}")
-            financials = None
-        
         try:
             balance = _with_retry(lambda: ticker.balance_sheet, max_retries=2, base_delay=1)
         except Exception as e:
             logger.warning(f"Could not fetch balance sheet for {sym}: {e}")
-            balance = None
-        
         try:
             cashflow = _with_retry(lambda: ticker.cashflow, max_retries=2, base_delay=1)
         except Exception as e:
             logger.warning(f"Could not fetch cashflow for {sym}: {e}")
-            cashflow = None
 
         def _safe_info(key):
             val = info.get(key)
@@ -294,12 +292,11 @@ def get_fundamentals_raw(symbol: str):
             except (ValueError, TypeError):
                 return None
 
-        # SAFE: Check if financials is not None and not empty before accessing .index
         financials_available = financials is not None and not financials.empty
         balance_available = balance is not None and not balance.empty
         cashflow_available = cashflow is not None and not cashflow.empty
 
-        # Revenue growth (from financials)
+        # Revenue growth
         revenue_growth = None
         if financials_available and "Total Revenue" in financials.index:
             rev_series = financials.loc["Total Revenue"]
@@ -308,7 +305,6 @@ def get_fundamentals_raw(symbol: str):
                 prev_rev = rev_series.iloc[1]
                 revenue_growth = _compute_growth(current_rev, prev_rev)
 
-        # Earnings growth (Net Income)
         earnings_growth = None
         if financials_available and "Net Income" in financials.index:
             earnings_series = financials.loc["Net Income"]
@@ -317,7 +313,6 @@ def get_fundamentals_raw(symbol: str):
                 prev_earn = earnings_series.iloc[1]
                 earnings_growth = _compute_growth(current_earn, prev_earn)
 
-        # ROE
         roe = None
         if "returnOnEquity" in info:
             roe = _safe_info("returnOnEquity") * 100 if _safe_info("returnOnEquity") else None
@@ -328,7 +323,6 @@ def get_fundamentals_raw(symbol: str):
                 if equity != 0:
                     roe = (net_income / equity) * 100
 
-        # Debt to Equity
         debt_to_equity = None
         if "debtToEquity" in info:
             debt_to_equity = _safe_info("debtToEquity")
@@ -338,14 +332,12 @@ def get_fundamentals_raw(symbol: str):
             if equity != 0:
                 debt_to_equity = total_debt / equity
 
-        # Free Cash Flow
         free_cashflow = None
         if "freeCashflow" in info:
             free_cashflow = _safe_info("freeCashflow")
         elif cashflow_available and "Free Cash Flow" in cashflow.index:
             free_cashflow = cashflow.loc["Free Cash Flow"].iloc[0]
 
-        # Profit Margins
         profit_margins = None
         if "profitMargins" in info:
             profit_margins = _safe_info("profitMargins") * 100
@@ -356,41 +348,34 @@ def get_fundamentals_raw(symbol: str):
                 if revenue != 0:
                     profit_margins = (net_income / revenue) * 100
 
-        # Institutional Holding
         held_percent_institutions = None
         if "heldPercentInstitutions" in info:
             held_percent_institutions = _safe_info("heldPercentInstitutions") * 100
         elif "institutionalPercent" in info:
             held_percent_institutions = _safe_info("institutionalPercent") * 100
 
-        # PE Ratio
         pe_ratio = None
         if "trailingPE" in info:
             pe_ratio = _safe_info("trailingPE")
         elif "peRatio" in info:
             pe_ratio = _safe_info("peRatio")
 
-        # Forward PE
         forward_pe = None
         if "forwardPE" in info:
             forward_pe = _safe_info("forwardPE")
 
-        # EPS
         eps = None
         if "trailingEps" in info:
             eps = _safe_info("trailingEps")
         elif "eps" in info:
             eps = _safe_info("eps")
 
-        # Price to Book
         price_to_book = None
         if "priceToBook" in info:
             price_to_book = _safe_info("priceToBook")
 
-        # Market Cap
         market_cap = _safe_info("marketCap")
 
-        # Dividend Yield
         dividend_yield = None
         if "dividendYield" in info:
             dividend_yield = _safe_info("dividendYield") * 100
@@ -405,7 +390,6 @@ def get_fundamentals_raw(symbol: str):
             except Exception:
                 pass
 
-        # Year high/low, averages
         year_high = _safe_info("fiftyTwoWeekHigh")
         year_low = _safe_info("fiftyTwoWeekLow")
         fifty_day_average = _safe_info("fiftyDayAverage")
@@ -414,7 +398,6 @@ def get_fundamentals_raw(symbol: str):
         if year_change_pct is not None:
             year_change_pct = year_change_pct * 100
 
-        # Range position
         range_position = None
         if year_high and year_low:
             last_price = _safe_info("regularMarketPrice") or _safe_info("last_price")
@@ -454,36 +437,11 @@ def get_fundamentals_raw(symbol: str):
         _cache_set(cache_key, result, ttl=3600)
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
-        # Ensure we catch ALL exceptions and return a valid JSON error
-        logger.exception(f"Failed to fetch fundamentals for {sym}: {e}")
-        # Return a valid JSON with nulls instead of raising an exception
-        error_result = {
-            "symbol": sym,
-            "pe_ratio": None,
-            "forward_pe": None,
-            "market_cap": None,
-            "dividend_yield": None,
-            "year_change_pct": None,
-            "year_high": None,
-            "year_low": None,
-            "fifty_day_average": None,
-            "two_hundred_day_average": None,
-            "range_position_pct": None,
-            "revenue_growth": None,
-            "earnings_growth": None,
-            "eps": None,
-            "roe": None,
-            "debt_to_equity": None,
-            "free_cashflow": None,
-            "profit_margins": None,
-            "held_percent_insiders": None,
-            "held_percent_institutions": None,
-            "price_to_book": None,
-            "sector": None,
-            "industry": None,
-        }
-        return error_result
+        logger.exception("Failed to fetch fundamentals for %s", sym)
+        raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
 
 if __name__ == "__main__":
     import uvicorn

@@ -31,7 +31,7 @@ DECISION_URL = os.getenv("DECISION_URL", "https://decision-engine-service-0hg6.o
 NOTIFICATION_URL = os.getenv("NOTIFICATION_URL", "https://notification-service-36py.onrender.com")
 NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")
 
-# ✅ Correct market data service URL (the actual service name)
+# Correct market data service URL
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
 TECHNICAL_URL = os.getenv("TECHNICAL_URL", "https://technical-analysis-service-zhnc.onrender.com")
 FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-service.onrender.com")
@@ -157,9 +157,11 @@ def _add_searched(symbol: str):
 # ── Dynamic Universe Sources ──────────────────────────────────────────────
 
 def _fetch_from_nse_api(endpoint: str, cache_key: str, ttl: int = 21600):
+    """Fetch from NSE API, but only return data if it's a dict; else None."""
     cached = _redis_get(cache_key)
-    if cached:
+    if cached and isinstance(cached, dict):
         return cached
+
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -168,8 +170,12 @@ def _fetch_from_nse_api(endpoint: str, cache_key: str, ttl: int = 21600):
         resp = httpx.get(f"https://www.nseindia.com/api/{endpoint}", headers=headers, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
-            _redis_set(cache_key, data, ttl)
-            return data
+            if isinstance(data, dict):
+                _redis_set(cache_key, data, ttl)
+                return data
+            else:
+                logger.warning(f"NSE API {endpoint} returned non-dict: {type(data).__name__}")
+                return None
         else:
             logger.warning(f"NSE API {endpoint} returned {resp.status_code}")
             return None
@@ -180,22 +186,22 @@ def _fetch_from_nse_api(endpoint: str, cache_key: str, ttl: int = 21600):
 def _get_all_nse_securities() -> List[str]:
     data = _fetch_from_nse_api("equity-stockIndices?index=SECURITIES%20IN%20NSE", "nse:all_securities")
     symbols = []
-    if data and "data" in data:
+    if data and "data" in data and isinstance(data["data"], list):
         for item in data["data"]:
-            if item.get("symbol"):
+            if isinstance(item, dict) and item.get("symbol"):
                 symbols.append(item["symbol"].upper())
     logger.info(f"Fetched {len(symbols)} securities from NSE")
     return symbols
 
 def _get_nifty_indices() -> List[str]:
-    """Fetch Nifty 50, Next 50, and Midcap 100 constituents with fallback."""
+    """Fetch Nifty 50, Next 50, Midcap 100 constituents, always returning a list."""
     indices = ["NIFTY%2050", "NIFTY%20NEXT%2050", "NIFTY%20MIDCAP%20100"]
     all_symbols = []
     for idx in indices:
         data = _fetch_from_nse_api(f"equity-stockIndices?index={idx}", f"nse:index_{idx}")
-        if data and "data" in data:
+        if data and "data" in data and isinstance(data["data"], list):
             for item in data["data"]:
-                if item.get("symbol"):
+                if isinstance(item, dict) and item.get("symbol"):
                     all_symbols.append(item["symbol"].upper())
     
     fallback = [
@@ -216,13 +222,14 @@ def _get_nifty_indices() -> List[str]:
 def _get_recent_ipos() -> List[str]:
     data = _fetch_from_nse_api("ipo?type=listed", IPO_CACHE_KEY, ttl=86400)
     symbols = []
-    if data:
+    if data and isinstance(data, list):
         for item in data:
-            sym = item.get("symbol") or item.get("secCode")
-            if sym:
-                symbols.append(sym.upper())
+            if isinstance(item, dict):
+                sym = item.get("symbol") or item.get("secCode")
+                if sym:
+                    symbols.append(sym.upper())
     if not symbols:
-        symbols = ["JIOFIN", "BLUESTONE", "CUPID", "IREDA", "RVNL", "HUDCO", "RAILTEL", "IRFC"]
+        symbols = ["JIOFIN", "BLUESTONE", "CUPID", "IREDA", "RVNL", "HUDCO", "RAILTEL", "IRFC", "MVELECTRO"]
     return symbols
 
 def _get_momentum_movers() -> List[str]:
@@ -261,23 +268,43 @@ def _get_news_mentioned_symbols() -> List[str]:
         logger.warning("Could not parse news for symbols: %s", e)
     return mentioned[:15]
 
-# ── Build scan universe ──────────────────────────────────────────────────────
+# ── Build scan universe (robust) ──────────────────────────────────────
 def _build_scan_universe() -> List[str]:
     cached = _redis_get(SCAN_UNIVERSE_KEY)
-    if cached:
+    if cached and isinstance(cached, list) and len(cached) > 0:
         return cached
 
     universe = set()
-    all_stocks = _get_all_nse_securities()
-    if all_stocks:
-        universe.update(all_stocks[:100])
-    else:
+    try:
+        all_stocks = _get_all_nse_securities()
+        if all_stocks:
+            universe.update(all_stocks[:100])
+        else:
+            universe.update(_get_nifty_indices())
+    except Exception as e:
+        logger.warning(f"Failed to fetch securities: {e}")
         universe.update(_get_nifty_indices())
-    
-    universe.update(_get_nifty_indices())
-    universe.update(_get_momentum_movers())
-    universe.update(_get_news_mentioned_symbols())
-    universe.update(_get_recent_ipos())
+
+    try:
+        universe.update(_get_nifty_indices())
+    except Exception as e:
+        logger.warning(f"Failed to fetch indices: {e}")
+
+    try:
+        universe.update(_get_momentum_movers())
+    except Exception as e:
+        logger.warning(f"Failed to fetch momentum movers: {e}")
+
+    try:
+        universe.update(_get_news_mentioned_symbols())
+    except Exception as e:
+        logger.warning(f"Failed to fetch news symbols: {e}")
+
+    try:
+        universe.update(_get_recent_ipos())
+    except Exception as e:
+        logger.warning(f"Failed to fetch IPOs: {e}")
+
     universe.update(_load_watchlist())
     universe.update(_load_searched())
     for target in SYMBOL_ALIASES.values():
@@ -293,18 +320,26 @@ def _build_scan_universe() -> List[str]:
         if s and s not in seen:
             seen.add(s)
             clean.append(s)
-    result = clean[:120] if clean else _get_nifty_indices()[:50]
+
+    if not clean:
+        fallback = ["RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HCLTECH", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK"]
+        clean = fallback
+
+    result = clean[:120]
     _redis_set(SCAN_UNIVERSE_KEY, result, ttl=21600)
-    logger.info("Scan universe built: %d symbols", len(result))
+    logger.info(f"Scan universe built: {len(result)} symbols")
     return result
 
 # ── Symbol resolution ──────────────────────────────────────────────────────
 def _get_all_known_symbols() -> Set[str]:
     cached = _redis_get(KNOWN_SYMBOLS_KEY)
-    if cached:
+    if cached and isinstance(cached, list):
         return set(cached)
     combined = set()
-    combined.update(_get_all_nse_securities()[:200])
+    try:
+        combined.update(_get_all_nse_securities()[:200])
+    except:
+        pass
     combined.update(_get_nifty_indices())
     combined.update(_load_watchlist())
     combined.update(_load_searched())
@@ -316,7 +351,7 @@ def _get_all_known_symbols() -> Set[str]:
         else:
             combined.add(target)
     scan_universe = _redis_get(SCAN_UNIVERSE_KEY)
-    if scan_universe:
+    if scan_universe and isinstance(scan_universe, list):
         combined.update(scan_universe)
     cleaned = set()
     for s in combined:
@@ -343,7 +378,7 @@ def _resolve_symbol(misspelled: str) -> Optional[str]:
         return matches[0]
     return None
 
-# ── Hinglish summary (with type validation) ──────────────────────────────
+# ── Hinglish summary ──────────────────────────────────────────────────────
 def _generate_summary(data: dict) -> str:
     if not isinstance(data, dict):
         return "Data unavailable"

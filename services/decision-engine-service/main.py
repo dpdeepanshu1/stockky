@@ -2,7 +2,7 @@
 Decision Engine Service
 -------------------------
 Combines Technical + Fundamental + News + Prediction scores.
-Now includes fundamental metrics in the response.
+Now includes fundamental metrics in the response, and global error handler.
 """
 import os
 import asyncio
@@ -12,6 +12,7 @@ from enum import Enum
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +28,16 @@ EVENT_RISK_WINDOW_DAYS = 3
 
 app = FastAPI(title="Stockky Decision Engine", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Global exception handler to always return JSON
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
 class Decision(str, Enum):
     BUY_NOW = "BUY NOW"
@@ -89,125 +100,118 @@ def _combined_score(technical_score: int, fundamental_score: int, news_score: in
 def _decide(technical_score: int, fundamental_score: int, news_score: int | None, prediction_score: int | None,
             trend_strength: str, volume_surge: bool, dist_to_resistance_pct: float, event_risk: bool, already_owned: bool) -> Decision:
     combined = _combined_score(technical_score, fundamental_score, news_score, prediction_score)
-    
-    # SELL if already owned and combined score is very low
     if already_owned and combined < 35:
         return Decision.SELL
-    
-    # HOLD if already owned and combined is in a moderate range
     if already_owned and 35 <= combined < 65:
         return Decision.HOLD
-    
-    news_ok = news_score is None or news_score >= 35  # relaxed from 40
-    model_ok = prediction_score is None or prediction_score >= 50  # relaxed from 55
-    
-    # BUY NOW: relaxed thresholds
+    news_ok = news_score is None or news_score >= 35
+    model_ok = prediction_score is None or prediction_score >= 50
     if (technical_score >= 60 and fundamental_score >= 50 
-        and trend_strength in ("strong", "moderate")  # allow moderate trend
+        and trend_strength in ("strong", "moderate") 
         and volume_surge
-        and dist_to_resistance_pct > 1  # relaxed from 2
+        and dist_to_resistance_pct > 1
         and news_ok 
         and model_ok):
         if event_risk:
             return Decision.PREPARE_TO_BUY
         return Decision.BUY_NOW
-    
-    # PREPARE TO BUY: easier to get
     if fundamental_score >= 45 and 50 <= technical_score < 60:
         return Decision.PREPARE_TO_BUY
-    
     if already_owned and combined >= 65:
         return Decision.HOLD
-    
     return Decision.DO_NOT_BUY
 
 @app.get("/decide/{symbol}")
 async def decide(symbol: str, already_owned: bool = False):
-    async with httpx.AsyncClient(timeout=70) as client:
-        technical_task = _fetch_required(client, f"{TECHNICAL_URL}/analyze/{symbol}", "Technical analysis")
-        fundamental_task = _fetch_required(client, f"{FUNDAMENTAL_URL}/analyze/{symbol}", "Fundamental analysis")
-        news_task = _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
-        prediction_task = _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
-        events_task = _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
-        technical, fundamental, news, prediction, events = await asyncio.gather(
-            technical_task, fundamental_task, news_task, prediction_task, events_task
-        )
+    try:
+        async with httpx.AsyncClient(timeout=70) as client:
+            technical_task = _fetch_required(client, f"{TECHNICAL_URL}/analyze/{symbol}", "Technical analysis")
+            fundamental_task = _fetch_required(client, f"{FUNDAMENTAL_URL}/analyze/{symbol}", "Fundamental analysis")
+            news_task = _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
+            prediction_task = _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
+            events_task = _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
+            technical, fundamental, news, prediction, events = await asyncio.gather(
+                technical_task, fundamental_task, news_task, prediction_task, events_task
+            )
 
-    technical_score = technical["technical_score"]
-    fundamental_score = fundamental["fundamental_score"]
-    news_score = news["news_score"] if news else None
-    prediction_score = prediction["prediction_score"] if prediction and prediction.get("model_loaded") else None
-    fundamental_metrics = fundamental.get("metrics")
+        technical_score = technical["technical_score"]
+        fundamental_score = fundamental["fundamental_score"]
+        news_score = news["news_score"] if news else None
+        prediction_score = prediction["prediction_score"] if prediction and prediction.get("model_loaded") else None
+        fundamental_metrics = fundamental.get("metrics")
 
-    close = technical["close"]
-    resistance = technical["resistance"]
-    support = technical["support"]
-    dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
+        close = technical["close"]
+        resistance = technical["resistance"]
+        support = technical["support"]
+        dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
 
-    event_risk = False
-    event_reason = None
-    if events and events.get("next_earnings_date"):
-        try:
-            from datetime import datetime
-            earnings_date = datetime.fromisoformat(events["next_earnings_date"][:10])
-            days_out = (earnings_date - datetime.utcnow()).days
-            if 0 <= days_out <= EVENT_RISK_WINDOW_DAYS:
-                event_risk = True
-                event_reason = f"Earnings due in {days_out} day(s) ({events['next_earnings_date'][:10]}) — elevated volatility risk"
-        except (ValueError, TypeError):
-            pass
+        event_risk = False
+        event_reason = None
+        if events and events.get("next_earnings_date"):
+            try:
+                from datetime import datetime
+                earnings_date = datetime.fromisoformat(events["next_earnings_date"][:10])
+                days_out = (earnings_date - datetime.utcnow()).days
+                if 0 <= days_out <= EVENT_RISK_WINDOW_DAYS:
+                    event_risk = True
+                    event_reason = f"Earnings due in {days_out} day(s) ({events['next_earnings_date'][:10]}) — elevated volatility risk"
+            except (ValueError, TypeError):
+                pass
 
-    decision = _decide(technical_score, fundamental_score, news_score, prediction_score,
-                       technical["trend_strength"], technical["volume_surge"], dist_to_resistance_pct,
-                       event_risk, already_owned)
-    combined_score = _combined_score(technical_score, fundamental_score, news_score, prediction_score)
+        decision = _decide(technical_score, fundamental_score, news_score, prediction_score,
+                           technical["trend_strength"], technical["volume_surge"], dist_to_resistance_pct,
+                           event_risk, already_owned)
+        combined_score = _combined_score(technical_score, fundamental_score, news_score, prediction_score)
 
-    entry_low, entry_high = round(support * 1.01, 2), round(close * 1.005, 2)
-    target_pct = 0.08
-    if prediction_score is not None:
-        target_pct = 0.06 + (prediction_score / 100) * 0.05
-    target = round(close * (1 + target_pct), 2)
-    stop_loss = round(support * 0.98, 2)
+        entry_low, entry_high = round(support * 1.01, 2), round(close * 1.005, 2)
+        target_pct = 0.08
+        if prediction_score is not None:
+            target_pct = 0.06 + (prediction_score / 100) * 0.05
+        target = round(close * (1 + target_pct), 2)
+        stop_loss = round(support * 0.98, 2)
 
-    confidence = "High" if combined_score >= 75 else "Medium" if combined_score >= 55 else "Low"
+        confidence = "High" if combined_score >= 75 else "Medium" if combined_score >= 55 else "Low"
 
-    reasons = {
-        "technical": technical["reasons"],
-        "fundamental": fundamental["reasons"],
-    }
-    if news:
-        reasons["news"] = news["reasons"]
-    if prediction and prediction.get("model_loaded"):
-        reasons["prediction"] = [prediction["note"]]
-    if event_reason:
-        reasons["event"] = [event_reason]
+        reasons = {
+            "technical": technical["reasons"],
+            "fundamental": fundamental["reasons"],
+        }
+        if news:
+            reasons["news"] = news["reasons"]
+        if prediction and prediction.get("model_loaded"):
+            reasons["prediction"] = [prediction["note"]]
+        if event_reason:
+            reasons["event"] = [event_reason]
 
-    response = {
-        "symbol": symbol.upper(),
-        "decision": decision.value,
-        "confidence": confidence,
-        "combined_score": combined_score,
-        "technical_score": technical_score,
-        "fundamental_score": fundamental_score,
-        "news_score": news_score,
-        "prediction_score": prediction_score,
-        "event_risk": event_risk,
-        "entry_range": {"low": entry_low, "high": entry_high},
-        "target": target,
-        "stop_loss": stop_loss,
-        "holding_period": "2-6 weeks" if decision == Decision.BUY_NOW else "N/A",
-        "close": close,
-        "support": support,
-        "resistance": resistance,
-        "reasons": reasons,
-        "valuation": fundamental["valuation"],
-        "sector": fundamental["sector"],
-    }
+        response = {
+            "symbol": symbol.upper(),
+            "decision": decision.value,
+            "confidence": confidence,
+            "combined_score": combined_score,
+            "technical_score": technical_score,
+            "fundamental_score": fundamental_score,
+            "news_score": news_score,
+            "prediction_score": prediction_score,
+            "event_risk": event_risk,
+            "entry_range": {"low": entry_low, "high": entry_high},
+            "target": target,
+            "stop_loss": stop_loss,
+            "holding_period": "2-6 weeks" if decision == Decision.BUY_NOW else "N/A",
+            "close": close,
+            "support": support,
+            "resistance": resistance,
+            "reasons": reasons,
+            "valuation": fundamental["valuation"],
+            "sector": fundamental["sector"],
+        }
 
-    if fundamental_metrics:
-        response["fundamental_metrics"] = fundamental_metrics
+        if fundamental_metrics:
+            response["fundamental_metrics"] = fundamental_metrics
 
-    return response
+        return response
+    except Exception as e:
+        logger.error(f"Decision failed for {symbol}: {e}")
+        raise HTTPException(status_code=502, detail=f"Decision failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

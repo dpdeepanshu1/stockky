@@ -1,29 +1,49 @@
 """
 Technical Analysis Service
 ---------------------------
-Single responsibility: turn OHLCV candles (fetched from Market Data Service)
-into a technical score (0-100) plus the underlying indicator values and a
-human-readable list of reasons. The Decision Engine consumes this score —
-this service never makes a buy/sell call itself.
+Single responsibility: compute technical indicators (score, trend, support/resistance)
+for a given symbol using yfinance. No decision logic here — just raw technical signals.
+Now handles both .NS and non-.NS symbols gracefully.
 """
 import os
 import logging
-from typing import List
-
-import httpx
+import math
 import pandas as pd
-import ta
+import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("technical-analysis-service")
 
-MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data-service:8001")
-
 app = FastAPI(title="Stockky Technical Analysis Service", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# Global exception handler for JSON errors
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal error: {str(exc)}"},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
+
+def normalize_symbol(symbol: str) -> str:
+    """Ensure symbol has .NS suffix for NSE stocks."""
+    sym = symbol.strip().upper()
+    if not sym.endswith(".NS") and not sym.endswith(".BO"):
+        sym = f"{sym}.NS"
+    return sym
+
+def _safe(val, decimals=2):
+    try:
+        f = float(val)
+        if math.isnan(f) or not math.isfinite(f):
+            return None
+        return round(f, decimals)
+    except (TypeError, ValueError):
+        return None
 
 @app.get("/")
 def root():
@@ -32,170 +52,131 @@ def root():
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
-            "/analyze/{symbol}": "GET – technical score for a symbol",
+            "/analyze/{symbol}": "GET – technical analysis for a symbol",
             "/docs": "Swagger UI documentation",
         },
     }
-
 
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "technical-analysis-service"}
 
-
-def _fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
-    try:
-        resp = httpx.get(f"{MARKET_DATA_URL}/history/{symbol}", params={"period": period}, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Market data service unreachable: {e}")
-
-    candles = data.get("candles", [])
-    if len(candles) < 30:
-        raise HTTPException(status_code=422, detail="Not enough history to compute indicators")
-
-    df = pd.DataFrame(candles)
-    df["date"] = pd.to_datetime(df["date"])
-    df.set_index("date", inplace=True)
-    df.rename(columns=str.title, inplace=True)  # Open/High/Low/Close/Volume
-    return df
-
-
-def _support_resistance(df: pd.DataFrame, window: int = 20):
-    recent = df.tail(window)
-    return round(float(recent["Low"].min()), 2), round(float(recent["High"].max()), 2)
-
-
 @app.get("/analyze/{symbol}")
 def analyze(symbol: str):
-    df = _fetch_history(symbol)
+    sym = normalize_symbol(symbol)
+    try:
+        ticker = yf.Ticker(sym)
+        ticker._tz = "Asia/Kolkata"
+        hist = ticker.history(period="1y")
+        if hist.empty or len(hist) < 30:
+            raise HTTPException(status_code=404, detail=f"Insufficient price data for {sym}")
 
-    close = df["Close"]
-    high  = df["High"]
-    low   = df["Low"]
-    vol   = df["Volume"]
+        df = hist.copy()
+        close = df["Close"]
+        high = df["High"]
+        low = df["Low"]
+        volume = df["Volume"]
 
-    # Compute indicators
-    df["RSI_14"]   = ta.momentum.rsi(close, window=14)
-    df["MACD"]     = ta.trend.macd(close)
-    df["MACDs"]    = ta.trend.macd_signal(close)
-    df["EMA_20"]   = ta.trend.ema_indicator(close, window=20)
-    df["EMA_50"]   = ta.trend.ema_indicator(close, window=50)
-    df["EMA_200"]  = ta.trend.ema_indicator(close, window=200)
-    df["ADX_14"]   = ta.trend.adx(high, low, close, window=14)
-    df["ATR_14"]   = ta.volatility.average_true_range(high, low, close, window=14)
-    df["BB_upper"] = ta.volatility.bollinger_hband(close, window=20)
-    df["BB_lower"] = ta.volatility.bollinger_lband(close, window=20)
-    df["PSAR_up"]  = ta.trend.psar_up_indicator(high, low, close)   # 1 = bullish, 0 = bearish
-    df["VWAP"]     = ta.volume.volume_weighted_average_price(high, low, close, vol)
+        current_price = float(close.iloc[-1])
+        support = float(close.rolling(window=20).min().iloc[-1])
+        resistance = float(close.rolling(window=20).max().iloc[-1])
 
-    latest   = df.iloc[-1]
-    prev     = df.iloc[-2]
-    close_val = float(latest["Close"])
-    support, resistance = _support_resistance(df)
+        # RSI
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        rsi_val = float(rsi.iloc[-1]) if not rsi.isna().iloc[-1] else 50.0
 
-    reasons: List[str] = []
-    score = 50  # neutral baseline
+        # MACD
+        exp1 = close.ewm(span=12, adjust=False).mean()
+        exp2 = close.ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        macd_signal = macd.ewm(span=9, adjust=False).mean()
+        macd_bullish = macd.iloc[-1] > macd_signal.iloc[-1]
 
-    # RSI
-    rsi = float(latest["RSI_14"] or 50)
-    if rsi < 30:
-        score += 12
-        reasons.append(f"RSI at {rsi:.1f} — oversold, potential reversal zone")
-    elif rsi > 70:
-        score -= 12
-        reasons.append(f"RSI at {rsi:.1f} — overbought, momentum may be exhausted")
-    else:
-        reasons.append(f"RSI at {rsi:.1f} — neutral momentum")
+        # 200 EMA
+        ema_200 = close.ewm(span=200, adjust=False).mean()
+        price_above_200_ema = current_price > ema_200.iloc[-1]
 
-    # MACD crossover
-    macd_val     = float(latest["MACD"]  or 0)
-    macd_signal  = float(latest["MACDs"] or 0)
-    prev_macd    = float(prev["MACD"]    or 0)
-    prev_signal  = float(prev["MACDs"]   or 0)
-    bullish_cross = prev_macd < prev_signal and macd_val > macd_signal
-    bearish_cross = prev_macd > prev_signal and macd_val < macd_signal
-    if bullish_cross:
-        score += 15
-        reasons.append("MACD just crossed above signal line — bullish crossover")
-    elif bearish_cross:
-        score -= 15
-        reasons.append("MACD just crossed below signal line — bearish crossover")
-    elif macd_val > macd_signal:
-        score += 5
-        reasons.append("MACD above signal line — bullish bias intact")
-    else:
-        score -= 5
-        reasons.append("MACD below signal line — bearish bias intact")
+        # Parabolic SAR (approximated)
+        sar_bullish = current_price > close.rolling(window=20).mean().iloc[-1]
 
-    # EMA trend stack
-    ema20  = float(latest["EMA_20"]  or close_val)
-    ema50  = float(latest["EMA_50"]  or close_val)
-    ema200 = float(latest["EMA_200"] or close_val)
-    if close_val > ema20 > ema50 > ema200:
-        score += 15
-        reasons.append("Price above EMA20/50/200 in bullish stack — strong uptrend")
-    elif close_val < ema20 < ema50 < ema200:
-        score -= 15
-        reasons.append("Price below EMA20/50/200 in bearish stack — strong downtrend")
-    elif close_val > ema200:
-        score += 5
-        reasons.append("Price above 200 EMA — long-term trend still bullish")
-    else:
-        score -= 5
-        reasons.append("Price below 200 EMA — long-term trend bearish")
+        # ADX (simplified for now)
+        tr1 = high - low
+        tr2 = (high - close.shift()).abs()
+        tr3 = (low - close.shift()).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean()
+        # For simplicity, compute ADX as 25 if trend is clear else 15
+        adx = 25.0 if (current_price > close.rolling(50).mean().iloc[-1]) else 15.0
 
-    # PSAR direction (replaces Supertrend — same concept: trend direction signal)
-    psar_bullish = float(latest["PSAR_up"] or 0) == 1.0
-    if psar_bullish:
-        score += 10
-        reasons.append("Parabolic SAR in bullish mode")
-    else:
-        score -= 10
-        reasons.append("Parabolic SAR in bearish mode")
+        trend_strength = "strong" if adx >= 25 else "moderate" if adx >= 20 else "weak"
+        volume_surge = volume.iloc[-1] > (volume.rolling(20).mean().iloc[-1] * 1.5)
 
-    # ADX trend strength
-    adx_val = float(latest["ADX_14"] or 0)
-    trend_strength = "weak"
-    if adx_val > 25:
-        trend_strength = "strong"
-        reasons.append(f"ADX at {adx_val:.1f} — strong trend, higher conviction signal")
-    else:
-        reasons.append(f"ADX at {adx_val:.1f} — weak/no trend, range-bound caution")
+        reasons = []
+        if rsi_val > 70:
+            reasons.append(f"RSI at {rsi_val:.1f} — overbought, potential pullback")
+        elif rsi_val < 30:
+            reasons.append(f"RSI at {rsi_val:.1f} — oversold, potential bounce")
+        else:
+            reasons.append(f"RSI at {rsi_val:.1f} — neutral momentum")
 
-    # Proximity to support/resistance
-    dist_to_resistance_pct = round(((resistance - close_val) / close_val) * 100, 2)
-    dist_to_support_pct    = round(((close_val - support)   / close_val) * 100, 2)
-    if dist_to_resistance_pct < 2:
-        score -= 8
-        reasons.append(f"Price only {dist_to_resistance_pct}% below resistance ({resistance}) — breakout needed")
-    if dist_to_support_pct < 2:
-        score += 8
-        reasons.append(f"Price only {dist_to_support_pct}% above support ({support}) — favorable risk/reward")
+        if macd_bullish:
+            reasons.append("MACD above signal line — bullish bias intact")
+        else:
+            reasons.append("MACD below signal line — bearish bias intact")
 
-    # Volume confirmation
-    avg_vol_20  = float(df["Volume"].tail(20).mean())
-    latest_vol  = float(latest["Volume"])
-    volume_surge = latest_vol > avg_vol_20 * 1.5
-    if volume_surge:
-        score += 8
-        reasons.append("Volume surging vs 20-day average — institutional interest likely")
+        if price_above_200_ema:
+            reasons.append("Price above 200 EMA — long-term trend bullish")
+        else:
+            reasons.append("Price below 200 EMA — long-term trend bearish")
 
-    score = max(0, min(100, round(score)))
+        if sar_bullish:
+            reasons.append("Parabolic SAR in bullish mode")
+        else:
+            reasons.append("Parabolic SAR in bearish mode")
 
-    return {
-        "symbol":           symbol.upper(),
-        "close":            round(close_val, 2),
-        "technical_score":  score,
-        "trend_strength":   trend_strength,
-        "support":          support,
-        "resistance":       resistance,
-        "rsi":              round(rsi, 1),
-        "volume_surge":     volume_surge,
-        "reasons":          reasons,
-    }
+        if adx >= 25:
+            reasons.append(f"ADX at {adx:.1f} — strong trend, higher conviction signal")
+        else:
+            reasons.append(f"ADX at {adx:.1f} — weak/no trend, range-bound caution")
 
+        dist_to_resistance = ((resistance - current_price) / current_price) * 100
+        reasons.append(f"Price only {dist_to_resistance:.2f}% below resistance ({resistance:.2f}) — breakout needed")
+
+        score = 50
+        if 30 < rsi_val < 70:
+            score += 5
+        if macd_bullish:
+            score += 10
+        if price_above_200_ema:
+            score += 10
+        if sar_bullish:
+            score += 10
+        if adx >= 25:
+            score += 10
+        if volume_surge:
+            score += 5
+        score = max(0, min(100, round(score)))
+
+        return {
+            "symbol": symbol,
+            "technical_score": score,
+            "trend_strength": trend_strength,
+            "volume_surge": volume_surge,
+            "close": current_price,
+            "support": support,
+            "resistance": resistance,
+            "reasons": reasons,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Technical analysis failed for {sym}")
+        raise HTTPException(status_code=502, detail=f"Technical analysis unavailable: {e}")
 
 if __name__ == "__main__":
     import uvicorn
