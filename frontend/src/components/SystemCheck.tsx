@@ -22,13 +22,12 @@ const SERVICE_LABELS: Record<string, string> = {
 const MAX_AUTO_ATTEMPTS = 6;
 const ESCAPE_HATCH_AFTER_ATTEMPTS = 3;
 
-export default function SystemCheck({ onReady }: { onReady: () => void }) {
+function SystemCheck({ onReady }: { onReady: () => void }) {
   const [stage, setStage] = useState<Stage>({ phase: "checking-gateway" });
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
   const cancelled = useRef(false);
   const currentAttempt = stage.phase === "waking" ? stage.attempt : 0;
 
-  // Track wake status per service
   const [wakingServices, setWakingServices] = useState<Record<string, boolean>>({});
   const [wakeMessages, setWakeMessages] = useState<Record<string, string>>({});
 
@@ -170,7 +169,6 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
     );
   }
 
-  // phase === "waking"
   const services = stage.health?.services || {};
   const entries = Object.entries(services);
   const showEscapeHatch = currentAttempt >= ESCAPE_HATCH_AFTER_ATTEMPTS;
@@ -292,5 +290,5 @@ function GateShell({ children }: { children: React.ReactNode }) {
   );
 }
 
-// ✅ Default export is here
+// ✅ Single default export
 export default SystemCheck;
