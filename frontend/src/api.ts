@@ -178,13 +178,18 @@ export const api = {
   getStock: (symbol: string, alreadyOwned = false) =>
     request<Decision>(`/stock/${symbol}?already_owned=${alreadyOwned}`),
 
+  // Full market scan (sync, legacy)
   runScan: () => request<ScanResult>("/scan"),
 
+  // Async scan with progress
   scanStart: (forceRefresh = false) =>
     request<{ task_id: string }>(`/scan/start?force_refresh=${forceRefresh}`, { method: "POST" }),
 
   scanStatus: (taskId: string) =>
     request<ScanStatus>(`/scan/status/${taskId}`),
+
+  // Scan only watchlist
+  scanWatchlist: () => request<ScanResult>("/scan/watchlist"),
 
   getWatchlist: () => request<{ symbols: string[] }>("/watchlist"),
 
@@ -195,6 +200,7 @@ export const api = {
       body: JSON.stringify({ symbols }),
     }),
 
+  // Market movers
   marketTopGainers: () => request<MarketResponse>("/market/top-gainers"),
   marketTopLosers: () => request<MarketResponse>("/market/top-losers"),
   marketMostActive: () => request<MarketResponse>("/market/most-active"),
