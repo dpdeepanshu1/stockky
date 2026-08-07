@@ -3,9 +3,6 @@ Fundamental Analysis Service
 ------------------------------
 Single responsibility: turn raw fundamental data (fetched from Market Data
 Service) into a fundamental quality score (0-100) and readable reasons.
-Thresholds below are reasonable general-purpose defaults for Indian large/mid
-caps — tune per-sector later (e.g. banks need a different debt-to-equity read
-than manufacturers).
 """
 import os
 import logging
@@ -42,7 +39,6 @@ def health():
 
 
 def _pct(x):
-    """Yahoo returns ratios as decimals (0.15 == 15%); normalize safely."""
     if x is None:
         return None
     return x * 100 if abs(x) < 5 else x
@@ -60,7 +56,31 @@ def analyze(symbol: str):
     score = 50
     reasons = []
 
+    # Extract metrics
     rev_growth = _pct(f.get("revenue_growth"))
+    earnings_growth = _pct(f.get("earnings_growth"))
+    roe = _pct(f.get("roe"))
+    d2e = f.get("debt_to_equity")
+    fcf = f.get("free_cashflow")
+    margins = _pct(f.get("profit_margins"))
+    inst_holding = _pct(f.get("held_percent_institutions"))
+    pe = f.get("pe_ratio")
+    forward_pe = f.get("forward_pe")
+
+    # Build metrics dict
+    metrics = {
+        "revenue_growth": rev_growth,
+        "earnings_growth": earnings_growth,
+        "roe": roe,
+        "debt_to_equity": d2e,
+        "free_cashflow": fcf,
+        "profit_margins": margins,
+        "institutional_holding": inst_holding,
+        "pe_ratio": pe,
+        "forward_pe": forward_pe,
+    }
+
+    # Scoring and reasons (same as before)
     if rev_growth is not None:
         if rev_growth > 15:
             score += 12
@@ -74,7 +94,6 @@ def analyze(symbol: str):
         else:
             reasons.append(f"Revenue growth flat at {rev_growth:.1f}%")
 
-    earnings_growth = _pct(f.get("earnings_growth"))
     if earnings_growth is not None:
         if earnings_growth > 15:
             score += 12
@@ -83,7 +102,6 @@ def analyze(symbol: str):
             score -= 12
             reasons.append(f"Earnings declining {earnings_growth:.1f}% YoY — margin or demand pressure")
 
-    roe = _pct(f.get("roe"))
     if roe is not None:
         if roe > 20:
             score += 10
@@ -95,7 +113,6 @@ def analyze(symbol: str):
             score -= 8
             reasons.append(f"ROE at {roe:.1f}% — weak returns on equity")
 
-    d2e = f.get("debt_to_equity")
     if d2e is not None:
         if d2e < 50:
             score += 8
@@ -106,7 +123,6 @@ def analyze(symbol: str):
         else:
             reasons.append(f"Debt/Equity at {d2e:.0f} — moderate leverage")
 
-    fcf = f.get("free_cashflow")
     if fcf is not None:
         if fcf > 0:
             score += 8
@@ -115,7 +131,6 @@ def analyze(symbol: str):
             score -= 10
             reasons.append("Negative free cash flow — relies on external financing")
 
-    margins = _pct(f.get("profit_margins"))
     if margins is not None:
         if margins > 15:
             score += 8
@@ -124,13 +139,10 @@ def analyze(symbol: str):
             score -= 8
             reasons.append(f"Net margin at {margins:.1f}% — thin profitability")
 
-    inst_holding = _pct(f.get("held_percent_institutions"))
     if inst_holding is not None and inst_holding > 40:
         score += 6
         reasons.append(f"Institutions hold {inst_holding:.1f}% — strong smart-money confidence")
 
-    pe = f.get("pe_ratio")
-    forward_pe = f.get("forward_pe")
     valuation_note = "fair"
     if pe is not None:
         if pe < 0:
@@ -149,15 +161,9 @@ def analyze(symbol: str):
             score += 4
             reasons.append("Forward P/E lower than trailing P/E — earnings expected to grow into valuation")
 
-    # FALLBACK: if no reasons were added, add a generic summary
+    # Always ensure at least one reason
     if not reasons:
         reasons.append("Fundamental data partially available; score is based on available metrics")
-        if pe is not None:
-            reasons.append(f"P/E ratio is {pe:.1f}")
-        if roe is not None:
-            reasons.append(f"ROE is {roe:.1f}%")
-        if rev_growth is not None:
-            reasons.append(f"Revenue growth is {rev_growth:.1f}%")
 
     score = max(0, min(100, round(score)))
 
@@ -168,6 +174,7 @@ def analyze(symbol: str):
         "sector": f.get("sector"),
         "industry": f.get("industry"),
         "reasons": reasons,
+        "metrics": metrics,          # <-- NEW: always include raw metrics
         "raw": f,
     }
 

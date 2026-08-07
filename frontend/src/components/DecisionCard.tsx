@@ -18,6 +18,9 @@ export default function DecisionCard({ data, onBack }: Props) {
     ...(data.prediction_score !== null ? [{ label: "AI Model", value: data.prediction_score }] : []),
   ];
 
+  // Fundamental metrics
+  const metrics = data.fundamental_metrics || {};
+
   return (
     <div className="space-y-4">
       <button
@@ -83,7 +86,7 @@ export default function DecisionCard({ data, onBack }: Props) {
         )}
       </div>
 
-      {/* Price levels */}
+      {/* Price levels + Fundamental Metrics (replaces old score breakdown) */}
       <div className="grid grid-cols-2 gap-4">
         <div className="rounded-xl border border-slate bg-graphite p-5">
           <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">Price levels</div>
@@ -99,7 +102,45 @@ export default function DecisionCard({ data, onBack }: Props) {
         </div>
       </div>
 
-      {/* Reasons – with fallback messages */}
+      {/* Fundamental Metrics */}
+      {Object.keys(metrics).length > 0 && (
+        <div className="rounded-xl border border-slate/60 bg-graphite/30 p-5">
+          <h3 className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">
+            📊 Fundamental Metrics
+          </h3>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+            {metrics.revenue_growth !== null && metrics.revenue_growth !== undefined && (
+              <MetricItem label="Revenue Growth" value={`${metrics.revenue_growth.toFixed(1)}%`} />
+            )}
+            {metrics.earnings_growth !== null && metrics.earnings_growth !== undefined && (
+              <MetricItem label="Earnings Growth" value={`${metrics.earnings_growth.toFixed(1)}%`} />
+            )}
+            {metrics.roe !== null && metrics.roe !== undefined && (
+              <MetricItem label="ROE" value={`${metrics.roe.toFixed(1)}%`} />
+            )}
+            {metrics.debt_to_equity !== null && metrics.debt_to_equity !== undefined && (
+              <MetricItem label="Debt/Equity" value={`${metrics.debt_to_equity.toFixed(1)}`} />
+            )}
+            {metrics.free_cashflow !== null && metrics.free_cashflow !== undefined && (
+              <MetricItem label="Free Cash Flow" value={metrics.free_cashflow > 0 ? "Positive" : "Negative"} />
+            )}
+            {metrics.profit_margins !== null && metrics.profit_margins !== undefined && (
+              <MetricItem label="Net Margin" value={`${metrics.profit_margins.toFixed(1)}%`} />
+            )}
+            {metrics.institutional_holding !== null && metrics.institutional_holding !== undefined && (
+              <MetricItem label="Institutional Holding" value={`${metrics.institutional_holding.toFixed(1)}%`} />
+            )}
+            {metrics.pe_ratio !== null && metrics.pe_ratio !== undefined && (
+              <MetricItem label="P/E Ratio" value={`${metrics.pe_ratio.toFixed(1)}`} />
+            )}
+            {metrics.forward_pe !== null && metrics.forward_pe !== undefined && (
+              <MetricItem label="Forward P/E" value={`${metrics.forward_pe.toFixed(1)}`} />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Reasons */}
       <div className="grid md:grid-cols-2 gap-4">
         <ReasonList title="Technical" items={data.reasons.technical} />
         <ReasonList title="Fundamental" items={data.reasons.fundamental} />
@@ -128,6 +169,18 @@ export default function DecisionCard({ data, onBack }: Props) {
           {data.natural_language_summary}
         </p>
       </div>
+    </div>
+  );
+}
+
+// ... (PriceLevelBar, ScoreBar, ReasonList remain the same)
+// Add MetricItem helper
+
+function MetricItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="bg-ink/40 border border-slate/40 rounded-lg px-3 py-2">
+      <div className="font-mono text-[9px] text-mist/50 uppercase tracking-wider">{label}</div>
+      <div className="font-mono text-sm text-paper mt-0.5">{value}</div>
     </div>
   );
 }

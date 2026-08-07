@@ -75,6 +75,7 @@ export default function App() {
     setTab("dashboard");
     setView({ mode: "loading", label: `Analysing ${symbol.toUpperCase()}...` });
     if (pollInterval) clearInterval(pollInterval);
+    setScanTaskId(null);
     try {
       const data = await api.getStock(symbol.trim());
       setView({ mode: "stock", data });
@@ -87,6 +88,8 @@ export default function App() {
   // Full market scan (async)
   async function handleScan() {
     setView({ mode: "loading", label: "Starting market scan..." });
+    setScanTaskId(null);
+    if (pollInterval) clearInterval(pollInterval);
     try {
       const { task_id } = await api.scanStart();
       setScanTaskId(task_id);
@@ -94,13 +97,23 @@ export default function App() {
       setPollInterval(interval);
       await pollScanStatus(task_id);
     } catch (e) {
-      setView({ mode: "error", message: (e as Error).message });
+      // If we have a task ID, check if it's still running before showing error
+      if (scanTaskId) {
+        // Resume polling if task exists
+        const interval = window.setInterval(() => pollScanStatus(scanTaskId), 1000);
+        setPollInterval(interval);
+        pollScanStatus(scanTaskId);
+      } else {
+        setView({ mode: "error", message: (e as Error).message });
+      }
     }
   }
 
   // Scan only watchlist
   async function handleScanWatchlist() {
     setView({ mode: "loading", label: "Scanning watchlist..." });
+    setScanTaskId(null);
+    if (pollInterval) clearInterval(pollInterval);
     try {
       const data = await api.scanWatchlist();
       setView({ mode: "scan", data });
@@ -135,9 +148,23 @@ export default function App() {
         setView({ mode: "error", message: status.error || "Scan failed" });
       }
     } catch (e) {
+      // If status fetch fails, keep polling if task exists
       console.warn("Polling error", e);
+      // Don't clear interval; let it retry
     }
   }
+
+  // Retry handler for error view
+  const handleRetry = () => {
+    if (scanTaskId) {
+      // Resume polling the existing task
+      const interval = window.setInterval(() => pollScanStatus(scanTaskId), 1000);
+      setPollInterval(interval);
+      pollScanStatus(scanTaskId);
+    } else {
+      setView({ mode: "idle" });
+    }
+  };
 
   async function handleWatchlistUpdate(symbols: string[]) {
     await api.setWatchlist(symbols);
@@ -382,10 +409,10 @@ export default function App() {
                   )}
                   <div className="flex gap-4 mt-4">
                     <button
-                      onClick={() => setView({ mode: "idle" })}
-                      className="font-mono text-xs text-mist hover:text-paper underline"
+                      onClick={handleRetry}
+                      className="font-mono text-xs text-paper bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-1.5 hover:bg-signal-prepare/30 transition"
                     >
-                      Try again
+                      {scanTaskId ? "Resume Scan" : "Try again"}
                     </button>
                     <button
                       onClick={() => setShowSettings(true)}

@@ -43,6 +43,18 @@ export interface Decision {
   valuation: string;
   sector: string | null;
   natural_language_summary: string;
+  // Add fundamental metrics (optional, but we'll populate from backend)
+  fundamental_metrics?: {
+    revenue_growth: number | null;
+    earnings_growth: number | null;
+    roe: number | null;
+    debt_to_equity: number | null;
+    free_cashflow: number | null;
+    profit_margins: number | null;
+    institutional_holding: number | null;
+    pe_ratio: number | null;
+    forward_pe: number | null;
+  };
 }
 
 export interface ScanResult {
@@ -117,7 +129,8 @@ export interface SystemHealth {
   services: Record<string, SystemServiceStatus>;
 }
 
-async function request<T>(path: string, init?: RequestInit, retries = 2): Promise<T> {
+/** Flexible request wrapper with configurable timeout (default 60s) */
+async function request<T>(path: string, init?: RequestInit, retries = 2, timeoutMs = 60000): Promise<T> {
   const base = getApiUrl();
   if (!base) {
     throw new Error(
@@ -127,7 +140,7 @@ async function request<T>(path: string, init?: RequestInit, retries = 2): Promis
 
   const url = `${base}${path}`;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(url, {
@@ -147,12 +160,12 @@ async function request<T>(path: string, init?: RequestInit, retries = 2): Promis
 
     if (retries > 0 && (error instanceof TypeError || error instanceof DOMException)) {
       await new Promise((resolve) => setTimeout(resolve, 1000 * (3 - retries)));
-      return request<T>(path, init, retries - 1);
+      return request<T>(path, init, retries - 1, timeoutMs);
     }
 
     if (error instanceof DOMException && error.name === "AbortError") {
       throw new Error(
-        `Request timed out after 30 seconds. The backend may be waking up (free-tier cold start). Try again in a moment.`
+        `Request timed out after ${timeoutMs / 1000} seconds. The backend may be waking up (free-tier cold start). Try again in a moment.`
       );
     }
 
@@ -160,53 +173,60 @@ async function request<T>(path: string, init?: RequestInit, retries = 2): Promis
   }
 }
 
-/** Helper to wake a service by its URL (used by wake buttons) */
+/** Helper to wake a service by its URL */
 export async function wakeService(url: string): Promise<void> {
   if (!url) return;
   try {
     await fetch(url + "/health", { mode: "no-cors" });
   } catch {
-    // Ignore – the request still wakes the service
+    // Ignore – request still wakes the service
   }
 }
 
 export const api = {
-  ping: () => request<{ status: string; service: string }>("/health"),
+  ping: () => request<{ status: string; service: string }>("/health", undefined, 2, 30000),
 
-  systemHealth: () => request<SystemHealth>("/system/health"),
+  systemHealth: () => request<SystemHealth>("/system/health", undefined, 2, 60000),
 
   getStock: (symbol: string, alreadyOwned = false) =>
-    request<Decision>(`/stock/${symbol}?already_owned=${alreadyOwned}`),
+    request<Decision>(`/stock/${symbol}?already_owned=${alreadyOwned}`, undefined, 2, 60000),
 
-  // Full market scan (sync, legacy)
-  runScan: () => request<ScanResult>("/scan"),
+  runScan: () => request<ScanResult>("/scan", undefined, 2, 120000), // 2 min for sync scan
 
-  // Async scan with progress
   scanStart: (forceRefresh = false) =>
-    request<{ task_id: string }>(`/scan/start?force_refresh=${forceRefresh}`, { method: "POST" }),
+    request<{ task_id: string }>(
+      `/scan/start?force_refresh=${forceRefresh}`,
+      { method: "POST" },
+      2,
+      120000 // 2 minutes for cold start
+    ),
 
   scanStatus: (taskId: string) =>
-    request<ScanStatus>(`/scan/status/${taskId}`),
+    request<ScanStatus>(`/scan/status/${taskId}`, undefined, 2, 10000), // 10s polling
 
-  // Scan only watchlist
-  scanWatchlist: () => request<ScanResult>("/scan/watchlist"),
+  scanWatchlist: () =>
+    request<ScanResult>("/scan/watchlist", undefined, 2, 120000),
 
-  getWatchlist: () => request<{ symbols: string[] }>("/watchlist"),
+  getWatchlist: () => request<{ symbols: string[] }>("/watchlist", undefined, 2, 30000),
 
   setWatchlist: (symbols: string[]) =>
-    request<{ symbols: string[] }>("/watchlist", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ symbols }),
-    }),
+    request<{ symbols: string[] }>(
+      "/watchlist",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbols }),
+      },
+      2,
+      30000
+    ),
 
-  // Market movers
-  marketTopGainers: () => request<MarketResponse>("/market/top-gainers"),
-  marketTopLosers: () => request<MarketResponse>("/market/top-losers"),
-  marketMostActive: () => request<MarketResponse>("/market/most-active"),
-  marketTrending: () => request<MarketResponse>("/market/trending"),
+  marketTopGainers: () => request<MarketResponse>("/market/top-gainers", undefined, 2, 30000),
+  marketTopLosers: () => request<MarketResponse>("/market/top-losers", undefined, 2, 30000),
+  marketMostActive: () => request<MarketResponse>("/market/most-active", undefined, 2, 30000),
+  marketTrending: () => request<MarketResponse>("/market/trending", undefined, 2, 30000),
 
-  getNotificationConfig: () => request<NotificationConfig>("/notifications/config"),
+  getNotificationConfig: () => request<NotificationConfig>("/notifications/config", undefined, 2, 30000),
 
   saveNotificationConfig: (update: {
     discord_webhook_url?: string;
@@ -215,18 +235,25 @@ export const api = {
     telegram_chat_id?: string;
     enabled?: Partial<Record<"discord" | "slack" | "telegram", boolean>>;
   }) =>
-    request<NotificationConfig>("/notifications/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(update),
-    }),
+    request<NotificationConfig>(
+      "/notifications/config",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(update),
+      },
+      2,
+      30000
+    ),
 
   clearNotificationChannel: (channel: "discord" | "slack" | "telegram") =>
-    request<NotificationConfig>(`/notifications/config/${channel}`, { method: "DELETE" }),
+    request<NotificationConfig>(`/notifications/config/${channel}`, { method: "DELETE" }, 2, 30000),
 
   testNotifications: () =>
     request<{ delivered: boolean; note?: string; results?: Record<string, string> }>(
       "/notifications/test",
-      { method: "POST" }
+      { method: "POST" },
+      2,
+      30000
     ),
 };
