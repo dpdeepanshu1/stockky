@@ -16,6 +16,18 @@ export function clearApiUrlOverride() {
   localStorage.removeItem(STORAGE_KEY);
 }
 
+export interface FundamentalMetrics {
+  revenue_growth: number | null;
+  earnings_growth: number | null;
+  roe: number | null;
+  debt_to_equity: number | null;
+  free_cashflow: number | null;
+  profit_margins: number | null;
+  institutional_holding: number | null;
+  pe_ratio: number | null;
+  forward_pe: number | null;
+}
+
 export interface Decision {
   symbol: string;
   decision: "BUY NOW" | "PREPARE TO BUY" | "HOLD" | "DO NOT BUY" | "SELL";
@@ -43,18 +55,7 @@ export interface Decision {
   valuation: string;
   sector: string | null;
   natural_language_summary: string;
-  // Add fundamental metrics (optional, but we'll populate from backend)
-  fundamental_metrics?: {
-    revenue_growth: number | null;
-    earnings_growth: number | null;
-    roe: number | null;
-    debt_to_equity: number | null;
-    free_cashflow: number | null;
-    profit_margins: number | null;
-    institutional_holding: number | null;
-    pe_ratio: number | null;
-    forward_pe: number | null;
-  };
+  fundamental_metrics?: FundamentalMetrics;  // <-- explicit type
 }
 
 export interface ScanResult {
@@ -191,18 +192,18 @@ export const api = {
   getStock: (symbol: string, alreadyOwned = false) =>
     request<Decision>(`/stock/${symbol}?already_owned=${alreadyOwned}`, undefined, 2, 60000),
 
-  runScan: () => request<ScanResult>("/scan", undefined, 2, 120000), // 2 min for sync scan
+  runScan: () => request<ScanResult>("/scan", undefined, 2, 120000),
 
   scanStart: (forceRefresh = false) =>
     request<{ task_id: string }>(
       `/scan/start?force_refresh=${forceRefresh}`,
       { method: "POST" },
       2,
-      120000 // 2 minutes for cold start
+      120000
     ),
 
   scanStatus: (taskId: string) =>
-    request<ScanStatus>(`/scan/status/${taskId}`, undefined, 2, 10000), // 10s polling
+    request<ScanStatus>(`/scan/status/${taskId}`, undefined, 2, 10000),
 
   scanWatchlist: () =>
     request<ScanResult>("/scan/watchlist", undefined, 2, 120000),
