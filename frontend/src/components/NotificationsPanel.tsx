@@ -277,7 +277,7 @@ function ChannelCard({
             <StatusPill connected={connected} enabled={enabled} />
           </div>
           <p className="text-mist/70 text-xs max-w-sm">{meta.blurb}</p>
-          
+          <a
             href={meta.setupUrl}
             target="_blank"
             rel="noreferrer"
