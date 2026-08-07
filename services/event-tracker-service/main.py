@@ -20,7 +20,6 @@ import os
 import json
 import math
 import logging
-from upstash_redis import Redis
 from datetime import datetime
 from typing import List
 
@@ -36,6 +35,23 @@ logger = logging.getLogger("event-tracker-service")
 app = FastAPI(title="Stockky Event Tracker Service", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+@app.get("/")
+def root():
+    return {
+        "service": "Stockky Event Tracker Service",
+        "status": "running",
+        "endpoints": {
+            "/health": "GET – health check",
+            "/events/{symbol}": "GET – full event snapshot for a symbol",
+            "/subscribe": "POST – subscribe to symbols",
+            "/subscriptions": "GET – list subscribed symbols",
+            "/check": "GET – check for changes in subscribed symbols",
+            "/docs": "Swagger UI documentation",
+        },
+    }
+
+
 # ── Redis ──────────────────────────────────────────────────────────────────────
 _redis = None
 try:
@@ -44,10 +60,12 @@ try:
         token=os.getenv("UPSTASH_REDIS_REST_TOKEN"),
     )
     _redis.ping()
+    logger.info("Connected to Upstash Redis")
 except Exception as e:
     logger.warning("Redis unavailable, state will not persist: %s", e)
 
 STATE_KEY = "stockky:event_state"
+
 
 def _load_state() -> dict:
     if _redis:
@@ -59,13 +77,15 @@ def _load_state() -> dict:
             pass
     return {"subscriptions": [], "last_known": {}}
 
+
 def _save_state(state: dict):
     if _redis:
         try:
             _redis.set(STATE_KEY, json.dumps(state, default=str))
         except Exception as e:
             logger.warning("Failed to persist state: %s", e)
-            
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 class SubscribeRequest(BaseModel):
     symbols: List[str]
@@ -276,4 +296,5 @@ def check_for_changes():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8006, reload=True)
+    port = int(os.getenv("PORT", 8006))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

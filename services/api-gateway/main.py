@@ -66,6 +66,24 @@ class WatchlistUpdate(BaseModel):
     symbols: List[str]
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "Stockky API Gateway",
+        "version": "0.2.0",
+        "status": "running",
+        "endpoints": {
+            "/health": "GET – health check",
+            "/watchlist": "GET/POST – manage watchlist",
+            "/watchlist/add": "POST – add symbols",
+            "/watchlist/{symbol}": "DELETE – remove symbol",
+            "/stock/{symbol}": "GET – get decision for a symbol",
+            "/scan": "GET – scan watchlist",
+            "/docs": "Swagger UI documentation",
+        },
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "api-gateway", "redis": bool(_redis)}
@@ -152,4 +170,5 @@ def run_scan():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

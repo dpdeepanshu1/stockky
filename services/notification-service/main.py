@@ -79,6 +79,23 @@ if Redis is not None:
 _memory_config: Optional[dict] = None
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "Stockky Notification Service",
+        "status": "running",
+        "endpoints": {
+            "/health": "GET – health check",
+            "/config": "GET – current notification configuration",
+            "/config": "POST – update notification configuration",
+            "/config/{channel}": "DELETE – clear a channel",
+            "/notify": "POST – send a notification",
+            "/test": "POST – test notification delivery",
+            "/docs": "Swagger UI documentation",
+        },
+    }
+
+
 def _load_config() -> dict:
     global _memory_config
     if _redis:
@@ -295,5 +312,5 @@ def test_notifications():
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=8008, reload=True)
+    port = int(os.getenv("PORT", 8008))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

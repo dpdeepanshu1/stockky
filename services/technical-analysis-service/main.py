@@ -25,6 +25,19 @@ app = FastAPI(title="Stockky Technical Analysis Service", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "Stockky Technical Analysis Service",
+        "status": "running",
+        "endpoints": {
+            "/health": "GET – health check",
+            "/analyze/{symbol}": "GET – technical score for a symbol",
+            "/docs": "Swagger UI documentation",
+        },
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "technical-analysis-service"}
@@ -186,4 +199,5 @@ def analyze(symbol: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=True)
+    port = int(os.getenv("PORT", 8002))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
