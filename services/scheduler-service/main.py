@@ -64,6 +64,16 @@ KEEPALIVE_ENDPOINTS = [
 # ---------- FastAPI app ----------
 app = FastAPI(title="Stockky Scheduler Service", version="1.0.0")
 
+@app.get("/")
+def root():
+    return {
+        "service": "Stockky Scheduler Service",
+        "status": "running",
+        "endpoints": {
+            "/health": "GET – health check",
+        },
+    }
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "scheduler-service"}
