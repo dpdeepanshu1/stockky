@@ -28,6 +28,10 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
   const cancelled = useRef(false);
   const currentAttempt = stage.phase === "waking" ? stage.attempt : 0;
 
+  // Track wake status per service
+  const [wakingServices, setWakingServices] = useState<Record<string, boolean>>({});
+  const [wakeMessages, setWakeMessages] = useState<Record<string, string>>({});
+
   useEffect(() => {
     cancelled.current = false;
     runCheck(0);
@@ -75,14 +79,42 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
     }
   }
 
-  async function handleWakeService(url: string | null | undefined) {
+  async function handleWakeService(url: string | null | undefined, serviceName: string) {
     if (!url) return;
-    await wakeService(url);
-    setTimeout(() => runCheck(currentAttempt), 3000);
+    setWakingServices((prev) => ({ ...prev, [serviceName]: true }));
+    setWakeMessages((prev) => ({ ...prev, [serviceName]: "⏳ Waking..." }));
+
+    try {
+      await wakeService(url);
+      setWakeMessages((prev) => ({ ...prev, [serviceName]: "✅ Woke! Rechecking..." }));
+      // Wait a moment, then recheck
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      await runCheck(currentAttempt);
+      setWakeMessages((prev) => ({ ...prev, [serviceName]: "🟢 Online" }));
+    } catch {
+      setWakeMessages((prev) => ({ ...prev, [serviceName]: "❌ Wake failed" }));
+    } finally {
+      setWakingServices((prev) => ({ ...prev, [serviceName]: false }));
+      // Clear message after 5 seconds
+      setTimeout(() => {
+        setWakeMessages((prev) => {
+          const newMsg = { ...prev };
+          delete newMsg[serviceName];
+          return newMsg;
+        });
+      }, 5000);
+    }
   }
 
   async function wakeAllServices() {
-    runCheck(currentAttempt);
+    // Get all services that have a URL and are not OK
+    const services = stage.phase === "waking" ? stage.health?.services : {};
+    if (!services) return;
+    for (const [name, s] of Object.entries(services)) {
+      if (s.url && !s.ok) {
+        await handleWakeService(s.url, name);
+      }
+    }
   }
 
   function saveGatewayUrl() {
@@ -165,7 +197,9 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
             key={name}
             name={SERVICE_LABELS[name] || name}
             status={s}
-            onWake={() => handleWakeService(s.url)}
+            onWake={() => handleWakeService(s.url, name)}
+            isWaking={!!wakingServices[name]}
+            message={wakeMessages[name]}
           />
         ))}
       </div>
@@ -200,10 +234,14 @@ function ServiceRow({
   name,
   status,
   onWake,
+  isWaking,
+  message,
 }: {
   name: string;
   status: { ok: boolean; required: boolean; status: string; url?: string | null };
   onWake: () => void;
+  isWaking: boolean;
+  message?: string;
 }) {
   let statusText = status.status;
   let color = "text-mist/30";
@@ -234,10 +272,14 @@ function ServiceRow({
         {status.url && !status.ok && (
           <button
             onClick={onWake}
-            className="text-xs px-2 py-0.5 border border-slate/60 rounded hover:border-mist/60 hover:text-paper transition"
+            disabled={isWaking}
+            className="text-xs px-2 py-0.5 border border-slate/60 rounded hover:border-mist/60 hover:text-paper transition disabled:opacity-50"
           >
-            Wake
+            {isWaking ? "⏳" : "Wake"}
           </button>
+        )}
+        {message && (
+          <span className="text-[10px] text-mist/60">{message}</span>
         )}
       </div>
     </div>

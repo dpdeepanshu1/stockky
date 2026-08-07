@@ -9,6 +9,7 @@ export default function ServiceManager({ onClose }: ServiceManagerProps) {
   const [services, setServices] = useState<Record<string, SystemServiceStatus>>({});
   const [loading, setLoading] = useState(true);
   const [waking, setWaking] = useState<Record<string, boolean>>({});
+  const [messages, setMessages] = useState<Record<string, string>>({});
 
   const fetchServices = async () => {
     setLoading(true);
@@ -29,6 +30,8 @@ export default function ServiceManager({ onClose }: ServiceManagerProps) {
   const handleWake = async (name: string, url: string | null | undefined) => {
     if (!url) return;
     setWaking((prev) => ({ ...prev, [name]: true }));
+    setMessages((prev) => ({ ...prev, [name]: "⏳ Waking..." }));
+
     try {
       // Open the render URL in a small popup to trigger wake
       const popup = window.open(url + "/health", "_blank", "width=400,height=200");
@@ -36,19 +39,28 @@ export default function ServiceManager({ onClose }: ServiceManagerProps) {
         if (popup) popup.close();
       }, 3000);
       // Wait a bit and then re-fetch status
-      setTimeout(async () => {
-        await fetchServices();
-        setWaking((prev) => ({ ...prev, [name]: false }));
-      }, 5000);
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await fetchServices();
+      setMessages((prev) => ({ ...prev, [name]: "✅ Online" }));
     } catch {
+      setMessages((prev) => ({ ...prev, [name]: "❌ Failed" }));
+    } finally {
       setWaking((prev) => ({ ...prev, [name]: false }));
+      // Clear message after 5 seconds
+      setTimeout(() => {
+        setMessages((prev) => {
+          const newMsg = { ...prev };
+          delete newMsg[name];
+          return newMsg;
+        });
+      }, 5000);
     }
   };
 
-  const handleWakeAll = () => {
+  const handleWakeAll = async () => {
     for (const [name, status] of Object.entries(services)) {
-      if (status.url) {
-        handleWake(name, status.url);
+      if (status.url && !status.ok) {
+        await handleWake(name, status.url);
       }
     }
   };
@@ -78,6 +90,7 @@ export default function ServiceManager({ onClose }: ServiceManagerProps) {
             <div className="space-y-2">
               {Object.entries(services).map(([name, status]) => {
                 const isWaking = waking[name] || false;
+                const msg = messages[name] || "";
                 return (
                   <div
                     key={name}
@@ -103,15 +116,20 @@ export default function ServiceManager({ onClose }: ServiceManagerProps) {
                         )}
                       </div>
                     </div>
-                    {status.url && (
-                      <button
-                        onClick={() => handleWake(name, status.url)}
-                        disabled={isWaking}
-                        className="font-mono text-xs px-3 py-1.5 border border-slate rounded hover:border-mist hover:text-paper transition disabled:opacity-50"
-                      >
-                        {isWaking ? "Waking..." : "Wake"}
-                      </button>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {status.url && !status.ok && (
+                        <button
+                          onClick={() => handleWake(name, status.url)}
+                          disabled={isWaking}
+                          className="font-mono text-xs px-3 py-1.5 border border-slate rounded hover:border-mist hover:text-paper transition disabled:opacity-50"
+                        >
+                          {isWaking ? "⏳ Waking..." : "Wake"}
+                        </button>
+                      )}
+                      {msg && (
+                        <span className="text-[10px] text-mist/60">{msg}</span>
+                      )}
+                    </div>
                   </div>
                 );
               })}
