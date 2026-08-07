@@ -28,7 +28,6 @@ EVENT_RISK_WINDOW_DAYS = 3
 app = FastAPI(title="Stockky Decision Engine", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-
 class Decision(str, Enum):
     BUY_NOW = "BUY NOW"
     PREPARE_TO_BUY = "PREPARE TO BUY"
@@ -36,10 +35,8 @@ class Decision(str, Enum):
     DO_NOT_BUY = "DO NOT BUY"
     SELL = "SELL"
 
-
 class DecisionRequest(BaseModel):
     already_owned: bool = False
-
 
 @app.get("/")
 def root():
@@ -53,11 +50,9 @@ def root():
         },
     }
 
-
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "decision-engine-service"}
-
 
 async def _fetch_required(client: httpx.AsyncClient, url: str, label: str) -> dict:
     try:
@@ -66,7 +61,6 @@ async def _fetch_required(client: httpx.AsyncClient, url: str, label: str) -> di
         return resp.json()
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"{label} unavailable: {e}")
-
 
 async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
     try:
@@ -77,22 +71,14 @@ async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
         logger.warning("%s unavailable, continuing without it: %s", label, e)
         return None
 
-
-def _combined_score(
-    technical_score: int,
-    fundamental_score: int,
-    news_score: int | None,
-    prediction_score: int | None,
-) -> float:
+def _combined_score(technical_score: int, fundamental_score: int, news_score: int | None, prediction_score: int | None) -> float:
     weights = {"technical": 0.55, "fundamental": 0.45, "news": 0.0, "prediction": 0.0}
-
     if news_score is not None and prediction_score is not None:
         weights = {"technical": 0.40, "fundamental": 0.30, "news": 0.10, "prediction": 0.20}
     elif news_score is not None:
         weights = {"technical": 0.45, "fundamental": 0.35, "news": 0.20, "prediction": 0.0}
     elif prediction_score is not None:
         weights = {"technical": 0.40, "fundamental": 0.30, "news": 0.0, "prediction": 0.30}
-
     total = technical_score * weights["technical"] + fundamental_score * weights["fundamental"]
     if news_score is not None:
         total += news_score * weights["news"]
@@ -100,49 +86,25 @@ def _combined_score(
         total += prediction_score * weights["prediction"]
     return round(total, 1)
 
-
-def _decide(
-    technical_score: int,
-    fundamental_score: int,
-    news_score: int | None,
-    prediction_score: int | None,
-    trend_strength: str,
-    volume_surge: bool,
-    dist_to_resistance_pct: float,
-    event_risk: bool,
-    already_owned: bool,
-) -> Decision:
+def _decide(technical_score: int, fundamental_score: int, news_score: int | None, prediction_score: int | None,
+            trend_strength: str, volume_surge: bool, dist_to_resistance_pct: float, event_risk: bool, already_owned: bool) -> Decision:
     combined = _combined_score(technical_score, fundamental_score, news_score, prediction_score)
-
     if already_owned and combined < 40:
         return Decision.SELL
     if already_owned and 40 <= combined < 70:
         return Decision.HOLD
-
     news_ok = news_score is None or news_score >= 40
     model_ok = prediction_score is None or prediction_score >= 55
-
-    if (
-        technical_score >= 70
-        and fundamental_score >= 60
-        and trend_strength == "strong"
-        and volume_surge
-        and dist_to_resistance_pct > 2
-        and news_ok
-        and model_ok
-    ):
+    if (technical_score >= 70 and fundamental_score >= 60 and trend_strength == "strong" and volume_surge
+        and dist_to_resistance_pct > 2 and news_ok and model_ok):
         if event_risk:
             return Decision.PREPARE_TO_BUY
         return Decision.BUY_NOW
-
     if fundamental_score >= 60 and 55 <= technical_score < 70:
         return Decision.PREPARE_TO_BUY
-
     if already_owned and combined >= 70:
         return Decision.HOLD
-
     return Decision.DO_NOT_BUY
-
 
 @app.get("/decide/{symbol}")
 async def decide(symbol: str, already_owned: bool = False):
@@ -152,7 +114,6 @@ async def decide(symbol: str, already_owned: bool = False):
         news_task = _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
         prediction_task = _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
         events_task = _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
-
         technical, fundamental, news, prediction, events = await asyncio.gather(
             technical_task, fundamental_task, news_task, prediction_task, events_task
         )
@@ -161,9 +122,7 @@ async def decide(symbol: str, already_owned: bool = False):
     fundamental_score = fundamental["fundamental_score"]
     news_score = news["news_score"] if news else None
     prediction_score = prediction["prediction_score"] if prediction and prediction.get("model_loaded") else None
-
-    # Extract fundamental metrics
-    fundamental_metrics = fundamental.get("metrics")
+    fundamental_metrics = fundamental.get("metrics")   # <-- extract metrics
 
     close = technical["close"]
     resistance = technical["resistance"]
@@ -183,18 +142,9 @@ async def decide(symbol: str, already_owned: bool = False):
         except (ValueError, TypeError):
             pass
 
-    decision = _decide(
-        technical_score=technical_score,
-        fundamental_score=fundamental_score,
-        news_score=news_score,
-        prediction_score=prediction_score,
-        trend_strength=technical["trend_strength"],
-        volume_surge=technical["volume_surge"],
-        dist_to_resistance_pct=dist_to_resistance_pct,
-        event_risk=event_risk,
-        already_owned=already_owned,
-    )
-
+    decision = _decide(technical_score, fundamental_score, news_score, prediction_score,
+                       technical["trend_strength"], technical["volume_surge"], dist_to_resistance_pct,
+                       event_risk, already_owned)
     combined_score = _combined_score(technical_score, fundamental_score, news_score, prediction_score)
 
     entry_low, entry_high = round(support * 1.01, 2), round(close * 1.005, 2)
@@ -239,12 +189,11 @@ async def decide(symbol: str, already_owned: bool = False):
         "sector": fundamental["sector"],
     }
 
-    # Include fundamental metrics if present
+    # ✅ Include fundamental metrics if present
     if fundamental_metrics:
         response["fundamental_metrics"] = fundamental_metrics
 
     return response
-
 
 if __name__ == "__main__":
     import uvicorn

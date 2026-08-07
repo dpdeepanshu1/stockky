@@ -19,7 +19,6 @@ MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://market-data-service.onre
 app = FastAPI(title="Stockky Fundamental Analysis Service", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-
 @app.get("/")
 def root():
     return {
@@ -32,17 +31,14 @@ def root():
         },
     }
 
-
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "fundamental-analysis-service"}
-
 
 def _pct(x):
     if x is None:
         return None
     return x * 100 if abs(x) < 5 else x
-
 
 @app.get("/analyze/{symbol}")
 def analyze(symbol: str):
@@ -56,7 +52,7 @@ def analyze(symbol: str):
     score = 50
     reasons = []
 
-    # Extract metrics
+    # Extract metrics (using the same keys as market-data-service)
     rev_growth = f.get("revenue_growth")
     earnings_growth = f.get("earnings_growth")
     roe = f.get("roe")
@@ -67,7 +63,7 @@ def analyze(symbol: str):
     pe = f.get("pe_ratio")
     forward_pe = f.get("forward_pe")
 
-    # Build metrics dict (always include, even if None)
+    # Build metrics dict
     metrics = {
         "revenue_growth": rev_growth,
         "earnings_growth": earnings_growth,
@@ -80,7 +76,7 @@ def analyze(symbol: str):
         "forward_pe": forward_pe,
     }
 
-    # Scoring and reasons (same as before)
+    # Scoring and reasons
     if rev_growth is not None:
         if rev_growth > 15:
             score += 12
@@ -161,7 +157,6 @@ def analyze(symbol: str):
             score += 4
             reasons.append("Forward P/E lower than trailing P/E — earnings expected to grow into valuation")
 
-    # Always ensure at least one reason
     if not reasons:
         reasons.append("Fundamental data partially available; score is based on available metrics")
 
@@ -174,10 +169,9 @@ def analyze(symbol: str):
         "sector": f.get("sector"),
         "industry": f.get("industry"),
         "reasons": reasons,
-        "metrics": metrics,
+        "metrics": metrics,          # <-- KEY: include raw metrics
         "raw": f,
     }
-
 
 if __name__ == "__main__":
     import uvicorn

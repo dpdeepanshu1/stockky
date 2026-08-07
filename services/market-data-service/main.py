@@ -30,8 +30,10 @@ session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 })
-# Override the session used by yfinance
+yf.set_tz_cache_location("/tmp/yfinance_tz")
 yf.shared._session = session
 
 def _safe(val, decimals=2):
@@ -51,10 +53,21 @@ def _safe_int(val):
         return None
 
 def _compute_growth(current, previous):
-    """Compute percentage growth from previous to current."""
     if previous is None or previous == 0:
         return None
     return ((current - previous) / previous) * 100
+
+def _with_retry(func, max_retries=3, base_delay=2):
+    """Retry a function with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = base_delay * (2 ** attempt)
+            logging.warning(f"Retry {attempt+1}/{max_retries} after {wait}s: {e}")
+            time.sleep(wait)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("market-data-service")
@@ -231,19 +244,27 @@ def get_fundamentals_raw(symbol: str):
 
         # Get info with retry (it might work with custom session)
         info = {}
-        for attempt in range(3):
-            try:
-                info = ticker.info
-                if info:
-                    break
-                time.sleep(1)
-            except Exception:
-                time.sleep(1)
+        try:
+            info = _with_retry(lambda: ticker.info, max_retries=3, base_delay=2)
+        except Exception as e:
+            logger.warning(f"Could not fetch info for {sym}: {e}")
 
-        # Get financials, balance sheet, cashflow
-        financials = ticker.financials
-        balance = ticker.balance_sheet
-        cashflow = ticker.cashflow
+        # Get financials, balance sheet, cashflow with retry
+        financials = None
+        balance = None
+        cashflow = None
+        try:
+            financials = _with_retry(lambda: ticker.financials, max_retries=2, base_delay=1)
+        except Exception as e:
+            logger.warning(f"Could not fetch financials for {sym}: {e}")
+        try:
+            balance = _with_retry(lambda: ticker.balance_sheet, max_retries=2, base_delay=1)
+        except Exception as e:
+            logger.warning(f"Could not fetch balance sheet for {sym}: {e}")
+        try:
+            cashflow = _with_retry(lambda: ticker.cashflow, max_retries=2, base_delay=1)
+        except Exception as e:
+            logger.warning(f"Could not fetch cashflow for {sym}: {e}")
 
         # Helper to safely get info key
         def _safe_info(key):
@@ -255,18 +276,18 @@ def get_fundamentals_raw(symbol: str):
             except (ValueError, TypeError):
                 return None
 
-        # Revenue growth
+        # Revenue growth (from financials)
         revenue_growth = None
-        if not financials.empty and "Total Revenue" in financials.index:
+        if financials is not None and not financials.empty and "Total Revenue" in financials.index:
             rev_series = financials.loc["Total Revenue"]
             if len(rev_series) >= 2:
                 current_rev = rev_series.iloc[0]
                 prev_rev = rev_series.iloc[1]
                 revenue_growth = _compute_growth(current_rev, prev_rev)
 
-        # Earnings growth
+        # Earnings growth (Net Income)
         earnings_growth = None
-        if not financials.empty and "Net Income" in financials.index:
+        if financials is not None and not financials.empty and "Net Income" in financials.index:
             earnings_series = financials.loc["Net Income"]
             if len(earnings_series) >= 2:
                 current_earn = earnings_series.iloc[0]
@@ -277,9 +298,9 @@ def get_fundamentals_raw(symbol: str):
         roe = None
         if "returnOnEquity" in info:
             roe = _safe_info("returnOnEquity") * 100 if _safe_info("returnOnEquity") else None
-        elif not balance.empty and "Total Equity Gross Minority Interest" in balance.index:
+        elif balance is not None and not balance.empty and "Total Equity Gross Minority Interest" in balance.index:
             equity = balance.loc["Total Equity Gross Minority Interest"].iloc[0]
-            if not financials.empty and "Net Income" in financials.index:
+            if financials is not None and not financials.empty and "Net Income" in financials.index:
                 net_income = financials.loc["Net Income"].iloc[0]
                 if equity != 0:
                     roe = (net_income / equity) * 100
@@ -288,7 +309,7 @@ def get_fundamentals_raw(symbol: str):
         debt_to_equity = None
         if "debtToEquity" in info:
             debt_to_equity = _safe_info("debtToEquity")
-        elif not balance.empty and "Total Debt" in balance.index and "Total Equity Gross Minority Interest" in balance.index:
+        elif balance is not None and not balance.empty and "Total Debt" in balance.index and "Total Equity Gross Minority Interest" in balance.index:
             total_debt = balance.loc["Total Debt"].iloc[0]
             equity = balance.loc["Total Equity Gross Minority Interest"].iloc[0]
             if equity != 0:
@@ -298,7 +319,7 @@ def get_fundamentals_raw(symbol: str):
         free_cashflow = None
         if "freeCashflow" in info:
             free_cashflow = _safe_info("freeCashflow")
-        elif not cashflow.empty and "Free Cash Flow" in cashflow.index:
+        elif cashflow is not None and not cashflow.empty and "Free Cash Flow" in cashflow.index:
             free_cashflow = cashflow.loc["Free Cash Flow"].iloc[0]
 
         # Profit Margins
@@ -306,7 +327,7 @@ def get_fundamentals_raw(symbol: str):
         if "profitMargins" in info:
             profit_margins = _safe_info("profitMargins") * 100
         else:
-            if not financials.empty and "Net Income" in financials.index and "Total Revenue" in financials.index:
+            if financials is not None and not financials.empty and "Net Income" in financials.index and "Total Revenue" in financials.index:
                 net_income = financials.loc["Net Income"].iloc[0]
                 revenue = financials.loc["Total Revenue"].iloc[0]
                 if revenue != 0:
@@ -406,6 +427,7 @@ def get_fundamentals_raw(symbol: str):
             "industry": industry,
         }
 
+        logger.info(f"Fundamentals for {sym}: PE={pe_ratio}, ROE={roe}, Revenue growth={revenue_growth}")
         _cache_set(cache_key, result, ttl=3600)
         return result
 
