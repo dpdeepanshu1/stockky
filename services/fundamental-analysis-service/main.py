@@ -149,6 +149,16 @@ def analyze(symbol: str):
             score += 4
             reasons.append("Forward P/E lower than trailing P/E — earnings expected to grow into valuation")
 
+    # FALLBACK: if no reasons were added, add a generic summary
+    if not reasons:
+        reasons.append("Fundamental data partially available; score is based on available metrics")
+        if pe is not None:
+            reasons.append(f"P/E ratio is {pe:.1f}")
+        if roe is not None:
+            reasons.append(f"ROE is {roe:.1f}%")
+        if rev_growth is not None:
+            reasons.append(f"Revenue growth is {rev_growth:.1f}%")
+
     score = max(0, min(100, round(score)))
 
     return {

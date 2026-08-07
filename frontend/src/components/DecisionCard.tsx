@@ -99,7 +99,7 @@ export default function DecisionCard({ data, onBack }: Props) {
         </div>
       </div>
 
-      {/* Reasons */}
+      {/* Reasons – with fallback messages */}
       <div className="grid md:grid-cols-2 gap-4">
         <ReasonList title="Technical" items={data.reasons.technical} />
         <ReasonList title="Fundamental" items={data.reasons.fundamental} />
@@ -119,7 +119,7 @@ export default function DecisionCard({ data, onBack }: Props) {
         </div>
       )}
 
-      {/* 🔥 NEW: Natural‑language Hinglish summary */}
+      {/* Natural-language Hinglish summary */}
       <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
         <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
           💬 Final Remarks
@@ -173,17 +173,24 @@ function ScoreBar({ label, value }: { label: string; value: number }) {
 }
 
 function ReasonList({ title, items }: { title: string; items: string[] }) {
+  // If items is empty or undefined, show a fallback message
+  const hasItems = items && items.length > 0;
+
   return (
     <div className="rounded-xl border border-slate bg-graphite p-5">
       <h3 className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">{title}</h3>
-      <ul className="space-y-2">
-        {items.map((item, i) => (
-          <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
-            <span className="text-slate mt-1 shrink-0">–</span>
-            <span>{item}</span>
-          </li>
-        ))}
-      </ul>
+      {hasItems ? (
+        <ul className="space-y-2">
+          {items.map((item, i) => (
+            <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
+              <span className="text-slate mt-1 shrink-0">–</span>
+              <span>{item}</span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-sm text-mist/40 italic">No specific {title.toLowerCase()} insights available</p>
+      )}
     </div>
   );
 }
