@@ -60,6 +60,19 @@ class DecisionRequest(BaseModel):
     already_owned: bool = False
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "Stockky Decision Engine",
+        "status": "running",
+        "endpoints": {
+            "/health": "GET – health check",
+            "/decide/{symbol}": "GET – get decision for a symbol",
+            "/docs": "Swagger UI documentation",
+        },
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "decision-engine-service"}
@@ -268,5 +281,5 @@ def decide(symbol: str, already_owned: bool = False):
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=8004, reload=True)
+    port = int(os.getenv("PORT", 8004))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
