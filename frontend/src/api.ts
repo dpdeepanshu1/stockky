@@ -102,7 +102,12 @@ export interface SystemHealth {
   services: Record<string, SystemServiceStatus>;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/**
+ * Fetch wrapper with timeout and automatic retry.
+ * Retries up to 2 times on network errors or 5xx responses.
+ * Timeout per request: 30 seconds.
+ */
+async function request<T>(path: string, init?: RequestInit, retries = 2): Promise<T> {
   const base = getApiUrl();
   if (!base) {
     throw new Error(
@@ -110,21 +115,48 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     );
   }
 
-  let res: Response;
+  const url = `${base}${path}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
   try {
-    res = await fetch(`${base}${path}`, init);
+    const response = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`${response.status} ${response.statusText}${body ? `: ${body.slice(0, 240)}` : ""}`);
+    }
+
+    return response.json();
+  } catch (error) {
+    clearTimeout(timeoutId);
+
+    if (retries > 0 && (error instanceof TypeError || error instanceof DOMException)) {
+      await new Promise((resolve) => setTimeout(resolve, 1000 * (3 - retries)));
+      return request<T>(path, init, retries - 1);
+    }
+
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(
+        `Request timed out after 30 seconds. The backend may be waking up (free-tier cold start). Try again in a moment.`
+      );
+    }
+
+    throw error;
+  }
+}
+
+/** Helper to wake a service by its URL (used by wake buttons) */
+export async function wakeService(url: string): Promise<void> {
+  try {
+    await fetch(url + "/health", { mode: "no-cors" });
   } catch {
-    throw new Error(
-      `Could not reach ${base}. The backend may be asleep (free-tier cold start -- retry in ~30s), down, or the URL is wrong. Check Settings.`
-    );
+    // Ignore – the request still wakes the service
   }
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`${res.status} ${res.statusText}${body ? `: ${body.slice(0, 240)}` : ""}`);
-  }
-
-  return res.json();
 }
 
 export const api = {

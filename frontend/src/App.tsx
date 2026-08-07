@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { api, getApiUrl, setApiUrl, Decision, ScanResult, ScanStatus } from "./api";
+import { api, getApiUrl, setApiUrl, Decision, ScanResult, wakeService } from "./api";
 import Pipeline from "./components/Pipeline";
 import DecisionCard from "./components/DecisionCard";
 import ScanPanel from "./components/ScanPanel";
@@ -25,10 +25,10 @@ export default function App() {
   const [showWatchlist, setShowWatchlist] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [backendUp, setBackendUp] = useState<"checking" | "up" | "down">("checking");
+  const [isWaking, setIsWaking] = useState(false);
 
   // Scan polling state
   const [scanTaskId, setScanTaskId] = useState<string | null>(null);
-  const [scanProgress, setScanProgress] = useState<{ processed: number; total: number; elapsed: number; estimatedRemaining?: number } | null>(null);
   const [pollInterval, setPollInterval] = useState<number | null>(null);
 
   useEffect(() => {
@@ -53,6 +53,22 @@ export default function App() {
       .catch(() => setBackendUp("down"));
   }
 
+  async function handleWakeBackend() {
+    setIsWaking(true);
+    try {
+      // Try to wake the gateway by hitting its health endpoint
+      await wakeService(getApiUrl());
+      // Wait a moment then re-check
+      setTimeout(() => {
+        checkBackend();
+        setIsWaking(false);
+      }, 3000);
+    } catch {
+      setIsWaking(false);
+      checkBackend();
+    }
+  }
+
   async function handleSearch(symbol: string) {
     if (!symbol.trim()) return;
     setTab("dashboard");
@@ -68,15 +84,12 @@ export default function App() {
   }
 
   async function handleScan() {
-    // Start async scan
     setView({ mode: "loading", label: "Starting market scan..." });
     try {
       const { task_id } = await api.scanStart();
       setScanTaskId(task_id);
-      // Start polling
       const interval = window.setInterval(() => pollScanStatus(task_id), 1000);
       setPollInterval(interval);
-      // First poll immediately
       await pollScanStatus(task_id);
     } catch (e) {
       setView({ mode: "error", message: (e as Error).message });
@@ -87,12 +100,6 @@ export default function App() {
     try {
       const status = await api.scanStatus(taskId);
       if (status.status === "running") {
-        setScanProgress({
-          processed: status.processed,
-          total: status.total,
-          elapsed: status.elapsed,
-          estimatedRemaining: status.estimated_remaining ?? undefined,
-        });
         setView({
           mode: "loading",
           label: `Running market scan... (${status.processed}/${status.total})`,
@@ -104,21 +111,18 @@ export default function App() {
           },
         });
       } else if (status.status === "done") {
-        // Stop polling
         if (pollInterval) clearInterval(pollInterval);
         setPollInterval(null);
         setScanTaskId(null);
-        setScanProgress(null);
         setView({ mode: "scan", data: status.result! });
       } else if (status.status === "error") {
         if (pollInterval) clearInterval(pollInterval);
         setPollInterval(null);
         setScanTaskId(null);
-        setScanProgress(null);
         setView({ mode: "error", message: status.error || "Scan failed" });
       }
     } catch (e) {
-      // Ignore polling errors (e.g., network hiccups)
+      // Ignore polling errors
       console.warn("Polling error", e);
     }
   }
@@ -132,7 +136,6 @@ export default function App() {
     return <SystemCheck onReady={() => setSystemReady(true)} />;
   }
 
-  // Helper to format time
   function formatTime(seconds: number): string {
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
@@ -186,6 +189,7 @@ export default function App() {
         <SettingsBanner onClose={() => setShowSettings(false)} onSaved={checkBackend} />
       )}
 
+      {/* Backend down banner with Wake button */}
       {backendUp === "down" && !showSettings && (
         <div className="border-b border-signal-sell/30 bg-signal-sell/5">
           <div className="max-w-6xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-3 flex-wrap">
@@ -193,6 +197,13 @@ export default function App() {
               Can't reach the backend at <span className="text-signal-sell/80">{getApiUrl() || "(not set)"}</span>.
             </p>
             <div className="flex gap-3">
+              <button
+                onClick={handleWakeBackend}
+                disabled={isWaking}
+                className="font-mono text-xs text-paper bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-1.5 hover:bg-signal-prepare/30 transition disabled:opacity-50"
+              >
+                {isWaking ? "Waking..." : "Wake Backend"}
+              </button>
               <button onClick={checkBackend} className="font-mono text-xs text-mist hover:text-paper underline">
                 Retry
               </button>
@@ -331,6 +342,12 @@ export default function App() {
                     Error
                   </p>
                   <p className="text-sm text-signal-sell break-words">{view.message}</p>
+                  {view.message.includes("timeout") || view.message.includes("reach") && (
+                    <p className="text-xs text-mist/60 mt-2">
+                      ⏳ Free‑tier services may take up to 60 seconds to wake up on the first request.
+                      Wait a moment and try again.
+                    </p>
+                  )}
                   <div className="flex gap-4 mt-4">
                     <button
                       onClick={() => setView({ mode: "idle" })}

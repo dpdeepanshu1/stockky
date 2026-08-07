@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, getApiUrl, setApiUrl, SystemHealth } from "../api";
+import { api, getApiUrl, setApiUrl, SystemHealth, wakeService } from "../api";
 
 type Stage =
   | { phase: "checking-gateway" }
@@ -26,8 +26,6 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
   const [stage, setStage] = useState<Stage>({ phase: "checking-gateway" });
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
   const cancelled = useRef(false);
-
-  // Helper to get current attempt (0 if not in waking phase)
   const currentAttempt = stage.phase === "waking" ? stage.attempt : 0;
 
   useEffect(() => {
@@ -77,14 +75,10 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
     }
   }
 
-  async function wakeService(url: string | null | undefined) {
+  async function handleWakeService(url: string | null | undefined) {
     if (!url) return;
-    try {
-      await fetch(url + "/health", { mode: "no-cors" });
-      setTimeout(() => runCheck(currentAttempt), 3000);
-    } catch {
-      setTimeout(() => runCheck(currentAttempt), 3000);
-    }
+    await wakeService(url);
+    setTimeout(() => runCheck(currentAttempt), 3000);
   }
 
   async function wakeAllServices() {
@@ -171,7 +165,7 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
             key={name}
             name={SERVICE_LABELS[name] || name}
             status={s}
-            onWake={() => wakeService(s.url)}
+            onWake={() => handleWakeService(s.url)}
           />
         ))}
       </div>
