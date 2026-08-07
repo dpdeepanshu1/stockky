@@ -158,23 +158,26 @@ def get_quote(symbol: str):
     if cached:
         return cached
 
+    ticker = yf.Ticker(sym)
+    ticker._tz = "Asia/Kolkata"
     try:
-        ticker = yf.Ticker(sym)
-        ticker._tz = "Asia/Kolkata"
-        info = ticker.fast_info
-        full_info = {}
-        try:
+            info = ticker.info
+    except Exception:
+            info = {}
+    if not info:
+            raise HTTPException(status_code=404, detail=f"No fundamentals for {sym}")
+    try:
             full_info = ticker.info
-        except Exception:
+    except Exception:
             pass  # fast_info is enough to still return a usable quote
 
-        price = getattr(info, "last_price", None)
-        prev_close = getattr(info, "previous_close", None)
-        change_pct = None
-        if price and prev_close:
+    price = getattr(info, "last_price", None)
+    prev_close = getattr(info, "previous_close", None)
+    change_pct = None
+    if price and prev_close:
             change_pct = round(((price - prev_close) / prev_close) * 100, 2)
 
-        result = {
+    result = {
             "symbol": sym,
             "name": full_info.get("longName") or full_info.get("shortName") or sym,
             "price": price,
@@ -187,12 +190,8 @@ def get_quote(symbol: str):
             "pe_ratio": full_info.get("trailingPE"),
             "fetched_at": datetime.utcnow().isoformat(),
         }
-        _cache_set(cache_key, result)
-        return result
-    except Exception as e:
-        logger.exception("Failed to fetch quote for %s", sym)
-        raise HTTPException(status_code=502, detail=f"Could not fetch data for {sym}: {e}")
-
+    _cache_set(cache_key, result)
+    return result
 
 @app.get("/history/{symbol}")
 def get_history(
