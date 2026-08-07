@@ -19,6 +19,7 @@ from typing import Optional
 
 from upstash_redis import Redis
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -82,6 +83,33 @@ def normalize_symbol(symbol: str) -> str:
     if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
         symbol = f"{symbol}.NS"
     return symbol
+
+
+def _fetch_info_with_retry(symbol: str, max_retries: int = 3, base_delay: int = 5):
+    """
+    Fetch ticker.info with exponential backoff on YFRateLimitError.
+    Returns the info dict or raises HTTPException on failure.
+    """
+    ticker = yf.Ticker(symbol)
+    for attempt in range(max_retries):
+        try:
+            return ticker.info
+        except YFRateLimitError as e:
+            wait = base_delay * (2 ** attempt)  # 5, 10, 20 seconds
+            logger.warning(
+                "Rate limit hit for %s. Retry %d/%d after %.0fs.",
+                symbol, attempt+1, max_retries, wait
+            )
+            time.sleep(wait)
+        except Exception as e:
+            # Non-rate-limit error – raise immediately
+            logger.exception("Unexpected error fetching fundamentals for %s", symbol)
+            raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {symbol}: {e}")
+    # If all retries exhausted
+    raise HTTPException(
+        status_code=429,
+        detail=f"Rate limited for {symbol}. Please try again later."
+    )
 
 
 class QuoteResponse(BaseModel):
@@ -226,7 +254,9 @@ def get_fundamentals_raw(symbol: str):
         return cached
 
     try:
-        info = yf.Ticker(sym).info
+        # Use retry logic for the info call to handle rate limits
+        info = _fetch_info_with_retry(sym)
+
         if not info:
             raise HTTPException(status_code=404, detail=f"No fundamentals for {sym}")
 
@@ -249,8 +279,10 @@ def get_fundamentals_raw(symbol: str):
             "sector": info.get("sector"),
             "industry": info.get("industry"),
         }
-        _cache_set(cache_key, result, ttl=3600)  # fundamentals barely move intraday
+        # Cache fundamentals for 6 hours to avoid repeated hits
+        _cache_set(cache_key, result, ttl=21600)
         return result
+
     except HTTPException:
         raise
     except Exception as e:
