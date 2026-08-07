@@ -77,6 +77,20 @@ export interface NotificationConfig {
   persisted: boolean;
 }
 
+export interface SystemServiceStatus {
+  ok: boolean;
+  required: boolean;
+  status: string;
+  seconds?: number;
+  error?: string;
+}
+
+export interface SystemHealth {
+  required_ok: boolean;
+  all_ok: boolean;
+  services: Record<string, SystemServiceStatus>;
+}
+
 /** Central fetch wrapper: turns the raw browser "Failed to fetch" TypeError
  * into an actionable message, and surfaces backend error bodies cleanly. */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -106,6 +120,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   ping: () => request<{ status: string; service: string }>("/health"),
+
+  systemHealth: () => request<SystemHealth>("/system/health"),
 
   getStock: (symbol: string, alreadyOwned = false) =>
     request<Decision>(`/stock/${symbol}?already_owned=${alreadyOwned}`),

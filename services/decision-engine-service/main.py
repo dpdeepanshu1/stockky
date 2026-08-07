@@ -25,6 +25,7 @@ because these are the three services most likely to be mid-build as you
 extend the platform.
 """
 import os
+import asyncio
 import logging
 from enum import Enum
 
@@ -36,6 +37,7 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("decision-engine-service")
 
+# ---- Live Render URLs (default) ----
 TECHNICAL_URL = os.getenv("TECHNICAL_URL", "https://technical-analysis-service-zhnc.onrender.com")
 FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-service.onrender.com")
 NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")
@@ -78,12 +80,26 @@ def health():
     return {"status": "ok", "service": "decision-engine-service"}
 
 
-def _fetch_optional(client: httpx.Client, url: str, label: str) -> dict | None:
+async def _fetch_required(client: httpx.AsyncClient, url: str, label: str) -> dict:
+    """Fetch from a Phase-1 service that decisions cannot be made without.
+    On a free-tier cold start this can legitimately take 30-60s — the
+    generous per-call timeout here (set on the client) is intentional, not
+    a bug, since Render's OWN edge timeout is what previously turned a slow
+    wake-up into an opaque platform-level 502 instead of a clean error."""
+    try:
+        resp = await client.get(url, timeout=70)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"{label} unavailable: {e}")
+
+
+async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
     """Fetch from an optional Phase-2 service. Returns None (not an
     exception) if it's unreachable, so the Decision Engine still works
     with just Technical + Fundamental while you're building the rest."""
     try:
-        resp = client.get(url, timeout=15)
+        resp = await client.get(url, timeout=70)
         resp.raise_for_status()
         return resp.json()
     except httpx.HTTPError as e:
@@ -176,25 +192,21 @@ def _decide(
 
 
 @app.get("/decide/{symbol}")
-def decide(symbol: str, already_owned: bool = False):
-    with httpx.Client(timeout=20) as client:
-        try:
-            tech_resp = client.get(f"{TECHNICAL_URL}/analyze/{symbol}")
-            tech_resp.raise_for_status()
-            technical = tech_resp.json()
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Technical analysis unavailable: {e}")
+async def decide(symbol: str, already_owned: bool = False):
+    # 70s per-call timeout: generous enough to ride out a free-tier cold
+    # start, but running all 5 calls CONCURRENTLY (not sequentially) means
+    # the total wait is roughly the slowest single one, not their sum —
+    # that's what actually keeps this under Render's own proxy timeout.
+    async with httpx.AsyncClient(timeout=70) as client:
+        technical_task = _fetch_required(client, f"{TECHNICAL_URL}/analyze/{symbol}", "Technical analysis")
+        fundamental_task = _fetch_required(client, f"{FUNDAMENTAL_URL}/analyze/{symbol}", "Fundamental analysis")
+        news_task = _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
+        prediction_task = _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
+        events_task = _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
 
-        try:
-            fund_resp = client.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}")
-            fund_resp.raise_for_status()
-            fundamental = fund_resp.json()
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Fundamental analysis unavailable: {e}")
-
-        news = _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
-        prediction = _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
-        events = _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
+        technical, fundamental, news, prediction, events = await asyncio.gather(
+            technical_task, fundamental_task, news_task, prediction_task, events_task
+        )
 
     technical_score = technical["technical_score"]
     fundamental_score = fundamental["fundamental_score"]

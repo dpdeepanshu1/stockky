@@ -5,6 +5,7 @@ import DecisionCard from "./components/DecisionCard";
 import ScanPanel from "./components/ScanPanel";
 import WatchlistManager from "./components/WatchlistManager";
 import NotificationsPanel from "./components/NotificationsPanel";
+import SystemCheck from "./components/SystemCheck";
 
 type ViewState =
   | { mode: "idle" }
@@ -16,6 +17,7 @@ type ViewState =
 type Tab = "dashboard" | "notifications";
 
 export default function App() {
+  const [systemReady, setSystemReady] = useState(false);
   const [tab, setTab] = useState<Tab>("dashboard");
   const [query, setQuery] = useState("");
   const [view, setView] = useState<ViewState>({ mode: "idle" });
@@ -65,6 +67,10 @@ export default function App() {
   async function handleWatchlistUpdate(symbols: string[]) {
     await api.setWatchlist(symbols);
     setWatchlist(symbols);
+  }
+
+  if (!systemReady) {
+    return <SystemCheck onReady={() => setSystemReady(true)} />;
   }
 
   return (
@@ -354,7 +360,7 @@ function SettingsBanner({ onClose, onSaved }: { onClose: () => void; onSaved: ()
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && save()}
-                placeholder="https://your-api-gateway.onrender.com"
+                placeholder="https://api-gateway-wizr.onrender.com"
                 className="flex-1 bg-ink/60 border border-slate rounded-lg px-3 py-2 font-mono text-xs text-paper placeholder:text-mist/30 outline-none focus:border-signal-prepare/60 transition"
                 spellCheck={false}
                 autoComplete="off"

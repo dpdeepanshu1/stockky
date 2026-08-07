@@ -6,6 +6,8 @@ Watchlist is now persisted in Upstash Redis — survives restarts.
 """
 import os
 import json
+import time
+import asyncio
 import logging
 from typing import List
 
@@ -18,8 +20,29 @@ from upstash_redis import Redis
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api-gateway")
 
+# ---- Live Render URLs (default) ----
 DECISION_URL = os.getenv("DECISION_URL", "https://decision-engine-service-0hg6.onrender.com")
-NOTIFICATION_URL = os.getenv("NOTIFICATION_URL", "https://notification-service-36py.onrender.com")  # <-- ADDED
+NOTIFICATION_URL = os.getenv("NOTIFICATION_URL", "https://notification-service-36py.onrender.com")
+
+# Optional downstream services for /system/health (wake‑up checks)
+MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://market-data-service.onrender.com")
+TECHNICAL_URL = os.getenv("TECHNICAL_URL", "https://technical-analysis-service-zhnc.onrender.com")
+FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-service.onrender.com")
+NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")
+EVENT_URL = os.getenv("EVENT_URL", "https://event-tracker-service-m1lw.onrender.com")
+PREDICTION_URL = os.getenv("PREDICTION_URL", "https://prediction-service-wowb.onrender.com")
+
+# Service definitions for system health
+SYSTEM_SERVICES = {
+    "market-data": {"url": MARKET_DATA_URL, "required": True},
+    "technical-analysis": {"url": TECHNICAL_URL, "required": True},
+    "fundamental-analysis": {"url": FUNDAMENTAL_URL, "required": True},
+    "decision-engine": {"url": DECISION_URL, "required": True},
+    "news-intelligence": {"url": NEWS_URL, "required": False},
+    "event-tracker": {"url": EVENT_URL, "required": False},
+    "prediction": {"url": PREDICTION_URL, "required": False},
+    "notification": {"url": NOTIFICATION_URL, "required": False},
+}
 
 app = FastAPI(title="Stockky API Gateway", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -75,14 +98,16 @@ def root():
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
+            "/system/health": "GET – health of all downstream services",
             "/watchlist": "GET/POST – manage watchlist",
             "/watchlist/add": "POST – add symbols",
             "/watchlist/{symbol}": "DELETE – remove symbol",
             "/stock/{symbol}": "GET – get decision for a symbol",
             "/scan": "GET – scan watchlist",
-            "/notifications/config": "GET/POST – get/update notification config",       # <-- UPDATED
-            "/notifications/config/{channel}": "DELETE – clear a channel",             # <-- UPDATED
-            "/notifications/test": "POST – test notifications",                        # <-- UPDATED
+            "/notifications/health": "GET – notification service health",
+            "/notifications/config": "GET/POST – get/update notification config",
+            "/notifications/config/{channel}": "DELETE – clear a channel",
+            "/notifications/test": "POST – test notifications",
             "/docs": "Swagger UI documentation",
         },
     }
@@ -91,6 +116,55 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "api-gateway", "redis": bool(_redis)}
+
+
+@app.get("/system/health")
+async def system_health():
+    """Pings every downstream service AT THE SAME TIME. This matters on free
+    tiers specifically: a sleeping Render service can take 30-60s to wake on
+    its first request. Waking them one-by-one in sequence (as a normal
+    request through decision-engine-service does) can stack up past
+    Render's own proxy timeout and surface as an opaque 502. Hitting them
+    all concurrently from here means the total wait is roughly the SLOWEST
+    single cold start, not the sum of all of them — and the frontend can
+    show live per-service status while it waits."""
+
+    async def check(name: str, url: str, required: bool):
+        if not url:
+            return name, {"ok": False, "required": required, "status": "not_configured"}
+        start = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=70) as client:
+                resp = await client.get(f"{url.rstrip('/')}/health")
+            elapsed = round(time.monotonic() - start, 1)
+            if resp.status_code == 200:
+                return name, {"ok": True, "required": required, "status": "up", "seconds": elapsed}
+            return name, {
+                "ok": False,
+                "required": required,
+                "status": f"http_{resp.status_code}",
+                "seconds": elapsed,
+            }
+        except httpx.HTTPError as e:
+            elapsed = round(time.monotonic() - start, 1)
+            return name, {
+                "ok": False,
+                "required": required,
+                "status": "unreachable",
+                "seconds": elapsed,
+                "error": str(e)[:200],
+            }
+
+    results = await asyncio.gather(
+        *(check(name, cfg["url"], cfg["required"]) for name, cfg in SYSTEM_SERVICES.items())
+    )
+    services = {"api-gateway": {"ok": True, "required": True, "status": "up", "seconds": 0}}
+    services.update(dict(results))
+
+    required_ok = all(v["ok"] for v in services.values() if v["required"])
+    all_ok = all(v["ok"] for v in services.values())
+
+    return {"required_ok": required_ok, "all_ok": all_ok, "services": services}
 
 
 @app.get("/watchlist")
@@ -172,10 +246,28 @@ def run_scan():
     }
 
 
-# ---------- NOTIFICATION PROXY ROUTES (ADDED) ----------
+class NotificationChannelUpdate(BaseModel):
+    discord_webhook_url: str | None = None
+    slack_webhook_url: str | None = None
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    enabled: dict | None = None
+
+
+@app.get("/notifications/health")
+def notifications_health():
+    """Lets the frontend know whether the notification-service is even
+    reachable, separately from whether any channel is configured."""
+    try:
+        resp = httpx.get(f"{NOTIFICATION_URL}/health", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
+
+
 @app.get("/notifications/config")
 def get_notification_config():
-    """Proxy to get notification configuration from Notification Service."""
     try:
         resp = httpx.get(f"{NOTIFICATION_URL}/config", timeout=10)
         resp.raise_for_status()
@@ -183,19 +275,23 @@ def get_notification_config():
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
 
+
 @app.post("/notifications/config")
-def update_notification_config(update: dict):
-    """Proxy to update notification configuration."""
+def set_notification_config(update: NotificationChannelUpdate):
     try:
-        resp = httpx.post(f"{NOTIFICATION_URL}/config", json=update, timeout=10)
+        resp = httpx.post(
+            f"{NOTIFICATION_URL}/config",
+            json=update.model_dump(exclude_none=True),
+            timeout=10,
+        )
         resp.raise_for_status()
         return resp.json()
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
 
+
 @app.delete("/notifications/config/{channel}")
-def clear_notification_channel(channel: str):
-    """Proxy to clear a notification channel."""
+def delete_notification_channel(channel: str):
     try:
         resp = httpx.delete(f"{NOTIFICATION_URL}/config/{channel}", timeout=10)
         resp.raise_for_status()
@@ -203,11 +299,11 @@ def clear_notification_channel(channel: str):
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
 
+
 @app.post("/notifications/test")
-def test_notifications():
-    """Proxy to test notification delivery."""
+def test_notification_channels():
     try:
-        resp = httpx.post(f"{NOTIFICATION_URL}/test", timeout=10)
+        resp = httpx.post(f"{NOTIFICATION_URL}/test", timeout=15)
         resp.raise_for_status()
         return resp.json()
     except httpx.HTTPError as e:
