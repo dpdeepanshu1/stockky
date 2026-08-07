@@ -163,7 +163,7 @@ async def decide(symbol: str, already_owned: bool = False):
     prediction_score = prediction["prediction_score"] if prediction and prediction.get("model_loaded") else None
 
     # Extract fundamental metrics
-    fundamental_metrics = fundamental.get("metrics")  # <-- from fundamental service
+    fundamental_metrics = fundamental.get("metrics")
 
     close = technical["close"]
     resistance = technical["resistance"]
@@ -239,7 +239,7 @@ async def decide(symbol: str, already_owned: bool = False):
         "sector": fundamental["sector"],
     }
 
-    # ✅ Include fundamental metrics if present
+    # Include fundamental metrics if present
     if fundamental_metrics:
         response["fundamental_metrics"] = fundamental_metrics
 

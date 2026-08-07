@@ -14,17 +14,25 @@ import time
 import json
 import logging
 import math
-import httpx
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
-from upstash_redis import Redis
+import requests
 import yfinance as yf
-from yfinance.exceptions import YFRateLimitError
+from upstash_redis import Redis
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# --- Patch yfinance session with a proper User-Agent ---
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+})
+# Override the session used by yfinance
+yf.shared._session = session
 
 def _safe(val, decimals=2):
     """Convert to float, round, handle NaN/Inf."""
@@ -36,13 +44,11 @@ def _safe(val, decimals=2):
     except (TypeError, ValueError):
         return None
 
-
 def _safe_int(val):
     try:
         return int(val) if val is not None else None
     except (TypeError, ValueError):
         return None
-
 
 def _compute_growth(current, previous):
     """Compute percentage growth from previous to current."""
@@ -50,13 +56,12 @@ def _compute_growth(current, previous):
         return None
     return ((current - previous) / previous) * 100
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("market-data-service")
 
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 min
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 
 app = FastAPI(title="Stockky Market Data Service", version="0.1.0")
 app.add_middleware(
@@ -78,54 +83,22 @@ except Exception as e:
     logger.warning("Redis unavailable (%s). Running without cache.", e)
     cache = None
 
-
 def _cache_get(key: str):
     if not cache:
         return None
     val = cache.get(key)
     return json.loads(val) if val else None
 
-
 def _cache_set(key: str, value: dict, ttl: int = CACHE_TTL_SECONDS):
     if not cache:
         return
     cache.setex(key, ttl, json.dumps(value, default=str))
 
-
 def normalize_symbol(symbol: str) -> str:
-    """Accept 'TCS', 'TCS.NS', or 'tcs' and normalize to Yahoo's NSE format."""
     symbol = symbol.strip().upper()
     if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
         symbol = f"{symbol}.NS"
     return symbol
-
-
-def _fetch_info_with_retry(symbol: str, max_retries: int = 3, base_delay: int = 5):
-    """
-    Fetch ticker.info with exponential backoff on YFRateLimitError.
-    Returns the info dict or raises HTTPException on failure.
-    """
-    ticker = yf.Ticker(symbol)
-    for attempt in range(max_retries):
-        try:
-            return ticker.info
-        except YFRateLimitError as e:
-            wait = base_delay * (2 ** attempt)  # 5, 10, 20 seconds
-            logger.warning(
-                "Rate limit hit for %s. Retry %d/%d after %.0fs.",
-                symbol, attempt+1, max_retries, wait
-            )
-            time.sleep(wait)
-        except Exception as e:
-            # Non-rate-limit error – raise immediately
-            logger.exception("Unexpected error fetching fundamentals for %s", symbol)
-            raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {symbol}: {e}")
-    # If all retries exhausted
-    raise HTTPException(
-        status_code=429,
-        detail=f"Rate limited for {symbol}. Please try again later."
-    )
-
 
 class QuoteResponse(BaseModel):
     symbol: str
@@ -140,8 +113,6 @@ class QuoteResponse(BaseModel):
     pe_ratio: Optional[float]
     fetched_at: str
 
-
-# ---------- ROOT ROUTE ----------
 @app.get("/")
 async def root():
     return {
@@ -158,15 +129,12 @@ async def root():
         },
     }
 
-
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "market-data-service", "cache": bool(cache)}
 
-
 @app.get("/quote/{symbol}", response_model=QuoteResponse)
 def get_quote(symbol: str):
-    """Latest quote snapshot for a single stock."""
     sym = normalize_symbol(symbol)
     cache_key = f"quote:{sym}"
     cached = _cache_get(cache_key)
@@ -180,29 +148,25 @@ def get_quote(symbol: str):
     except Exception:
         info = {}
     if not info:
-        raise HTTPException(status_code=404, detail=f"No fundamentals for {sym}")
-    try:
-        full_info = ticker.info
-    except Exception:
-        pass  # fast_info is enough to still return a usable quote
+        raise HTTPException(status_code=404, detail=f"No data for {sym}")
 
-    price = getattr(info, "last_price", None)
-    prev_close = getattr(info, "previous_close", None)
+    price = info.get("regularMarketPrice") or info.get("last_price")
+    prev_close = info.get("previousClose")
     change_pct = None
     if price and prev_close:
         change_pct = round(((price - prev_close) / prev_close) * 100, 2)
 
     result = {
         "symbol": sym,
-        "name": full_info.get("longName") or full_info.get("shortName") or sym,
+        "name": info.get("longName") or info.get("shortName") or sym,
         "price": price,
         "previous_close": prev_close,
         "day_change_pct": change_pct,
-        "day_high": getattr(info, "day_high", None),
-        "day_low": getattr(info, "day_low", None),
-        "volume": getattr(info, "last_volume", None),
-        "market_cap": getattr(info, "market_cap", None),
-        "pe_ratio": full_info.get("trailingPE"),
+        "day_high": info.get("dayHigh"),
+        "day_low": info.get("dayLow"),
+        "volume": info.get("volume"),
+        "market_cap": info.get("marketCap"),
+        "pe_ratio": info.get("trailingPE"),
         "fetched_at": datetime.utcnow().isoformat(),
     }
     _cache_set(cache_key, result)
@@ -214,7 +178,6 @@ def get_history(
     period: str = Query("6mo", description="1mo, 3mo, 6mo, 1y, 2y, 5y"),
     interval: str = Query("1d", description="1d, 1wk, 1h"),
 ):
-    """OHLCV candle history, used by the Technical Analysis Service."""
     sym = normalize_symbol(symbol)
     cache_key = f"history:{sym}:{period}:{interval}"
     cached = _cache_get(cache_key)
@@ -225,13 +188,11 @@ def get_history(
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
         df = ticker.history(period=period, interval=interval, auto_adjust=True)
-
         if df.empty:
             raise HTTPException(status_code=404, detail=f"No history found for {sym}")
 
         candles = []
         for idx, row in df.iterrows():
-            # Skip rows where Close is NaN (bad data)
             if _safe(row["Close"]) is None:
                 continue
             candles.append({
@@ -247,7 +208,7 @@ def get_history(
             raise HTTPException(status_code=404, detail=f"No valid candles for {sym}")
 
         result = {"symbol": sym, "period": period, "interval": interval, "candles": candles}
-        _cache_set(cache_key, result, ttl=900)  # history changes less often
+        _cache_set(cache_key, result, ttl=900)
         return result
 
     except HTTPException:
@@ -256,12 +217,8 @@ def get_history(
         logger.exception("Failed to fetch history for %s", sym)
         raise HTTPException(status_code=502, detail=f"Could not fetch history for {sym}: {e}")
 
-
 @app.get("/fundamentals/{symbol}")
 def get_fundamentals_raw(symbol: str):
-    """Fundamental data built from info, financials, balance sheet, cashflow.
-    Fetches full info (may work), falls back to financials if info fails.
-    """
     sym = normalize_symbol(symbol)
     cache_key = f"fundamentals:{sym}"
     cached = _cache_get(cache_key)
@@ -272,13 +229,18 @@ def get_fundamentals_raw(symbol: str):
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
 
-        # 1. Try to get full info (may work from some IPs)
-        try:
-            info = ticker.info
-        except Exception:
-            info = {}
+        # Get info with retry (it might work with custom session)
+        info = {}
+        for attempt in range(3):
+            try:
+                info = ticker.info
+                if info:
+                    break
+                time.sleep(1)
+            except Exception:
+                time.sleep(1)
 
-        # 2. Get financials, balance sheet, cashflow
+        # Get financials, balance sheet, cashflow
         financials = ticker.financials
         balance = ticker.balance_sheet
         cashflow = ticker.cashflow
@@ -293,9 +255,7 @@ def get_fundamentals_raw(symbol: str):
             except (ValueError, TypeError):
                 return None
 
-        # --- Extract metrics from info or financials ---
-
-        # Revenue growth (from financials)
+        # Revenue growth
         revenue_growth = None
         if not financials.empty and "Total Revenue" in financials.index:
             rev_series = financials.loc["Total Revenue"]
@@ -304,7 +264,7 @@ def get_fundamentals_raw(symbol: str):
                 prev_rev = rev_series.iloc[1]
                 revenue_growth = _compute_growth(current_rev, prev_rev)
 
-        # Earnings growth (Net Income)
+        # Earnings growth
         earnings_growth = None
         if not financials.empty and "Net Income" in financials.index:
             earnings_series = financials.loc["Net Income"]
@@ -313,7 +273,7 @@ def get_fundamentals_raw(symbol: str):
                 prev_earn = earnings_series.iloc[1]
                 earnings_growth = _compute_growth(current_earn, prev_earn)
 
-        # ROE (Net Income / Shareholders' Equity)
+        # ROE
         roe = None
         if "returnOnEquity" in info:
             roe = _safe_info("returnOnEquity") * 100 if _safe_info("returnOnEquity") else None
@@ -341,12 +301,11 @@ def get_fundamentals_raw(symbol: str):
         elif not cashflow.empty and "Free Cash Flow" in cashflow.index:
             free_cashflow = cashflow.loc["Free Cash Flow"].iloc[0]
 
-        # Profit Margins (Net Margin)
+        # Profit Margins
         profit_margins = None
         if "profitMargins" in info:
             profit_margins = _safe_info("profitMargins") * 100
         else:
-            # Compute from financials
             if not financials.empty and "Net Income" in financials.index and "Total Revenue" in financials.index:
                 net_income = financials.loc["Net Income"].iloc[0]
                 revenue = financials.loc["Total Revenue"].iloc[0]
@@ -392,7 +351,6 @@ def get_fundamentals_raw(symbol: str):
         if "dividendYield" in info:
             dividend_yield = _safe_info("dividendYield") * 100
         else:
-            # Compute from dividends
             try:
                 divs = ticker.dividends
                 if divs is not None and not divs.empty:
@@ -456,7 +414,6 @@ def get_fundamentals_raw(symbol: str):
     except Exception as e:
         logger.exception("Failed to fetch fundamentals for %s", sym)
         raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
-
 
 if __name__ == "__main__":
     import uvicorn

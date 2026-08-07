@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fundamental-analysis-service")
 
-MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
+MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://market-data-service.onrender.com")
 
 app = FastAPI(title="Stockky Fundamental Analysis Service", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -57,13 +57,13 @@ def analyze(symbol: str):
     reasons = []
 
     # Extract metrics
-    rev_growth = _pct(f.get("revenue_growth"))
-    earnings_growth = _pct(f.get("earnings_growth"))
-    roe = _pct(f.get("roe"))
+    rev_growth = f.get("revenue_growth")
+    earnings_growth = f.get("earnings_growth")
+    roe = f.get("roe")
     d2e = f.get("debt_to_equity")
     fcf = f.get("free_cashflow")
-    margins = _pct(f.get("profit_margins"))
-    inst_holding = _pct(f.get("held_percent_institutions"))
+    margins = f.get("profit_margins")
+    inst_holding = f.get("held_percent_institutions")
     pe = f.get("pe_ratio")
     forward_pe = f.get("forward_pe")
 
@@ -174,7 +174,7 @@ def analyze(symbol: str):
         "sector": f.get("sector"),
         "industry": f.get("industry"),
         "reasons": reasons,
-        "metrics": metrics,          # <-- INCLUDE METRICS
+        "metrics": metrics,
         "raw": f,
     }
 

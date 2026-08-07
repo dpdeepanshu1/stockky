@@ -3,7 +3,7 @@ API Gateway
 ------------
 Single entry point for the React frontend.
 Includes async scan with progress (via BackgroundTasks), symbol correction,
-Hinglish summaries, market movers endpoints, watchlist scan, and manual CORS headers.
+Hinglish summaries, market movers endpoints, watchlist scan, and Telegram notifications.
 """
 import os
 import json
@@ -350,6 +350,35 @@ class NotificationChannelUpdate(BaseModel):
     telegram_chat_id: str | None = None
     enabled: dict | None = None
 
+# ── Telegram notification helper ──────────────────────────────────────────
+def _send_scan_notification(recommendations: list, verdict: str, scanned: int, universe_size: int):
+    """Send top 5 recommendations to Telegram via notification service."""
+    if not recommendations:
+        message = f"📊 Market Scan Complete\n\nScanned {scanned} stocks. No strong BUY signals today.\nVerdict: {verdict}"
+    else:
+        lines = [f"📊 *Top {len(recommendations)} Picks from Market Scan*", ""]
+        for i, r in enumerate(recommendations[:5], 1):
+            symbol = r.get("symbol")
+            decision = r.get("decision")
+            combined_score = r.get("combined_score")
+            close = r.get("close")
+            target = r.get("target")
+            stop_loss = r.get("stop_loss")
+            lines.append(f"{i}. *{symbol}* – {decision} (Score: {combined_score})")
+            lines.append(f"   Price: ₹{close:.2f} | Target: ₹{target:.2f} | Stop: ₹{stop_loss:.2f}")
+            lines.append("")
+        message = "\n".join(lines)
+
+    try:
+        httpx.post(f"{NOTIFICATION_URL}/notify", json={
+            "title": "Market Scan Complete",
+            "message": message,
+            "channel": "telegram"
+        }, timeout=10)
+        logger.info("Scan recommendations sent to Telegram")
+    except Exception as e:
+        logger.warning("Failed to send scan notification: %s", e)
+
 # ── Asynchronous scan with progress (BackgroundTasks) ──────────────────────
 async def run_scan_async(task_id: str, universe: List[str]):
     start_time = time.time()
@@ -438,6 +467,9 @@ async def run_scan_async(task_id: str, universe: List[str]):
         "result": final_result,
         "error": None,
     }, ttl=3600)
+
+    # Send Telegram notification
+    _send_scan_notification(final_result.get("recommendations", []), final_result["verdict"], final_result["scanned"], final_result["universe_size"])
 
 # ── Real-time Market Movers ──────────────────────────────────────────────
 def _get_nifty50_data() -> List[dict]:
@@ -743,7 +775,7 @@ def run_scan(force_refresh: bool = False):
 
     verdict = f"{len(top_picks)} strong opportunity(ies) found" if top_picks else "DO NOT BUY ANY STOCK TODAY — market conditions cautious"
 
-    return {
+    result = {
         "scanned": len(results),
         "universe_size": len(universe),
         "watchlist_size": len(_load_watchlist()),
@@ -760,6 +792,10 @@ def run_scan(force_refresh: bool = False):
         "all_results": results,
         "errors": errors,
     }
+
+    # Send Telegram notification for sync scan too
+    _send_scan_notification(result.get("recommendations", []), result["verdict"], result["scanned"], result["universe_size"])
+    return result
 
 # ── Async scan endpoints ──────────────────────────────────────────────────
 @app.post("/scan/start")
@@ -831,7 +867,7 @@ def scan_watchlist():
 
     verdict = f"{len(top_picks)} opportunity(ies) found" if top_picks else "No strong signals in your watchlist"
 
-    return {
+    result = {
         "scanned": len(results),
         "universe_size": len(watchlist),
         "watchlist_size": len(watchlist),
@@ -848,6 +884,10 @@ def scan_watchlist():
         "all_results": results,
         "errors": errors,
     }
+
+    # Send Telegram notification for watchlist scan
+    _send_scan_notification(result.get("recommendations", []), result["verdict"], result["scanned"], result["universe_size"])
+    return result
 
 # ── Universe preview endpoints ──────────────────────────────────────────────
 @app.get("/scan/universe")
