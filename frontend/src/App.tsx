@@ -34,15 +34,17 @@ export default function App() {
     checkBackend();
   }, []);
 
-  // Timer interval
+  // Timer interval – uses number (browser)
   useEffect(() => {
-    let interval: NodeJS.Timeout;
+    let interval: number | undefined;
     if (view.mode === "loading" && scanStartTime) {
-      interval = setInterval(() => {
+      interval = window.setInterval(() => {
         setElapsedSeconds(Math.floor((Date.now() - scanStartTime) / 1000));
       }, 1000);
     }
-    return () => clearInterval(interval);
+    return () => {
+      if (interval) clearInterval(interval);
+    };
   }, [view.mode, scanStartTime]);
 
   function checkBackend() {
@@ -60,7 +62,6 @@ export default function App() {
     if (!symbol.trim()) return;
     setTab("dashboard");
     setView({ mode: "loading", label: `Analysing ${symbol.toUpperCase()}...` });
-    // Reset timer (not used for single stock)
     setScanStartTime(null);
     setElapsedSeconds(0);
     try {
@@ -73,7 +74,6 @@ export default function App() {
   }
 
   async function handleScan() {
-    // Start timer
     setScanStartTime(Date.now());
     setElapsedSeconds(0);
     setView({ mode: "loading", label: "Running market scan..." });

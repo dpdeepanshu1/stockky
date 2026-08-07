@@ -27,6 +27,9 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
   const cancelled = useRef(false);
 
+  // Helper to get current attempt (0 if not in waking phase)
+  const currentAttempt = stage.phase === "waking" ? stage.attempt : 0;
+
   useEffect(() => {
     cancelled.current = false;
     runCheck(0);
@@ -78,17 +81,14 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
     if (!url) return;
     try {
       await fetch(url + "/health", { mode: "no-cors" });
-      // After a moment, re-run the health check
-      setTimeout(() => runCheck(stage.attempt || 0), 3000);
+      setTimeout(() => runCheck(currentAttempt), 3000);
     } catch {
-      // even if fetch fails (due to CORS), the request may still wake the service
-      setTimeout(() => runCheck(stage.attempt || 0), 3000);
+      setTimeout(() => runCheck(currentAttempt), 3000);
     }
   }
 
   async function wakeAllServices() {
-    // Re-run the system health check, which pings all services concurrently
-    runCheck(stage.attempt || 0);
+    runCheck(currentAttempt);
   }
 
   function saveGatewayUrl() {
@@ -150,7 +150,7 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
   // phase === "waking"
   const services = stage.health?.services || {};
   const entries = Object.entries(services);
-  const showEscapeHatch = stage.attempt >= ESCAPE_HATCH_AFTER_ATTEMPTS;
+  const showEscapeHatch = currentAttempt >= ESCAPE_HATCH_AFTER_ATTEMPTS;
 
   return (
     <GateShell>
@@ -184,7 +184,7 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
           Wake All Services
         </button>
         <button
-          onClick={() => runCheck(stage.attempt + 1)}
+          onClick={() => runCheck(currentAttempt + 1)}
           className="font-mono text-xs text-mist hover:text-paper border border-slate rounded-lg px-3 py-2 hover:border-mist/60 transition"
         >
           Recheck now
