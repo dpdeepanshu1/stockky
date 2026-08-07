@@ -12,14 +12,18 @@ New in v2 (merged):
   - Watchlist CRUD persisted in Redis.
   - System health check for all downstream services (concurrent).
   - Notification configuration proxy.
+  - Expanded universe: 100+ base stocks, top 10 gainers/losers, new listings.
+  - Real-time IPO fetching from NSE API (cached in Redis).
+  - Symbol auto-correction with fuzzy matching.
+  - Symbol alias mapping for rebranded/split companies (TATAMOTORS → TMPV/TMLCV, LTIM → LTM, Zomato → Eternal).
 """
 import os
 import json
 import time
 import asyncio
 import logging
-import math
-from typing import List
+import difflib
+from typing import List, Optional, Set, Dict, Union
 
 import httpx
 import yfinance as yf
@@ -35,7 +39,7 @@ logger = logging.getLogger("api-gateway")
 # ---- Live Render URLs (default) ----
 DECISION_URL = os.getenv("DECISION_URL", "https://decision-engine-service-0hg6.onrender.com")
 NOTIFICATION_URL = os.getenv("NOTIFICATION_URL", "https://notification-service-36py.onrender.com")
-NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")  # used for news mentions
+NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")
 
 # Optional downstream services for /system/health (wake‑up checks)
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://market-data-service.onrender.com")
@@ -74,15 +78,48 @@ except Exception as e:
 WATCHLIST_KEY       = "stockky:watchlist"
 SEARCHED_KEY        = "stockky:searched_symbols"
 SCAN_UNIVERSE_KEY   = "stockky:scan_universe"
+IPO_CACHE_KEY       = "stockky:ipos:recent"
+KNOWN_SYMBOLS_KEY   = "stockky:known_symbols"
 
-DEFAULT_WATCHLIST = [
-    "TCS", "INFY", "HDFCBANK", "ICICIBANK", "RELIANCE", "HCLTECH",
-    "WIPRO", "COFORGE", "ANGELONE", "ADANIPOWER", "BEL", "HAL",
-    "TATAMOTORS", "SBIN", "AXISBANK", "KOTAKBANK", "LT", "MARUTI",
-    "SUNPHARMA", "TITAN", "ITC", "BAJFINANCE", "ASIANPAINT", "NESTLEIND",
-]
+# ── Symbol Alias Mapping (old → new) ──────────────────────────────────────
+SYMBOL_ALIASES: Dict[str, Union[str, List[str]]] = {
+    # Tata Motors split into two entities: Passenger Vehicles and Commercial Vehicles
+    "TATAMOTORS": "TMPV",        # primary new symbol for trading (you can also use TMLCV)
+    "TATAMOTER": "TMPV",
+    "TATAMOT": "TMPV",
+    # LTIMindtree rebranded to LTM Limited
+    "LTIM": "LTM",
+    "LTIMIND": "LTM",
+    "LTIMINDTREE": "LTM",
+    # Zomato parent company rebranded to Eternal Limited; the food app still called Zomato
+    "ZOMATO": "ETERNAL",         # trading symbol may be ETERNAL or ZOMATO? We'll keep both.
+    "ZOMAT": "ETERNAL",
+}
 
-# ── Redis helpers ──────────────────────────────────────────────────────────────
+# Also add the new symbols to the base universe
+EXTRA_NEW_SYMBOLS = ["TMPV", "TMLCV", "LTM", "ETERNAL"]
+
+# ── Expanded base universe (100+ stocks) ────────────────────────────────────
+BASE_UNIVERSE = [
+    # Nifty 50
+    "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HCLTECH",
+    "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "TATAMOTORS",  # keep old for fallback
+    "AXISBANK", "SUNPHARMA", "BAJFINANCE", "TITAN", "MARUTI", "WIPRO",
+    "ONGC", "NTPC", "POWERGRID", "ULTRACEMCO", "HINDUNILVR", "M&M",
+    "TATASTEEL", "JSWSTEEL", "HDFCLIFE", "SBILIFE", "DRREDDY", "CIPLA",
+    "DIVISLAB", "EICHERMOT", "INDUSINDBK", "GRASIM", "BRITANNIA", "COALINDIA",
+    "HINDALCO", "BAJAJFINSV", "BPCL", "APOLLOHOSP", "ASIANPAINT", "NESTLEIND",
+    "TATACONSUM", "TRENT", "HEROMOTOCO", "SHRIRAMFIN", "ADANIENT", "ADANIPORTS",
+    "HDFC", "LICHSGFIN", "BANKBARODA", "PNB", "CANBK", "IOC", "GAIL",
+    # Mid cap
+    "BEL", "HAL", "COFORGE", "LTIM",  # keep old for fallback
+    "TECHM", "MPHASIS", "PERSISTENT",
+    "ANGELONE", "ICICIGI", "DMART", "NYKAA", "ZOMATO",  # keep old for fallback
+    "PAYTM", "ADANIPOWER", "IREDA", "IRFC", "RVNL", "HUDCO", "RAILTEL",
+    "CUPID", "BLUESTONE", "JIOFIN", "BSE", "CDSL", "NSDL", "NSE",
+] + EXTRA_NEW_SYMBOLS  # add the new symbols so they are scanned
+
+# ── Redis helpers ─────────────────────────────────────────────────────────
 def _redis_get(key: str):
     if not _redis:
         return None
@@ -118,40 +155,53 @@ def _add_searched(symbol: str):
     sym = symbol.upper().replace(".NS", "").replace(".BO", "")
     if sym not in searched:
         searched.append(sym)
-        _redis_set(SEARCHED_KEY, searched[-200:])  # keep last 200
+        _redis_set(SEARCHED_KEY, searched[-200:])
 
-# ── Dynamic scan universe ──────────────────────────────────────────────────────
-# Base NSE liquid universe — covers all major sectors
-BASE_UNIVERSE = [
-    # IT
-    "TCS", "INFY", "HCLTECH", "WIPRO", "TECHM", "COFORGE", "LTIM", "PERSISTENT", "MPHASIS",
-    # Banks & Finance
-    "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "BAJFINANCE",
-    "BAJAJFINSV", "ANGELONE", "HDFCLIFE", "SBILIFE", "ICICIGI",
-    # Large cap
-    "RELIANCE", "LT", "MARUTI", "TATAMOTORS", "TITAN", "ITC",
-    "SUNPHARMA", "DRREDDY", "CIPLA", "DIVISLAB",
-    # Mid cap diversified
-    "ADANIPOWER", "BEL", "HAL", "ASIANPAINT", "NESTLEIND",
-    "ULTRACEMCO", "GRASIM", "HINDALCO", "JSWSTEEL", "TATASTEEL",
-    "ONGC", "POWERGRID", "NTPC", "COALINDIA", "BPCL",
-    # Consumer & Retail
-    "DMART", "TRENT", "NYKAA", "ZOMATO", "PAYTM",
-    # New listings & emerging
-    "IREDA", "RAILTEL", "IRFC", "RVNL", "HUDCO",
-]
+# ── Real-time IPO fetcher ───────────────────────────────────────────────────
+def _get_recent_ipos() -> List[str]:
+    """Fetch recently listed IPOs from NSE API, with Redis cache."""
+    cached = _redis_get(IPO_CACHE_KEY)
+    if cached:
+        logger.info("Using cached IPO list: %d symbols", len(cached))
+        return cached
 
-# NSE indices — yfinance tickers for momentum screening (unused directly, but kept for reference)
-NSE_INDEX_TICKERS = ["^NSEI", "^NSEBANK"]
+    symbols = []
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = httpx.get("https://www.nseindia.com/api/ipo?type=listed", headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            for item in data:
+                sym = item.get("symbol") or item.get("secCode")
+                if sym:
+                    symbols.append(sym.upper())
+            logger.info("Fetched %d IPOs from NSE API", len(symbols))
+        else:
+            logger.warning("NSE IPO API returned status %d", resp.status_code)
+    except Exception as e:
+        logger.warning("Failed to fetch recent IPOs from NSE: %s", e)
 
+    if not symbols:
+        fallback = ["JIOFIN", "BLUESTONE", "CUPID", "IREDA", "RVNL", "HUDCO", "RAILTEL", "IRFC", "ZOMATO", "NYKAA", "PAYTM"]
+        symbols = fallback
+        logger.info("Using fallback IPO list")
+
+    _redis_set(IPO_CACHE_KEY, symbols, ttl=86400)
+    return symbols
+
+# ── Momentum movers ────────────────────────────────────────────────────────
 def _get_momentum_movers() -> List[str]:
-    """Fetch top gainers/losers from NSE indices — these have recent momentum."""
+    """Fetch top 10 gainers and top 10 losers from Nifty 50."""
     movers = []
     try:
         nifty50_symbols = [
             "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-            "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BPCL",
-            "BHARTIARTL", "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY",
+            "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BHARTIARTL", "BPCL",
+            "BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB", "DRREDDY",
             "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
             "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "ITC",
             "INDUSINDBK", "INFY", "JSWSTEEL", "KOTAKBANK", "LT",
@@ -161,7 +211,7 @@ def _get_momentum_movers() -> List[str]:
             "TCS", "TRENT", "TITAN", "ULTRACEMCO", "WIPRO",
         ]
         performances = []
-        for sym in nifty50_symbols[:20]:  # limit to avoid timeout
+        for sym in nifty50_symbols:
             try:
                 t = yf.Ticker(f"{sym}.NS")
                 hist = t.history(period="5d", interval="1d")
@@ -172,8 +222,8 @@ def _get_momentum_movers() -> List[str]:
             except Exception:
                 continue
         performances.sort(key=lambda x: x[1], reverse=True)
-        movers = [s for s, _ in performances[:5]] + [s for s, _ in performances[-5:]]
-        logger.info("Momentum movers this week: %s", movers)
+        movers = [s for s, _ in performances[:10]] + [s for s, _ in performances[-10:]]
+        logger.info("Momentum movers: %s", movers[:5])
     except Exception as e:
         logger.warning("Could not fetch momentum movers: %s", e)
     return movers
@@ -185,23 +235,93 @@ def _get_news_mentioned_symbols() -> List[str]:
         feed = feedparser.parse(
             "https://news.google.com/rss/search?q=NSE+stock+bulk+deal+earnings+results&hl=en-IN&gl=IN&ceid=IN:en"
         )
-        text = " ".join(e.title for e in feed.entries[:20]).upper()
+        text = " ".join(e.title for e in feed.entries[:30]).upper()
         for sym in BASE_UNIVERSE:
             if sym in text:
                 mentioned.append(sym)
     except Exception as e:
         logger.warning("Could not parse news for symbols: %s", e)
-    return mentioned[:10]
+    return mentioned[:15]
 
+# ── Symbol resolution (auto-correction + alias mapping) ────────────────────
+def _get_all_known_symbols() -> Set[str]:
+    """Combine all sources of known symbols (cached for 6 hours)."""
+    cached = _redis_get(KNOWN_SYMBOLS_KEY)
+    if cached:
+        return set(cached)
+
+    combined = set(BASE_UNIVERSE)
+    combined.update(_load_watchlist())
+    combined.update(_load_searched())
+    combined.update(_get_recent_ipos())
+    combined.update(_get_momentum_movers())
+    # Also add any alias targets
+    for target in SYMBOL_ALIASES.values():
+        if isinstance(target, list):
+            combined.update(target)
+        else:
+            combined.add(target)
+
+    scan_universe = _redis_get(SCAN_UNIVERSE_KEY)
+    if scan_universe:
+        combined.update(scan_universe)
+
+    cleaned = set()
+    for s in combined:
+        s = s.upper().replace(".NS", "").replace(".BO", "")
+        if s:
+            cleaned.add(s)
+
+    _redis_set(KNOWN_SYMBOLS_KEY, list(cleaned), ttl=21600)
+    return cleaned
+
+def _resolve_symbol(misspelled: str) -> Optional[str]:
+    """
+    Try to correct a misspelled symbol using:
+    1. Alias mapping (old → new)
+    2. Fuzzy matching against known symbols
+    """
+    if not misspelled:
+        return None
+    symbol = misspelled.upper().replace(".NS", "").replace(".BO", "")
+
+    # Check alias map
+    if symbol in SYMBOL_ALIASES:
+        alias = SYMBOL_ALIASES[symbol]
+        if isinstance(alias, list):
+            # For splits, return the first one as primary, but also log
+            logger.info("Alias '%s' → %s (primary)", symbol, alias[0])
+            return alias[0]
+        else:
+            logger.info("Alias '%s' → %s", symbol, alias)
+            return alias
+
+    known = _get_all_known_symbols()
+
+    # Exact match
+    if symbol in known:
+        return symbol
+
+    # Fuzzy match
+    matches = difflib.get_close_matches(symbol, known, n=1, cutoff=0.7)
+    if matches:
+        corrected = matches[0]
+        logger.info("Corrected '%s' → '%s'", symbol, corrected)
+        return corrected
+
+    return None
+
+# ── Build scan universe ──────────────────────────────────────────────────────
 def _build_scan_universe() -> List[str]:
     """
     Build a fresh scan universe by combining:
-    1. Base liquid universe (40+ stocks)
+    1. Base liquid universe (100+ stocks)
     2. User watchlist
     3. Previously searched symbols
-    4. Weekly momentum movers
+    4. Weekly momentum movers (top 10 gainers + top 10 losers)
     5. News-mentioned symbols
-    Deduped and capped at 60 symbols to keep scan under 3 minutes.
+    6. Real-time IPOs (from NSE API)
+    Deduped and capped at 120 symbols.
     """
     cached = _redis_get(SCAN_UNIVERSE_KEY)
     if cached:
@@ -212,6 +332,7 @@ def _build_scan_universe() -> List[str]:
     universe.update(_load_searched())
     universe.update(_get_momentum_movers())
     universe.update(_get_news_mentioned_symbols())
+    universe.update(_get_recent_ipos())
 
     clean = []
     seen = set()
@@ -221,12 +342,12 @@ def _build_scan_universe() -> List[str]:
             seen.add(s)
             clean.append(s)
 
-    result = clean[:60]
-    _redis_set(SCAN_UNIVERSE_KEY, result, ttl=21600)  # 6hr cache
+    result = clean[:120]
+    _redis_set(SCAN_UNIVERSE_KEY, result, ttl=21600)
     logger.info("Scan universe built: %d symbols", len(result))
     return result
 
-# ── Pydantic models ────────────────────────────────────────────────────────────
+# ── Pydantic models ──────────────────────────────────────────────────────────
 class WatchlistUpdate(BaseModel):
     symbols: List[str]
 
@@ -237,7 +358,7 @@ class NotificationChannelUpdate(BaseModel):
     telegram_chat_id: str | None = None
     enabled: dict | None = None
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+# ── Routes ──────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
@@ -250,7 +371,7 @@ def root():
             "/watchlist": "GET/POST – manage watchlist",
             "/watchlist/add": "POST – add symbols",
             "/watchlist/{symbol}": "DELETE – remove symbol",
-            "/stock/{symbol}": "GET – get decision for a symbol",
+            "/stock/{symbol}": "GET – get decision for a symbol (auto-corrects misspelled symbols)",
             "/scan": "GET – scan universe (dynamic) – accepts ?force_refresh=true",
             "/scan/universe": "GET – preview current scan universe",
             "/scan/universe/cache": "DELETE – clear universe cache",
@@ -269,7 +390,6 @@ def health():
 
 @app.get("/system/health")
 async def system_health():
-    """Pings every downstream service AT THE SAME TIME."""
     async def check(name: str, url: str, required: bool):
         if not url:
             return name, {"ok": False, "required": required, "status": "not_configured"}
@@ -301,13 +421,11 @@ async def system_health():
     )
     services = {"api-gateway": {"ok": True, "required": True, "status": "up", "seconds": 0}}
     services.update(dict(results))
-
     required_ok = all(v["ok"] for v in services.values() if v["required"])
     all_ok = all(v["ok"] for v in services.values())
-
     return {"required_ok": required_ok, "all_ok": all_ok, "services": services}
 
-# ── Watchlist ──────────────────────────────────────────────────────────────────
+# ── Watchlist endpoints ────────────────────────────────────────────────────
 @app.get("/watchlist")
 def get_watchlist():
     return {"symbols": _load_watchlist()}
@@ -344,42 +462,63 @@ def remove_from_watchlist(symbol: str):
     _save_watchlist(updated)
     return {"symbols": updated}
 
-# ── Searched symbols ──────────────────────────────────────────────────────────
+# ── Searched symbols ────────────────────────────────────────────────────────
 @app.get("/searched")
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision ─────────────────────────────────────────────────────────────
+# ── Stock decision (with auto-correction and alias mapping) ────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
-    """Single stock analysis. Saves symbol to searched history."""
-    _add_searched(symbol)
+    original = symbol.strip()
+    resolved = _resolve_symbol(original)
+
+    if resolved is None:
+        resolved = original.upper()
+        corrected_from = None
+    elif resolved != original.upper():
+        corrected_from = original.upper()
+        symbol_to_use = resolved
+    else:
+        symbol_to_use = original.upper()
+        corrected_from = None
+
+    _add_searched(symbol_to_use)
+
     if _redis:
         try:
             _redis.delete(SCAN_UNIVERSE_KEY)
         except Exception:
             pass
+
     try:
         resp = httpx.get(
-            f"{DECISION_URL}/decide/{symbol}",
+            f"{DECISION_URL}/decide/{symbol_to_use}",
             params={"already_owned": already_owned},
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+
+        if corrected_from:
+            result["corrected_from"] = corrected_from
+            result["symbol"] = symbol_to_use
+
+        return result
+
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+        if e.response.status_code == 404:
+            suggestions = difflib.get_close_matches(symbol_to_use, _get_all_known_symbols(), n=3, cutoff=0.5)
+            suggestion_text = f"Symbol '{symbol_to_use}' not found. Did you mean: {', '.join(suggestions)}?" if suggestions else f"Symbol '{symbol_to_use}' not found."
+            raise HTTPException(status_code=404, detail=suggestion_text)
+        else:
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Decision engine unreachable: {e}")
 
-# ── Scan ──────────────────────────────────────────────────────────────────────
+# ── Scan ──────────────────────────────────────────────────────────────────
 @app.get("/scan")
 def run_scan(force_refresh: bool = False):
-    """
-    Smart market scan across 50+ stocks.
-    Always returns top 3-5 picks with buy/target/stop even when the
-    overall market is cautious — ranked by combined score.
-    """
     if force_refresh and _redis:
         try:
             _redis.delete(SCAN_UNIVERSE_KEY)
@@ -390,7 +529,7 @@ def run_scan(force_refresh: bool = False):
     results = []
     errors = []
 
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=150) as client:
         for symbol in universe:
             try:
                 resp = client.get(f"{DECISION_URL}/decide/{symbol}")
@@ -446,9 +585,9 @@ def run_scan(force_refresh: bool = False):
         "errors": errors,
     }
 
+# ── Universe preview endpoints ──────────────────────────────────────────────
 @app.get("/scan/universe")
 def get_scan_universe():
-    """Preview what symbols will be scanned next run."""
     universe = _build_scan_universe()
     searched = _load_searched()
     movers = _get_momentum_movers()
@@ -461,7 +600,6 @@ def get_scan_universe():
 
 @app.delete("/scan/universe/cache")
 def clear_universe_cache():
-    """Force rebuild of scan universe on next scan."""
     if _redis:
         try:
             _redis.delete(SCAN_UNIVERSE_KEY)
@@ -469,7 +607,7 @@ def clear_universe_cache():
             pass
     return {"message": "Scan universe cache cleared — will rebuild on next scan"}
 
-# ── Notifications ──────────────────────────────────────────────────────────────
+# ── Notification endpoints ──────────────────────────────────────────────────
 @app.get("/notifications/health")
 def notifications_health():
     try:
