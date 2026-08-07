@@ -188,6 +188,8 @@ def _get_all_nse_securities() -> List[str]:
     return symbols
 
 def _get_nifty_indices() -> List[str]:
+    """Fetch Nifty 50, Next 50, and Midcap 100 constituents with fallback."""
+    # First attempt to fetch from NSE API
     indices = ["NIFTY%2050", "NIFTY%20NEXT%2050", "NIFTY%20MIDCAP%20100"]
     all_symbols = []
     for idx in indices:
@@ -196,6 +198,25 @@ def _get_nifty_indices() -> List[str]:
             for item in data["data"]:
                 if item.get("symbol"):
                     all_symbols.append(item["symbol"].upper())
+    
+    # If we got less than 50 symbols, fallback to a known Nifty 50 list
+    if len(all_symbols) < 50:
+        logger.warning("NSE API returned fewer than 50 symbols. Using fallback list.")
+        fallback = [
+            "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+            "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BHARTIARTL", "BPCL",
+            "BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB", "DRREDDY",
+            "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
+            "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "ITC",
+            "INDUSINDBK", "INFY", "JSWSTEEL", "KOTAKBANK", "LT",
+            "LTIM", "M&M", "MARUTI", "NESTLEIND", "NTPC",
+            "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN",
+            "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL",
+            "TCS", "TRENT", "TITAN", "ULTRACEMCO", "WIPRO"
+        ]
+        # Merge with what we already have
+        all_symbols = list(set(all_symbols + fallback))
+    
     return all_symbols
 
 def _get_recent_ipos() -> List[str]:
@@ -490,6 +511,7 @@ async def run_scan_async(task_id: str, universe: List[str]):
 
 # ── Market Movers ──────────────────────────────────────────────────────────
 def _get_nifty50_data() -> List[dict]:
+    """Fetch real-time Nifty 50 stock data (from yfinance)."""
     nifty_symbols = _get_nifty_indices()[:50]
     data = []
     for sym in nifty_symbols:

@@ -32,9 +32,10 @@ export default function MarketMovers({ onSelect }: { onSelect: (symbol: string) 
           res = await api.marketTrending();
           break;
       }
-      setData(res.data);
+      setData(res.data || []);
     } catch (e) {
       setError((e as Error).message);
+      setData([]);
     } finally {
       setLoading(false);
     }
@@ -75,7 +76,13 @@ export default function MarketMovers({ onSelect }: { onSelect: (symbol: string) 
         <p className="text-signal-sell text-xs font-mono">{error}</p>
       )}
 
-      {!loading && !error && (
+      {!loading && !error && data.length === 0 && (
+        <p className="text-mist/60 text-sm font-mono text-center py-8">
+          No market data available at the moment. Please try again later.
+        </p>
+      )}
+
+      {!loading && !error && data.length > 0 && (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2">
           {data.map((stock, index) => (
             <div
