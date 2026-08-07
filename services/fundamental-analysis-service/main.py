@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fundamental-analysis-service")
 
+# IMPORTANT: Ensure this URL matches your deployed market-data-service URL
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://market-data-service.onrender.com")
 
 app = FastAPI(title="Stockky Fundamental Analysis Service", version="0.1.0")
@@ -50,14 +51,12 @@ def analyze(symbol: str):
         logger.error(f"Market data service error for {symbol}: {e}")
         raise HTTPException(status_code=502, detail=f"Market data service unreachable: {e}")
 
-    # Ensure we have a dict even if the response is empty
     if not f:
         f = {}
 
     score = 50
     reasons = []
 
-    # Extract metrics - use .get() with default None
     rev_growth = f.get("revenue_growth")
     earnings_growth = f.get("earnings_growth")
     roe = f.get("roe")
@@ -68,7 +67,6 @@ def analyze(symbol: str):
     pe = f.get("pe_ratio")
     forward_pe = f.get("forward_pe")
 
-    # Build metrics dict (always include all keys)
     metrics = {
         "revenue_growth": rev_growth,
         "earnings_growth": earnings_growth,
@@ -81,7 +79,6 @@ def analyze(symbol: str):
         "forward_pe": forward_pe,
     }
 
-    # Scoring and reasons
     if rev_growth is not None:
         if rev_growth > 15:
             score += 12
@@ -162,7 +159,6 @@ def analyze(symbol: str):
             score += 4
             reasons.append("Forward P/E lower than trailing P/E — earnings expected to grow into valuation")
 
-    # Ensure at least one reason
     if not reasons:
         reasons.append("Fundamental data partially available; score is based on available metrics")
 

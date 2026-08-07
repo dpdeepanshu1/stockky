@@ -189,7 +189,6 @@ def _get_all_nse_securities() -> List[str]:
 
 def _get_nifty_indices() -> List[str]:
     """Fetch Nifty 50, Next 50, and Midcap 100 constituents with fallback."""
-    # First attempt to fetch from NSE API
     indices = ["NIFTY%2050", "NIFTY%20NEXT%2050", "NIFTY%20MIDCAP%20100"]
     all_symbols = []
     for idx in indices:
@@ -199,24 +198,21 @@ def _get_nifty_indices() -> List[str]:
                 if item.get("symbol"):
                     all_symbols.append(item["symbol"].upper())
     
-    # If we got less than 50 symbols, fallback to a known Nifty 50 list
-    if len(all_symbols) < 50:
-        logger.warning("NSE API returned fewer than 50 symbols. Using fallback list.")
-        fallback = [
-            "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-            "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BHARTIARTL", "BPCL",
-            "BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB", "DRREDDY",
-            "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
-            "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "ITC",
-            "INDUSINDBK", "INFY", "JSWSTEEL", "KOTAKBANK", "LT",
-            "LTIM", "M&M", "MARUTI", "NESTLEIND", "NTPC",
-            "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN",
-            "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL",
-            "TCS", "TRENT", "TITAN", "ULTRACEMCO", "WIPRO"
-        ]
-        # Merge with what we already have
-        all_symbols = list(set(all_symbols + fallback))
-    
+    # Always ensure we have at least 50 symbols
+    fallback = [
+        "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+        "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BHARTIARTL", "BPCL",
+        "BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB", "DRREDDY",
+        "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
+        "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "ITC",
+        "INDUSINDBK", "INFY", "JSWSTEEL", "KOTAKBANK", "LT",
+        "LTIM", "M&M", "MARUTI", "NESTLEIND", "NTPC",
+        "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN",
+        "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL",
+        "TCS", "TRENT", "TITAN", "ULTRACEMCO", "WIPRO"
+    ]
+    # Merge and deduplicate
+    all_symbols = list(set(all_symbols + fallback))
     return all_symbols
 
 def _get_recent_ipos() -> List[str]:
@@ -275,7 +271,12 @@ def _build_scan_universe() -> List[str]:
 
     universe = set()
     all_stocks = _get_all_nse_securities()
-    universe.update(all_stocks[:100])
+    if all_stocks:
+        universe.update(all_stocks[:100])
+    else:
+        # fallback: use nifty indices
+        universe.update(_get_nifty_indices())
+    
     universe.update(_get_nifty_indices())
     universe.update(_get_momentum_movers())
     universe.update(_get_news_mentioned_symbols())
@@ -295,7 +296,7 @@ def _build_scan_universe() -> List[str]:
         if s and s not in seen:
             seen.add(s)
             clean.append(s)
-    result = clean[:120]
+    result = clean[:120] if clean else _get_nifty_indices()[:50]
     _redis_set(SCAN_UNIVERSE_KEY, result, ttl=21600)
     logger.info("Scan universe built: %d symbols", len(result))
     return result
@@ -345,10 +346,14 @@ def _resolve_symbol(misspelled: str) -> Optional[str]:
         return matches[0]
     return None
 
-# ── Hinglish summary ──────────────────────────────────────────────────────
+# ── Hinglish summary (with type validation) ──────────────────────────────
 def _generate_summary(data: dict) -> str:
+    if not isinstance(data, dict):
+        return "Data unavailable"
     decision = data.get("decision")
     symbol = data.get("symbol")
+    if not symbol:
+        symbol = "Unknown"
     confidence = data.get("confidence")
     combined_score = data.get("combined_score")
     entry = data.get("entry_range", {})
@@ -441,8 +446,12 @@ async def run_scan_async(task_id: str, universe: List[str]):
                 resp = await client.get(f"{DECISION_URL}/decide/{symbol}")
                 resp.raise_for_status()
                 result = resp.json()
-                result["natural_language_summary"] = _generate_summary(result)
-                results.append(result)
+                # Ensure result is a dict
+                if isinstance(result, dict):
+                    result["natural_language_summary"] = _generate_summary(result)
+                    results.append(result)
+                else:
+                    errors.append({"symbol": symbol, "error": "Invalid response format"})
             except httpx.HTTPError as e:
                 logger.warning("Scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})
@@ -458,6 +467,8 @@ async def run_scan_async(task_id: str, universe: List[str]):
                     "error": None,
                 }, ttl=3600)
 
+    # Filter out any non-dict items
+    results = [r for r in results if isinstance(r, dict)]
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = actionable[:5]
@@ -511,7 +522,6 @@ async def run_scan_async(task_id: str, universe: List[str]):
 
 # ── Market Movers ──────────────────────────────────────────────────────────
 def _get_nifty50_data() -> List[dict]:
-    """Fetch real-time Nifty 50 stock data (from yfinance)."""
     nifty_symbols = _get_nifty_indices()[:50]
     data = []
     for sym in nifty_symbols:
@@ -740,12 +750,16 @@ def run_scan(force_refresh: bool = False):
                 resp = client.get(f"{DECISION_URL}/decide/{symbol}")
                 resp.raise_for_status()
                 result = resp.json()
-                result["natural_language_summary"] = _generate_summary(result)
-                results.append(result)
+                if isinstance(result, dict):
+                    result["natural_language_summary"] = _generate_summary(result)
+                    results.append(result)
+                else:
+                    errors.append({"symbol": symbol, "error": "Invalid response format"})
             except httpx.HTTPError as e:
                 logger.warning("Scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})
 
+    results = [r for r in results if isinstance(r, dict)]
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = actionable[:5]
@@ -857,12 +871,16 @@ def scan_watchlist():
                 resp = client.get(f"{DECISION_URL}/decide/{symbol}")
                 resp.raise_for_status()
                 result = resp.json()
-                result["natural_language_summary"] = _generate_summary(result)
-                results.append(result)
+                if isinstance(result, dict):
+                    result["natural_language_summary"] = _generate_summary(result)
+                    results.append(result)
+                else:
+                    errors.append({"symbol": symbol, "error": "Invalid response format"})
             except httpx.HTTPError as e:
                 logger.warning("Watchlist scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})
 
+    results = [r for r in results if isinstance(r, dict)]
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = actionable[:5]
