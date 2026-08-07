@@ -454,11 +454,36 @@ def get_fundamentals_raw(symbol: str):
         _cache_set(cache_key, result, ttl=3600)
         return result
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.exception("Failed to fetch fundamentals for %s", sym)
-        raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
+        # Ensure we catch ALL exceptions and return a valid JSON error
+        logger.exception(f"Failed to fetch fundamentals for {sym}: {e}")
+        # Return a valid JSON with nulls instead of raising an exception
+        error_result = {
+            "symbol": sym,
+            "pe_ratio": None,
+            "forward_pe": None,
+            "market_cap": None,
+            "dividend_yield": None,
+            "year_change_pct": None,
+            "year_high": None,
+            "year_low": None,
+            "fifty_day_average": None,
+            "two_hundred_day_average": None,
+            "range_position_pct": None,
+            "revenue_growth": None,
+            "earnings_growth": None,
+            "eps": None,
+            "roe": None,
+            "debt_to_equity": None,
+            "free_cashflow": None,
+            "profit_margins": None,
+            "held_percent_insiders": None,
+            "held_percent_institutions": None,
+            "price_to_book": None,
+            "sector": None,
+            "industry": None,
+        }
+        return error_result
 
 if __name__ == "__main__":
     import uvicorn
