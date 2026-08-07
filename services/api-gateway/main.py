@@ -31,8 +31,8 @@ DECISION_URL = os.getenv("DECISION_URL", "https://decision-engine-service-0hg6.o
 NOTIFICATION_URL = os.getenv("NOTIFICATION_URL", "https://notification-service-36py.onrender.com")
 NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")
 
-# Optional downstream services for /system/health (wake‑up checks)
-MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://market-data-service.onrender.com")
+# ✅ Correct market data service URL (the actual service name)
+MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
 TECHNICAL_URL = os.getenv("TECHNICAL_URL", "https://technical-analysis-service-zhnc.onrender.com")
 FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-service.onrender.com")
 EVENT_URL = os.getenv("EVENT_URL", "https://event-tracker-service-m1lw.onrender.com")
@@ -198,7 +198,6 @@ def _get_nifty_indices() -> List[str]:
                 if item.get("symbol"):
                     all_symbols.append(item["symbol"].upper())
     
-    # Always ensure we have at least 50 symbols
     fallback = [
         "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
         "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BHARTIARTL", "BPCL",
@@ -211,7 +210,6 @@ def _get_nifty_indices() -> List[str]:
         "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL",
         "TCS", "TRENT", "TITAN", "ULTRACEMCO", "WIPRO"
     ]
-    # Merge and deduplicate
     all_symbols = list(set(all_symbols + fallback))
     return all_symbols
 
@@ -274,7 +272,6 @@ def _build_scan_universe() -> List[str]:
     if all_stocks:
         universe.update(all_stocks[:100])
     else:
-        # fallback: use nifty indices
         universe.update(_get_nifty_indices())
     
     universe.update(_get_nifty_indices())
@@ -446,12 +443,11 @@ async def run_scan_async(task_id: str, universe: List[str]):
                 resp = await client.get(f"{DECISION_URL}/decide/{symbol}")
                 resp.raise_for_status()
                 result = resp.json()
-                # Ensure result is a dict
                 if isinstance(result, dict):
                     result["natural_language_summary"] = _generate_summary(result)
                     results.append(result)
                 else:
-                    errors.append({"symbol": symbol, "error": "Invalid response format"})
+                    errors.append({"symbol": symbol, "error": f"Invalid response (expected dict, got {type(result).__name__})"})
             except httpx.HTTPError as e:
                 logger.warning("Scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})
@@ -467,7 +463,6 @@ async def run_scan_async(task_id: str, universe: List[str]):
                     "error": None,
                 }, ttl=3600)
 
-    # Filter out any non-dict items
     results = [r for r in results if isinstance(r, dict)]
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
@@ -686,7 +681,7 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision (FIXED: symbol_to_use always defined) ──────────────────
+# ── Stock decision ──────────────────────────────────────────────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
@@ -719,7 +714,10 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         if corrected_from:
             result["corrected_from"] = corrected_from
             result["symbol"] = symbol_to_use
-        result["natural_language_summary"] = _generate_summary(result)
+        if isinstance(result, dict):
+            result["natural_language_summary"] = _generate_summary(result)
+        else:
+            result = {"error": "Invalid response from decision engine", "symbol": symbol_to_use}
         return result
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
@@ -754,7 +752,7 @@ def run_scan(force_refresh: bool = False):
                     result["natural_language_summary"] = _generate_summary(result)
                     results.append(result)
                 else:
-                    errors.append({"symbol": symbol, "error": "Invalid response format"})
+                    errors.append({"symbol": symbol, "error": f"Invalid response (expected dict, got {type(result).__name__})"})
             except httpx.HTTPError as e:
                 logger.warning("Scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})
@@ -875,7 +873,7 @@ def scan_watchlist():
                     result["natural_language_summary"] = _generate_summary(result)
                     results.append(result)
                 else:
-                    errors.append({"symbol": symbol, "error": "Invalid response format"})
+                    errors.append({"symbol": symbol, "error": f"Invalid response (expected dict, got {type(result).__name__})"})
             except httpx.HTTPError as e:
                 logger.warning("Watchlist scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})

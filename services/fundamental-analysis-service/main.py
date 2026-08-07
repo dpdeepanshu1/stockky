@@ -14,8 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fundamental-analysis-service")
 
-# IMPORTANT: Ensure this URL matches your deployed market-data-service URL
-MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://market-data-service.onrender.com")
+# ✅ CORRECT: Use the actual market data service URL from your deployment
+# The service is named "stockky-market-data" on Render.
+# Default uses the live Render URL.
+MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
 
 app = FastAPI(title="Stockky Fundamental Analysis Service", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -57,6 +59,7 @@ def analyze(symbol: str):
     score = 50
     reasons = []
 
+    # Extract metrics – these keys must match what the market-data service returns
     rev_growth = f.get("revenue_growth")
     earnings_growth = f.get("earnings_growth")
     roe = f.get("roe")
@@ -79,6 +82,7 @@ def analyze(symbol: str):
         "forward_pe": forward_pe,
     }
 
+    # Scoring and reasons
     if rev_growth is not None:
         if rev_growth > 15:
             score += 12
