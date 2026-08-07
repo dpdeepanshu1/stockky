@@ -87,7 +87,6 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
     try {
       await wakeService(url);
       setWakeMessages((prev) => ({ ...prev, [serviceName]: "✅ Woke! Rechecking..." }));
-      // Wait a moment, then recheck
       await new Promise((resolve) => setTimeout(resolve, 3000));
       await runCheck(currentAttempt);
       setWakeMessages((prev) => ({ ...prev, [serviceName]: "🟢 Online" }));
@@ -95,7 +94,6 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
       setWakeMessages((prev) => ({ ...prev, [serviceName]: "❌ Wake failed" }));
     } finally {
       setWakingServices((prev) => ({ ...prev, [serviceName]: false }));
-      // Clear message after 5 seconds
       setTimeout(() => {
         setWakeMessages((prev) => {
           const newMsg = { ...prev };
@@ -107,7 +105,6 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
   }
 
   async function wakeAllServices() {
-    // Get all services that have a URL and are not OK
     const services = stage.phase === "waking" ? stage.health?.services : {};
     if (!services) return;
     for (const [name, s] of Object.entries(services)) {
@@ -294,3 +291,6 @@ function GateShell({ children }: { children: React.ReactNode }) {
     </div>
   );
 }
+
+// ✅ Default export is here
+export default SystemCheck;

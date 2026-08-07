@@ -174,7 +174,7 @@ def analyze(symbol: str):
         "sector": f.get("sector"),
         "industry": f.get("industry"),
         "reasons": reasons,
-        "metrics": metrics,          # <-- NEW: always include raw metrics
+        "metrics": metrics,          # <-- include the raw metrics
         "raw": f,
     }
 

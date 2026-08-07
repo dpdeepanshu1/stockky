@@ -1,4 +1,4 @@
-import { Decision, FundamentalMetrics } from "../api";
+import { Decision } from "../api";
 import { decisionStyle } from "../decisionStyle";
 
 interface Props {
@@ -18,21 +18,7 @@ export default function DecisionCard({ data, onBack }: Props) {
     ...(data.prediction_score !== null ? [{ label: "AI Model", value: data.prediction_score }] : []),
   ];
 
-  // Fundamental metrics – explicitly type as FundamentalMetrics or empty object
-  const metrics: FundamentalMetrics = data.fundamental_metrics || {
-    revenue_growth: null,
-    earnings_growth: null,
-    roe: null,
-    debt_to_equity: null,
-    free_cashflow: null,
-    profit_margins: null,
-    institutional_holding: null,
-    pe_ratio: null,
-    forward_pe: null,
-  };
-
-  // Helper to check if any metric has a value
-  const hasMetrics = Object.values(metrics).some((v) => v !== null && v !== undefined);
+  const metrics = data.fundamental_metrics;
 
   return (
     <div className="space-y-4">
@@ -116,37 +102,37 @@ export default function DecisionCard({ data, onBack }: Props) {
       </div>
 
       {/* Fundamental Metrics */}
-      {hasMetrics && (
+      {metrics && (
         <div className="rounded-xl border border-slate/60 bg-graphite/30 p-5">
           <h3 className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">
             📊 Fundamental Metrics
           </h3>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-            {metrics.revenue_growth !== null && metrics.revenue_growth !== undefined && (
+            {metrics.revenue_growth != null && (
               <MetricItem label="Revenue Growth" value={`${metrics.revenue_growth.toFixed(1)}%`} />
             )}
-            {metrics.earnings_growth !== null && metrics.earnings_growth !== undefined && (
+            {metrics.earnings_growth != null && (
               <MetricItem label="Earnings Growth" value={`${metrics.earnings_growth.toFixed(1)}%`} />
             )}
-            {metrics.roe !== null && metrics.roe !== undefined && (
+            {metrics.roe != null && (
               <MetricItem label="ROE" value={`${metrics.roe.toFixed(1)}%`} />
             )}
-            {metrics.debt_to_equity !== null && metrics.debt_to_equity !== undefined && (
+            {metrics.debt_to_equity != null && (
               <MetricItem label="Debt/Equity" value={`${metrics.debt_to_equity.toFixed(1)}`} />
             )}
-            {metrics.free_cashflow !== null && metrics.free_cashflow !== undefined && (
+            {metrics.free_cashflow != null && (
               <MetricItem label="Free Cash Flow" value={metrics.free_cashflow > 0 ? "Positive" : "Negative"} />
             )}
-            {metrics.profit_margins !== null && metrics.profit_margins !== undefined && (
+            {metrics.profit_margins != null && (
               <MetricItem label="Net Margin" value={`${metrics.profit_margins.toFixed(1)}%`} />
             )}
-            {metrics.institutional_holding !== null && metrics.institutional_holding !== undefined && (
+            {metrics.institutional_holding != null && (
               <MetricItem label="Institutional Holding" value={`${metrics.institutional_holding.toFixed(1)}%`} />
             )}
-            {metrics.pe_ratio !== null && metrics.pe_ratio !== undefined && (
+            {metrics.pe_ratio != null && (
               <MetricItem label="P/E Ratio" value={`${metrics.pe_ratio.toFixed(1)}`} />
             )}
-            {metrics.forward_pe !== null && metrics.forward_pe !== undefined && (
+            {metrics.forward_pe != null && (
               <MetricItem label="Forward P/E" value={`${metrics.forward_pe.toFixed(1)}`} />
             )}
           </div>

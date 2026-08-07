@@ -55,7 +55,7 @@ export interface Decision {
   valuation: string;
   sector: string | null;
   natural_language_summary: string;
-  fundamental_metrics?: FundamentalMetrics;  // <-- explicit type
+  fundamental_metrics?: FundamentalMetrics;
 }
 
 export interface ScanResult {
@@ -130,7 +130,7 @@ export interface SystemHealth {
   services: Record<string, SystemServiceStatus>;
 }
 
-/** Flexible request wrapper with configurable timeout (default 60s) */
+/** Flexible request wrapper with configurable timeout */
 async function request<T>(path: string, init?: RequestInit, retries = 2, timeoutMs = 60000): Promise<T> {
   const base = getApiUrl();
   if (!base) {
