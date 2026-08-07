@@ -14,6 +14,7 @@ import time
 import json
 import logging
 import math
+import httpx
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -244,8 +245,9 @@ def get_history(
 
 @app.get("/fundamentals/{symbol}")
 def get_fundamentals_raw(symbol: str):
-    """Raw fundamental data pulled from Yahoo's info payload — the Fundamental
-    Analysis Service turns this into scores; this endpoint just exposes it."""
+    """Fundamental data built from fast_info + quote + dividends history.
+    Yahoo's full .info endpoint is blocked from cloud environments (403),
+    so we assemble what we can from the endpoints that do work."""
     sym = normalize_symbol(symbol)
     cache_key = f"fundamentals:{sym}"
     cached = _cache_get(cache_key)
@@ -253,33 +255,84 @@ def get_fundamentals_raw(symbol: str):
         return cached
 
     try:
-        # Use retry logic for the info call to handle rate limits
-        info = _fetch_info_with_retry(sym)
+        ticker = yf.Ticker(sym)
+        ticker._tz = "Asia/Kolkata"
 
-        if not info:
-            raise HTTPException(status_code=404, detail=f"No fundamentals for {sym}")
+        # fast_info — price-level data, works from cloud
+        fi = ticker.fast_info
+
+        def _safe_fi(attr):
+            try:
+                v = getattr(fi, attr, None)
+                return None if (v is None or (isinstance(v, float) and (v != v))) else v
+            except Exception:
+                return None
+
+        last_price   = _safe_fi("last_price")
+        market_cap   = _safe_fi("market_cap")
+        year_high    = _safe_fi("year_high")
+        year_low     = _safe_fi("year_low")
+        year_change  = _safe_fi("year_change")
+        fifty_day    = _safe_fi("fifty_day_average")
+        two_hundred  = _safe_fi("two_hundred_day_average")
+
+        # Dividends — works from cloud via history endpoint
+        dividend_yield = None
+        try:
+            divs = ticker.dividends
+            if divs is not None and not divs.empty and last_price:
+                annual_div = float(divs.tail(4).sum())  # trailing 4 quarters
+                dividend_yield = round(annual_div / last_price * 100, 2)
+        except Exception:
+            pass
+
+        # PE ratio — already in quote endpoint, fetch from there
+        pe_ratio = None
+        try:
+            q_resp = httpx.get(f"http://localhost:{os.getenv('PORT', '8001')}/quote/{symbol}", timeout=10)
+            if q_resp.status_code == 200:
+                pe_ratio = q_resp.json().get("pe_ratio")
+        except Exception:
+            pass
+
+        # Price momentum as a proxy for earnings growth
+        momentum = None
+        if year_change is not None:
+            momentum = round(year_change * 100, 2)
+
+        # 52-week range position (0-100%) as valuation proxy
+        range_position = None
+        if year_high and year_low and last_price and year_high != year_low:
+            range_position = round((last_price - year_low) / (year_high - year_low) * 100, 1)
 
         result = {
             "symbol": sym,
-            "revenue_growth": info.get("revenueGrowth"),
-            "earnings_growth": info.get("earningsGrowth"),
-            "eps": info.get("trailingEps"),
-            "roe": info.get("returnOnEquity"),
-            "debt_to_equity": info.get("debtToEquity"),
-            "free_cashflow": info.get("freeCashflow"),
-            "profit_margins": info.get("profitMargins"),
-            "held_percent_insiders": info.get("heldPercentInsiders"),
-            "held_percent_institutions": info.get("heldPercentInstitutions"),
-            "pe_ratio": info.get("trailingPE"),
-            "forward_pe": info.get("forwardPE"),
-            "price_to_book": info.get("priceToBook"),
-            "dividend_yield": info.get("dividendYield"),
-            "market_cap": info.get("marketCap"),
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
+            "pe_ratio": pe_ratio,
+            "forward_pe": None,
+            "market_cap": market_cap,
+            "dividend_yield": dividend_yield,
+            "year_change_pct": momentum,
+            "year_high": year_high,
+            "year_low": year_low,
+            "fifty_day_average": fifty_day,
+            "two_hundred_day_average": two_hundred,
+            "range_position_pct": range_position,
+            # Fields not available from cloud — honest nulls
+            "revenue_growth": None,
+            "earnings_growth": None,
+            "eps": None,
+            "roe": None,
+            "debt_to_equity": None,
+            "free_cashflow": None,
+            "profit_margins": None,
+            "held_percent_insiders": None,
+            "held_percent_institutions": None,
+            "price_to_book": None,
+            "sector": None,
+            "industry": None,
         }
-        # Cache fundamentals for 6 hours to avoid repeated hits
-        _cache_set(cache_key, result, ttl=21600)
+
+        _cache_set(cache_key, result, ttl=3600)
         return result
 
     except HTTPException:
@@ -287,7 +340,6 @@ def get_fundamentals_raw(symbol: str):
     except Exception as e:
         logger.exception("Failed to fetch fundamentals for %s", sym)
         raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
-
 
 if __name__ == "__main__":
     import uvicorn
