@@ -5,9 +5,10 @@ interface Props {
   result: ScanResult;
   onSelect: (symbol: string) => void;
   onBack: () => void;
+  onAddToWatchlist: (symbol: string) => void; // NEW
 }
 
-export default function ScanPanel({ result, onSelect, onBack }: Props) {
+export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist }: Props) {
   const allSorted = [...result.all_results].sort((a, b) => b.combined_score - a.combined_score);
 
   return (
@@ -58,7 +59,13 @@ export default function ScanPanel({ result, onSelect, onBack }: Props) {
           <div className="font-mono text-xs text-mist/60 uppercase tracking-widest">{result.verdict}</div>
           <div className="grid md:grid-cols-3 gap-4">
             {result.recommendations.map((r, i) => (
-              <TopPick key={r.symbol} rank={i + 1} data={r} onSelect={onSelect} />
+              <TopPick
+                key={r.symbol}
+                rank={i + 1}
+                data={r}
+                onSelect={onSelect}
+                onAddToWatchlist={onAddToWatchlist}
+              />
             ))}
           </div>
         </>
@@ -70,7 +77,7 @@ export default function ScanPanel({ result, onSelect, onBack }: Props) {
           <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">Watchlist Candidates</div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {result.watchlist_candidates.slice(0, 6).map((d) => (
-              <CandidateCard key={d.symbol} data={d} onSelect={onSelect} />
+              <CandidateCard key={d.symbol} data={d} onSelect={onSelect} onAddToWatchlist={onAddToWatchlist} />
             ))}
           </div>
         </div>
@@ -133,7 +140,17 @@ export default function ScanPanel({ result, onSelect, onBack }: Props) {
   );
 }
 
-function TopPick({ rank, data, onSelect }: { rank: number; data: Decision; onSelect: (s: string) => void }) {
+function TopPick({
+  rank,
+  data,
+  onSelect,
+  onAddToWatchlist,
+}: {
+  rank: number;
+  data: Decision;
+  onSelect: (s: string) => void;
+  onAddToWatchlist: (s: string) => void;
+}) {
   const style = decisionStyle[data.decision];
   const upside = (((data.target - data.close) / data.close) * 100).toFixed(1);
 
@@ -152,14 +169,30 @@ function TopPick({ rank, data, onSelect }: { rank: number; data: Decision; onSel
         <span>₹{data.close.toLocaleString("en-IN")}</span>
         <span>Score {data.combined_score}/100</span>
       </div>
-      <div className="mt-3 pt-3 border-t border-slate/40 font-mono text-[10px] text-mist/50 group-hover:text-mist transition">
-        View full analysis →
+      <div className="mt-3 pt-3 border-t border-slate/40 flex items-center justify-between">
+        <span className="font-mono text-[10px] text-mist/50 group-hover:text-mist transition">
+          View full analysis →
+        </span>
+        <button
+          onClick={(e) => { e.stopPropagation(); onAddToWatchlist(data.symbol); }}
+          className="text-[10px] font-mono text-signal-prepare hover:text-paper transition border border-signal-prepare/30 px-2 py-0.5 rounded"
+        >
+          + Watchlist
+        </button>
       </div>
     </button>
   );
 }
 
-function CandidateCard({ data, onSelect }: { data: Decision; onSelect: (s: string) => void }) {
+function CandidateCard({
+  data,
+  onSelect,
+  onAddToWatchlist,
+}: {
+  data: Decision;
+  onSelect: (s: string) => void;
+  onAddToWatchlist: (s: string) => void;
+}) {
   const style = decisionStyle[data.decision];
   return (
     <div
@@ -176,6 +209,12 @@ function CandidateCard({ data, onSelect }: { data: Decision; onSelect: (s: strin
           <div className="text-xs text-mist/60">Score: {data.combined_score}</div>
         </div>
       </div>
+      <button
+        onClick={(e) => { e.stopPropagation(); onAddToWatchlist(data.symbol); }}
+        className="mt-2 text-[10px] font-mono text-signal-prepare hover:text-paper transition border border-signal-prepare/30 px-2 py-0.5 rounded"
+      >
+        + Watchlist
+      </button>
     </div>
   );
 }

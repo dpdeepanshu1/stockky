@@ -89,21 +89,36 @@ def _combined_score(technical_score: int, fundamental_score: int, news_score: in
 def _decide(technical_score: int, fundamental_score: int, news_score: int | None, prediction_score: int | None,
             trend_strength: str, volume_surge: bool, dist_to_resistance_pct: float, event_risk: bool, already_owned: bool) -> Decision:
     combined = _combined_score(technical_score, fundamental_score, news_score, prediction_score)
-    if already_owned and combined < 40:
+    
+    # SELL if already owned and combined score is very low
+    if already_owned and combined < 35:
         return Decision.SELL
-    if already_owned and 40 <= combined < 70:
+    
+    # HOLD if already owned and combined is in a moderate range
+    if already_owned and 35 <= combined < 65:
         return Decision.HOLD
-    news_ok = news_score is None or news_score >= 40
-    model_ok = prediction_score is None or prediction_score >= 55
-    if (technical_score >= 70 and fundamental_score >= 60 and trend_strength == "strong" and volume_surge
-        and dist_to_resistance_pct > 2 and news_ok and model_ok):
+    
+    news_ok = news_score is None or news_score >= 35  # relaxed from 40
+    model_ok = prediction_score is None or prediction_score >= 50  # relaxed from 55
+    
+    # BUY NOW: relaxed thresholds
+    if (technical_score >= 60 and fundamental_score >= 50 
+        and trend_strength in ("strong", "moderate")  # allow moderate trend
+        and volume_surge
+        and dist_to_resistance_pct > 1  # relaxed from 2
+        and news_ok 
+        and model_ok):
         if event_risk:
             return Decision.PREPARE_TO_BUY
         return Decision.BUY_NOW
-    if fundamental_score >= 60 and 55 <= technical_score < 70:
+    
+    # PREPARE TO BUY: easier to get
+    if fundamental_score >= 45 and 50 <= technical_score < 60:
         return Decision.PREPARE_TO_BUY
-    if already_owned and combined >= 70:
+    
+    if already_owned and combined >= 65:
         return Decision.HOLD
+    
     return Decision.DO_NOT_BUY
 
 @app.get("/decide/{symbol}")
@@ -122,7 +137,7 @@ async def decide(symbol: str, already_owned: bool = False):
     fundamental_score = fundamental["fundamental_score"]
     news_score = news["news_score"] if news else None
     prediction_score = prediction["prediction_score"] if prediction and prediction.get("model_loaded") else None
-    fundamental_metrics = fundamental.get("metrics")   # <-- extract metrics
+    fundamental_metrics = fundamental.get("metrics")
 
     close = technical["close"]
     resistance = technical["resistance"]
@@ -189,7 +204,6 @@ async def decide(symbol: str, already_owned: bool = False):
         "sector": fundamental["sector"],
     }
 
-    # ✅ Include fundamental metrics if present
     if fundamental_metrics:
         response["fundamental_metrics"] = fundamental_metrics
 

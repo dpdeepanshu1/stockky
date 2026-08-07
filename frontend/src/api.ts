@@ -222,6 +222,19 @@ export const api = {
       30000
     ),
 
+  // NEW: Add a single symbol to watchlist
+  addToWatchlist: (symbol: string) =>
+    request<{ symbols: string[] }>(
+      "/watchlist/add",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbols: [symbol] }),
+      },
+      2,
+      30000
+    ),
+
   marketTopGainers: () => request<MarketResponse>("/market/top-gainers", undefined, 2, 30000),
   marketTopLosers: () => request<MarketResponse>("/market/top-losers", undefined, 2, 30000),
   marketMostActive: () => request<MarketResponse>("/market/most-active", undefined, 2, 30000),

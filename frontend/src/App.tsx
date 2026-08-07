@@ -171,6 +171,20 @@ export default function App() {
     setWatchlist(symbols);
   }
 
+  // NEW: Add to watchlist from scan results
+  async function handleAddToWatchlist(symbol: string) {
+    try {
+      await api.addToWatchlist(symbol);
+      // Refresh watchlist
+      const wl = await api.getWatchlist();
+      setWatchlist(wl.symbols);
+      // Optional: show a brief success indication (could be a toast)
+      console.log(`Added ${symbol} to watchlist`);
+    } catch (e) {
+      console.error("Failed to add to watchlist", e);
+    }
+  }
+
   if (!systemReady) {
     return <SystemCheck onReady={() => setSystemReady(true)} />;
   }
@@ -437,6 +451,7 @@ export default function App() {
                   result={view.data}
                   onSelect={handleSearch}
                   onBack={() => setView({ mode: "idle" })}
+                  onAddToWatchlist={handleAddToWatchlist}
                 />
               )}
             </section>
