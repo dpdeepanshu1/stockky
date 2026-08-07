@@ -109,7 +109,6 @@ def analyze(symbol: str):
         tr3 = (low - close.shift()).abs()
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr = tr.rolling(14).mean()
-        # For simplicity, compute ADX as 25 if trend is clear else 15
         adx = 25.0 if (current_price > close.rolling(50).mean().iloc[-1]) else 15.0
 
         trend_strength = "strong" if adx >= 25 else "moderate" if adx >= 20 else "weak"
