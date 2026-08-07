@@ -33,8 +33,19 @@ session.headers.update({
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 })
-yf.set_tz_cache_location("/tmp/yfinance_tz")
-yf.shared._session = session
+# Set session for yfinance (newer versions)
+try:
+    yf.set_session(session)
+except AttributeError:
+    # Fallback for older versions (though unlikely)
+    import yfinance as yf_old
+    yf_old.shared._session = session
+
+# Also set tz cache location (optional)
+try:
+    yf.set_tz_cache_location("/tmp/yfinance_tz")
+except:
+    pass
 
 def _safe(val, decimals=2):
     """Convert to float, round, handle NaN/Inf."""
