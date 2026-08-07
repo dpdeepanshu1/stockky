@@ -7,7 +7,7 @@ import WatchlistManager from "./components/WatchlistManager";
 import NotificationsPanel from "./components/NotificationsPanel";
 import SystemCheck from "./components/SystemCheck";
 import MarketMovers from "./components/MarketMovers";
-
+import ServiceManager from "./components/ServiceManager";
 
 type ViewState =
   | { mode: "idle" }
@@ -26,6 +26,7 @@ export default function App() {
   const [watchlist, setWatchlist] = useState<string[]>([]);
   const [showWatchlist, setShowWatchlist] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showServiceManager, setShowServiceManager] = useState(false);
   const [backendUp, setBackendUp] = useState<"checking" | "up" | "down">("checking");
   const [isWaking, setIsWaking] = useState(false);
 
@@ -58,9 +59,7 @@ export default function App() {
   async function handleWakeBackend() {
     setIsWaking(true);
     try {
-      // Try to wake the gateway by hitting its health endpoint
       await wakeService(getApiUrl());
-      // Wait a moment then re-check
       setTimeout(() => {
         checkBackend();
         setIsWaking(false);
@@ -85,6 +84,7 @@ export default function App() {
     }
   }
 
+  // Full market scan (async)
   async function handleScan() {
     setView({ mode: "loading", label: "Starting market scan..." });
     try {
@@ -93,6 +93,17 @@ export default function App() {
       const interval = window.setInterval(() => pollScanStatus(task_id), 1000);
       setPollInterval(interval);
       await pollScanStatus(task_id);
+    } catch (e) {
+      setView({ mode: "error", message: (e as Error).message });
+    }
+  }
+
+  // Scan only watchlist
+  async function handleScanWatchlist() {
+    setView({ mode: "loading", label: "Scanning watchlist..." });
+    try {
+      const data = await api.scanWatchlist();
+      setView({ mode: "scan", data });
     } catch (e) {
       setView({ mode: "error", message: (e as Error).message });
     }
@@ -124,7 +135,6 @@ export default function App() {
         setView({ mode: "error", message: status.error || "Scan failed" });
       }
     } catch (e) {
-      // Ignore polling errors
       console.warn("Polling error", e);
     }
   }
@@ -177,6 +187,13 @@ export default function App() {
               </button>
             )}
             <button
+              onClick={() => setShowServiceManager(!showServiceManager)}
+              className="text-xs font-mono text-mist hover:text-paper border border-slate rounded-lg px-3 py-2 hover:border-mist/60 transition"
+              title="Service Manager"
+            >
+              ⚙️ Services
+            </button>
+            <button
               onClick={() => setShowSettings(!showSettings)}
               className="text-xs font-mono text-mist hover:text-paper border border-slate rounded-lg px-3 py-2 hover:border-mist/60 transition"
               title="Backend settings"
@@ -189,6 +206,10 @@ export default function App() {
 
       {showSettings && (
         <SettingsBanner onClose={() => setShowSettings(false)} onSaved={checkBackend} />
+      )}
+
+      {showServiceManager && (
+        <ServiceManager onClose={() => setShowServiceManager(false)} />
       )}
 
       {/* Backend down banner with Wake button */}
@@ -220,7 +241,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Watchlist drawer */}
+      {/* Watchlist drawer with Scan Watchlist button */}
       {showWatchlist && tab === "dashboard" && (
         <div className="border-b border-slate/60 bg-graphite">
           <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6">
@@ -230,6 +251,10 @@ export default function App() {
               onAnalyse={(s) => {
                 setShowWatchlist(false);
                 handleSearch(s);
+              }}
+              onScanWatchlist={() => {
+                setShowWatchlist(false);
+                handleScanWatchlist();
               }}
             />
           </div>
@@ -278,11 +303,11 @@ export default function App() {
                   Run market scan
                 </button>
               </div>
-  // ... inside the dashboard view, after the hero section:
 
-           <section className="mb-8">
-              <MarketMovers onSelect={handleSearch} />
-           </section>            
+              {/* Market Movers */}
+              <div className="mt-8">
+                <MarketMovers onSelect={handleSearch} />
+              </div>
 
               {/* Quick watchlist chips */}
               {watchlist.length > 0 && view.mode === "idle" && (

@@ -4,9 +4,10 @@ interface Props {
   symbols: string[];
   onChange: (symbols: string[]) => void;
   onAnalyse: (symbol: string) => void;
+  onScanWatchlist?: () => void; // NEW
 }
 
-export default function WatchlistManager({ symbols, onChange, onAnalyse }: Props) {
+export default function WatchlistManager({ symbols, onChange, onAnalyse, onScanWatchlist }: Props) {
   const [input, setInput] = useState("");
 
   function add() {
@@ -46,6 +47,18 @@ export default function WatchlistManager({ symbols, onChange, onAnalyse }: Props
         >
           Add
         </button>
+      </div>
+
+      {/* Action buttons */}
+      <div className="flex gap-2 mb-4">
+        {onScanWatchlist && (
+          <button
+            onClick={onScanWatchlist}
+            className="font-mono text-xs border border-slate rounded-lg px-4 py-1.5 hover:border-signal-prepare hover:text-paper transition"
+          >
+            🔍 Scan Watchlist
+          </button>
+        )}
       </div>
 
       {/* Symbol grid */}

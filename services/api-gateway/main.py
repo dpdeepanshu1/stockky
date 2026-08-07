@@ -3,7 +3,7 @@ API Gateway
 ------------
 Single entry point for the React frontend.
 Includes async scan with progress (via BackgroundTasks), symbol correction,
-Hinglish summaries, market movers endpoints, and manual CORS headers.
+Hinglish summaries, market movers endpoints, watchlist scan, and manual CORS headers.
 """
 import os
 import json
@@ -550,6 +550,7 @@ def root():
             "/scan": "GET – synchronous scan (legacy)",
             "/scan/start": "POST – start async scan, returns task_id",
             "/scan/status/{task_id}": "GET – get progress/result of async scan",
+            "/scan/watchlist": "GET – scan only your watchlist",
             "/scan/universe": "GET – preview current scan universe",
             "/scan/universe/cache": "DELETE – clear universe cache",
             "/searched": "GET – list searched symbols",
@@ -763,7 +764,6 @@ def run_scan(force_refresh: bool = False):
 # ── Async scan endpoints ──────────────────────────────────────────────────
 @app.post("/scan/start")
 def start_scan(force_refresh: bool = False, background_tasks: BackgroundTasks = None):
-    """Start an asynchronous scan and return a task ID."""
     if force_refresh and _redis:
         try:
             _redis.delete(SCAN_UNIVERSE_KEY)
@@ -772,10 +772,7 @@ def start_scan(force_refresh: bool = False, background_tasks: BackgroundTasks = 
 
     universe = _build_scan_universe()
     task_id = str(uuid.uuid4())
-
-    # Run the scan in the background using FastAPI's BackgroundTasks
     background_tasks.add_task(run_scan_async, task_id, universe)
-
     return {"task_id": task_id}
 
 @app.get("/scan/status/{task_id}")
@@ -795,6 +792,62 @@ def get_scan_status(task_id: str):
         else:
             data["estimated_remaining"] = None
     return data
+
+# ── Watchlist-only scan ──────────────────────────────────────────────────
+@app.get("/scan/watchlist")
+def scan_watchlist():
+    watchlist = _load_watchlist()
+    results = []
+    errors = []
+
+    with httpx.Client(timeout=120) as client:
+        for symbol in watchlist:
+            try:
+                resp = client.get(f"{DECISION_URL}/decide/{symbol}")
+                resp.raise_for_status()
+                result = resp.json()
+                result["natural_language_summary"] = _generate_summary(result)
+                results.append(result)
+            except httpx.HTTPError as e:
+                logger.warning("Watchlist scan skipped %s: %s", symbol, e)
+                errors.append({"symbol": symbol, "error": str(e)})
+
+    results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
+    actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
+    top_picks = actionable[:5]
+
+    buy_count = len([r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")])
+    sell_count = len([r for r in results if r.get("decision") == "SELL"])
+    hold_count = len([r for r in results if r.get("decision") == "HOLD"])
+
+    if buy_count >= 5:
+        market_mood = "Bullish"
+    elif sell_count > buy_count:
+        market_mood = "Bearish"
+    elif buy_count > 0:
+        market_mood = "Selective"
+    else:
+        market_mood = "Cautious"
+
+    verdict = f"{len(top_picks)} opportunity(ies) found" if top_picks else "No strong signals in your watchlist"
+
+    return {
+        "scanned": len(results),
+        "universe_size": len(watchlist),
+        "watchlist_size": len(watchlist),
+        "recommendations": top_picks,
+        "watchlist_candidates": [],
+        "verdict": verdict,
+        "market_mood": market_mood,
+        "market_stats": {
+            "buy_signals": buy_count,
+            "sell_signals": sell_count,
+            "hold_signals": hold_count,
+            "cautious": len(results) - buy_count - sell_count - hold_count,
+        },
+        "all_results": results,
+        "errors": errors,
+    }
 
 # ── Universe preview endpoints ──────────────────────────────────────────────
 @app.get("/scan/universe")
