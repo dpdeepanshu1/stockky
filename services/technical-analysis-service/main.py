@@ -100,6 +100,7 @@ def analyze(symbol: str):
     try:
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
+        # 增加 timeout 参数，防止请求卡死
         hist = ticker.history(period="1y", timeout=30)
         if hist.empty or len(hist) < 30:
             raise HTTPException(status_code=404, detail=f"Insufficient price data for {sym}")
