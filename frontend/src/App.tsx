@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { api, getApiUrl, setApiUrl, Decision, ScanResult } from "./api";
+import { api, getApiUrl, setApiUrl, Decision, ScanResult, ScanStatus } from "./api";
 import Pipeline from "./components/Pipeline";
 import DecisionCard from "./components/DecisionCard";
 import ScanPanel from "./components/ScanPanel";
@@ -9,7 +9,7 @@ import SystemCheck from "./components/SystemCheck";
 
 type ViewState =
   | { mode: "idle" }
-  | { mode: "loading"; label: string }
+  | { mode: "loading"; label: string; progress?: { processed: number; total: number; elapsed: number; estimatedRemaining?: number } }
   | { mode: "stock"; data: Decision }
   | { mode: "scan"; data: ScanResult }
   | { mode: "error"; message: string };
@@ -26,26 +26,21 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [backendUp, setBackendUp] = useState<"checking" | "up" | "down">("checking");
 
-  // Timer states for scan
-  const [scanStartTime, setScanStartTime] = useState<number | null>(null);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  // Scan polling state
+  const [scanTaskId, setScanTaskId] = useState<string | null>(null);
+  const [scanProgress, setScanProgress] = useState<{ processed: number; total: number; elapsed: number; estimatedRemaining?: number } | null>(null);
+  const [pollInterval, setPollInterval] = useState<number | null>(null);
 
   useEffect(() => {
     checkBackend();
   }, []);
 
-  // Timer interval – uses number (browser)
+  // Cleanup polling on unmount
   useEffect(() => {
-    let interval: number | undefined;
-    if (view.mode === "loading" && scanStartTime) {
-      interval = window.setInterval(() => {
-        setElapsedSeconds(Math.floor((Date.now() - scanStartTime) / 1000));
-      }, 1000);
-    }
     return () => {
-      if (interval) clearInterval(interval);
+      if (pollInterval) clearInterval(pollInterval);
     };
-  }, [view.mode, scanStartTime]);
+  }, [pollInterval]);
 
   function checkBackend() {
     setBackendUp("checking");
@@ -62,8 +57,7 @@ export default function App() {
     if (!symbol.trim()) return;
     setTab("dashboard");
     setView({ mode: "loading", label: `Analysing ${symbol.toUpperCase()}...` });
-    setScanStartTime(null);
-    setElapsedSeconds(0);
+    if (pollInterval) clearInterval(pollInterval);
     try {
       const data = await api.getStock(symbol.trim());
       setView({ mode: "stock", data });
@@ -74,16 +68,58 @@ export default function App() {
   }
 
   async function handleScan() {
-    setScanStartTime(Date.now());
-    setElapsedSeconds(0);
-    setView({ mode: "loading", label: "Running market scan..." });
+    // Start async scan
+    setView({ mode: "loading", label: "Starting market scan..." });
     try {
-      const data = await api.runScan();
-      setScanStartTime(null);
-      setView({ mode: "scan", data });
+      const { task_id } = await api.scanStart();
+      setScanTaskId(task_id);
+      // Start polling
+      const interval = window.setInterval(() => pollScanStatus(task_id), 1000);
+      setPollInterval(interval);
+      // First poll immediately
+      await pollScanStatus(task_id);
     } catch (e) {
-      setScanStartTime(null);
       setView({ mode: "error", message: (e as Error).message });
+    }
+  }
+
+  async function pollScanStatus(taskId: string) {
+    try {
+      const status = await api.scanStatus(taskId);
+      if (status.status === "running") {
+        setScanProgress({
+          processed: status.processed,
+          total: status.total,
+          elapsed: status.elapsed,
+          estimatedRemaining: status.estimated_remaining ?? undefined,
+        });
+        setView({
+          mode: "loading",
+          label: `Running market scan... (${status.processed}/${status.total})`,
+          progress: {
+            processed: status.processed,
+            total: status.total,
+            elapsed: status.elapsed,
+            estimatedRemaining: status.estimated_remaining ?? undefined,
+          },
+        });
+      } else if (status.status === "done") {
+        // Stop polling
+        if (pollInterval) clearInterval(pollInterval);
+        setPollInterval(null);
+        setScanTaskId(null);
+        setScanProgress(null);
+        setView({ mode: "scan", data: status.result! });
+      } else if (status.status === "error") {
+        if (pollInterval) clearInterval(pollInterval);
+        setPollInterval(null);
+        setScanTaskId(null);
+        setScanProgress(null);
+        setView({ mode: "error", message: status.error || "Scan failed" });
+      }
+    } catch (e) {
+      // Ignore polling errors (e.g., network hiccups)
+      console.warn("Polling error", e);
     }
   }
 
@@ -94,6 +130,13 @@ export default function App() {
 
   if (!systemReady) {
     return <SystemCheck onReady={() => setSystemReady(true)} />;
+  }
+
+  // Helper to format time
+  function formatTime(seconds: number): string {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
   }
 
   return (
@@ -257,10 +300,28 @@ export default function App() {
               {view.mode === "loading" && (
                 <div className="rounded-xl border border-slate bg-graphite p-8 max-w-sm">
                   <p className="font-mono text-xs text-mist mb-2">{view.label}</p>
-                  <p className="font-mono text-xs text-mist/60 mb-4">
-                    ⏱️ {elapsedSeconds}s elapsed
-                  </p>
-                  <Pipeline running={true} />
+                  {view.progress && (
+                    <div className="mt-4 space-y-2">
+                      <div className="flex justify-between font-mono text-[11px] text-mist/60">
+                        <span>Processed: {view.progress.processed}/{view.progress.total}</span>
+                        <span>⏱️ {formatTime(view.progress.elapsed)}</span>
+                      </div>
+                      <div className="w-full h-1 bg-slate rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-signal-prepare transition-all duration-500"
+                          style={{ width: `${(view.progress.processed / view.progress.total) * 100}%` }}
+                        />
+                      </div>
+                      {view.progress.estimatedRemaining !== undefined && view.progress.estimatedRemaining > 0 && (
+                        <p className="font-mono text-[10px] text-mist/40 text-right">
+                          Est. remaining: {formatTime(view.progress.estimatedRemaining)}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  <div className="mt-6">
+                    <Pipeline running={true} />
+                  </div>
                 </div>
               )}
 

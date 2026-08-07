@@ -1,15 +1,5 @@
 const STORAGE_KEY = "stockky:api_url";
 
-/**
- * Vite bakes VITE_API_URL into the static bundle at BUILD time. If the
- * frontend is deployed without that build-time env var set (a common
- * mistake when frontend + backend are deployed separately), every fetch
- * silently targets http://localhost:8000 from the visitor's browser --
- * which fails instantly with "Failed to fetch". To make the app resilient
- * to that misconfiguration without a rebuild, the backend URL can also be
- * set at runtime from the Settings banner and is remembered in
- * localStorage, taking priority over the build-time value.
- */
 export function getApiUrl(): string {
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored) return stored;
@@ -52,16 +42,35 @@ export interface Decision {
   };
   valuation: string;
   sector: string | null;
-  natural_language_summary: string;  // <-- NEW
+  natural_language_summary: string;
 }
 
 export interface ScanResult {
   scanned: number;
+  universe_size: number;
   watchlist_size: number;
   recommendations: Decision[];
+  watchlist_candidates: Decision[];
   verdict: string;
+  market_mood: string;
+  market_stats: {
+    buy_signals: number;
+    sell_signals: number;
+    hold_signals: number;
+    cautious: number;
+  };
   all_results: Decision[];
   errors: { symbol: string; error: string }[];
+}
+
+export interface ScanStatus {
+  status: "running" | "done" | "error";
+  total: number;
+  processed: number;
+  elapsed: number;
+  estimated_remaining?: number | null;
+  result?: ScanResult;
+  error?: string;
 }
 
 export interface NotificationChannelStatus {
@@ -93,8 +102,6 @@ export interface SystemHealth {
   services: Record<string, SystemServiceStatus>;
 }
 
-/** Central fetch wrapper: turns the raw browser "Failed to fetch" TypeError
- * into an actionable message, and surfaces backend error bodies cleanly. */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const base = getApiUrl();
   if (!base) {
@@ -128,7 +135,15 @@ export const api = {
   getStock: (symbol: string, alreadyOwned = false) =>
     request<Decision>(`/stock/${symbol}?already_owned=${alreadyOwned}`),
 
+  // Synchronous scan (legacy)
   runScan: () => request<ScanResult>("/scan"),
+
+  // Asynchronous scan with progress
+  scanStart: (forceRefresh = false) =>
+    request<{ task_id: string }>(`/scan/start?force_refresh=${forceRefresh}`, { method: "POST" }),
+
+  scanStatus: (taskId: string) =>
+    request<ScanStatus>(`/scan/status/${taskId}`),
 
   getWatchlist: () => request<{ symbols: string[] }>("/watchlist"),
 

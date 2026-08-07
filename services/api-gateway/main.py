@@ -17,6 +17,7 @@ New in v2 (merged):
   - Symbol auto-correction with fuzzy matching.
   - Symbol alias mapping for rebranded/split companies (TATAMOTORS → TMPV/TMLCV, LTIM → LTM, Zomato → Eternal).
   - Natural-language Hinglish summary for every decision.
+  - Asynchronous scan with progress tracking (task ID, processed/total, estimated remaining time).
 """
 import os
 import json
@@ -24,7 +25,8 @@ import time
 import asyncio
 import logging
 import difflib
-from typing import List, Optional, Set, Dict, Union
+import uuid
+from typing import List, Optional, Set, Dict, Union, Any
 
 import httpx
 import yfinance as yf
@@ -81,30 +83,25 @@ SEARCHED_KEY        = "stockky:searched_symbols"
 SCAN_UNIVERSE_KEY   = "stockky:scan_universe"
 IPO_CACHE_KEY       = "stockky:ipos:recent"
 KNOWN_SYMBOLS_KEY   = "stockky:known_symbols"
+SCAN_TASK_PREFIX    = "stockky:scan_task:"
 
 # ── Symbol Alias Mapping (old → new) ──────────────────────────────────────
 SYMBOL_ALIASES: Dict[str, Union[str, List[str]]] = {
-    # Tata Motors split into two entities: Passenger Vehicles and Commercial Vehicles
-    "TATAMOTORS": "TMPV",        # primary new symbol for trading (you can also use TMLCV)
+    "TATAMOTORS": "TMPV",
     "TATAMOTER": "TMPV",
     "TATAMOT": "TMPV",
-    # LTIMindtree rebranded to LTM Limited
     "LTIM": "LTM",
     "LTIMIND": "LTM",
     "LTIMINDTREE": "LTM",
-    # Zomato parent company rebranded to Eternal Limited; the food app still called Zomato
-    "ZOMATO": "ETERNAL",         # trading symbol may be ETERNAL or ZOMATO? We'll keep both.
+    "ZOMATO": "ETERNAL",
     "ZOMAT": "ETERNAL",
 }
-
-# Also add the new symbols to the base universe
 EXTRA_NEW_SYMBOLS = ["TMPV", "TMLCV", "LTM", "ETERNAL"]
 
-# ── Expanded base universe (100+ stocks) ────────────────────────────────────
+# ── Expanded base universe ──────────────────────────────────────────────────
 BASE_UNIVERSE = [
-    # Nifty 50
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HCLTECH",
-    "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "TATAMOTORS",  # keep old for fallback
+    "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "TATAMOTORS",
     "AXISBANK", "SUNPHARMA", "BAJFINANCE", "TITAN", "MARUTI", "WIPRO",
     "ONGC", "NTPC", "POWERGRID", "ULTRACEMCO", "HINDUNILVR", "M&M",
     "TATASTEEL", "JSWSTEEL", "HDFCLIFE", "SBILIFE", "DRREDDY", "CIPLA",
@@ -112,13 +109,11 @@ BASE_UNIVERSE = [
     "HINDALCO", "BAJAJFINSV", "BPCL", "APOLLOHOSP", "ASIANPAINT", "NESTLEIND",
     "TATACONSUM", "TRENT", "HEROMOTOCO", "SHRIRAMFIN", "ADANIENT", "ADANIPORTS",
     "HDFC", "LICHSGFIN", "BANKBARODA", "PNB", "CANBK", "IOC", "GAIL",
-    # Mid cap
-    "BEL", "HAL", "COFORGE", "LTIM",  # keep old for fallback
-    "TECHM", "MPHASIS", "PERSISTENT",
-    "ANGELONE", "ICICIGI", "DMART", "NYKAA", "ZOMATO",  # keep old for fallback
-    "PAYTM", "ADANIPOWER", "IREDA", "IRFC", "RVNL", "HUDCO", "RAILTEL",
+    "BEL", "HAL", "COFORGE", "LTIM", "TECHM", "MPHASIS", "PERSISTENT",
+    "ANGELONE", "ICICIGI", "DMART", "NYKAA", "ZOMATO", "PAYTM",
+    "ADANIPOWER", "IREDA", "IRFC", "RVNL", "HUDCO", "RAILTEL",
     "CUPID", "BLUESTONE", "JIOFIN", "BSE", "CDSL", "NSDL", "NSE",
-] + EXTRA_NEW_SYMBOLS  # add the new symbols so they are scanned
+] + EXTRA_NEW_SYMBOLS
 
 # ── Redis helpers ─────────────────────────────────────────────────────────
 def _redis_get(key: str):
@@ -160,18 +155,15 @@ def _add_searched(symbol: str):
 
 # ── Real-time IPO fetcher ───────────────────────────────────────────────────
 def _get_recent_ipos() -> List[str]:
-    """Fetch recently listed IPOs from NSE API, with Redis cache."""
     cached = _redis_get(IPO_CACHE_KEY)
     if cached:
-        logger.info("Using cached IPO list: %d symbols", len(cached))
         return cached
 
     symbols = []
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
         }
         resp = httpx.get("https://www.nseindia.com/api/ipo?type=listed", headers=headers, timeout=15)
         if resp.status_code == 200:
@@ -184,19 +176,17 @@ def _get_recent_ipos() -> List[str]:
         else:
             logger.warning("NSE IPO API returned status %d", resp.status_code)
     except Exception as e:
-        logger.warning("Failed to fetch recent IPOs from NSE: %s", e)
+        logger.warning("Failed to fetch recent IPOs: %s", e)
 
     if not symbols:
         fallback = ["JIOFIN", "BLUESTONE", "CUPID", "IREDA", "RVNL", "HUDCO", "RAILTEL", "IRFC", "ZOMATO", "NYKAA", "PAYTM"]
         symbols = fallback
-        logger.info("Using fallback IPO list")
 
     _redis_set(IPO_CACHE_KEY, symbols, ttl=86400)
     return symbols
 
 # ── Momentum movers ────────────────────────────────────────────────────────
 def _get_momentum_movers() -> List[str]:
-    """Fetch top 10 gainers and top 10 losers from Nifty 50."""
     movers = []
     try:
         nifty50_symbols = [
@@ -224,13 +214,11 @@ def _get_momentum_movers() -> List[str]:
                 continue
         performances.sort(key=lambda x: x[1], reverse=True)
         movers = [s for s, _ in performances[:10]] + [s for s, _ in performances[-10:]]
-        logger.info("Momentum movers: %s", movers[:5])
     except Exception as e:
         logger.warning("Could not fetch momentum movers: %s", e)
     return movers
 
 def _get_news_mentioned_symbols() -> List[str]:
-    """Extract NSE symbols mentioned in recent market news."""
     mentioned = []
     try:
         feed = feedparser.parse(
@@ -244,9 +232,8 @@ def _get_news_mentioned_symbols() -> List[str]:
         logger.warning("Could not parse news for symbols: %s", e)
     return mentioned[:15]
 
-# ── Symbol resolution (auto-correction + alias mapping) ────────────────────
+# ── Symbol resolution ──────────────────────────────────────────────────────
 def _get_all_known_symbols() -> Set[str]:
-    """Combine all sources of known symbols (cached for 6 hours)."""
     cached = _redis_get(KNOWN_SYMBOLS_KEY)
     if cached:
         return set(cached)
@@ -256,7 +243,6 @@ def _get_all_known_symbols() -> Set[str]:
     combined.update(_load_searched())
     combined.update(_get_recent_ipos())
     combined.update(_get_momentum_movers())
-    # Also add any alias targets
     for target in SYMBOL_ALIASES.values():
         if isinstance(target, list):
             combined.update(target)
@@ -277,44 +263,27 @@ def _get_all_known_symbols() -> Set[str]:
     return cleaned
 
 def _resolve_symbol(misspelled: str) -> Optional[str]:
-    """
-    Try to correct a misspelled symbol using:
-    1. Alias mapping (old → new)
-    2. Fuzzy matching against known symbols
-    """
     if not misspelled:
         return None
     symbol = misspelled.upper().replace(".NS", "").replace(".BO", "")
 
-    # Check alias map
     if symbol in SYMBOL_ALIASES:
         alias = SYMBOL_ALIASES[symbol]
         if isinstance(alias, list):
-            # For splits, return the first one as primary, but also log
-            logger.info("Alias '%s' → %s (primary)", symbol, alias[0])
             return alias[0]
-        else:
-            logger.info("Alias '%s' → %s", symbol, alias)
-            return alias
+        return alias
 
     known = _get_all_known_symbols()
-
-    # Exact match
     if symbol in known:
         return symbol
 
-    # Fuzzy match
     matches = difflib.get_close_matches(symbol, known, n=1, cutoff=0.7)
     if matches:
-        corrected = matches[0]
-        logger.info("Corrected '%s' → '%s'", symbol, corrected)
-        return corrected
-
+        return matches[0]
     return None
 
-# ── Hinglish natural-language summary generator ──────────────────────────
+# ── Hinglish summary ──────────────────────────────────────────────────────
 def _generate_summary(data: dict) -> str:
-    """Generate a short, conversational Hinglish summary for the decision."""
     decision = data.get("decision")
     symbol = data.get("symbol")
     confidence = data.get("confidence")
@@ -329,53 +298,35 @@ def _generate_summary(data: dict) -> str:
     if decision == "BUY NOW":
         summary = f"🚀 {symbol} अभी खरीदने का बहुत अच्छा मौका है! "
         summary += f"एंट्री {entry.get('low')}-{entry.get('high')}, टारगेट {target}, स्टॉप लॉस {stop}. "
-        summary += f"अनुमानित होल्डिंग अवधि {holding}. "
-        summary += f"कॉन्फिडेंस {confidence} है, स्कोर {combined_score}. "
+        summary += f"होल्डिंग {holding}. कॉन्फिडेंस {confidence}, स्कोर {combined_score}. "
         tech = reasons.get("technical", [])
         if tech:
             summary += f"तकनीकी: {tech[0]}. "
         fund = reasons.get("fundamental", [])
         if fund:
             summary += f"फंडामेंटल: {fund[0]}. "
-        summary += "जल्दी से अपने पोर्टफोलियो में शामिल करें!"
+        summary += "जल्दी शामिल करें!"
     elif decision == "PREPARE TO BUY":
-        summary = f"⏳ {symbol} के लिए खरीदारी की तैयारी करें, लेकिन अभी थोड़ा इंतज़ार करें. "
-        summary += f"एंट्री {entry.get('low')}-{entry.get('high')}, टारगेट {target}, स्टॉप लॉस {stop}. "
-        summary += f"होल्डिंग {holding} हो सकती है. स्कोर {combined_score}. "
-        summary += "अगले कुछ दिनों में वॉल्यूम और ट्रेंड कन्फर्मेशन का इंतज़ार करें."
+        summary = f"⏳ {symbol} के लिए तैयारी करें, अभी इंतज़ार करें. "
+        summary += f"एंट्री {entry.get('low')}-{entry.get('high')}, टारगेट {target}, स्टॉप {stop}. "
+        summary += f"स्कोर {combined_score}. वॉल्यूम कन्फर्मेशन का इंतज़ार करें."
     elif decision == "HOLD":
-        summary = f"🔄 {symbol} को होल्ड करें. अभी बेचने की ज़रूरत नहीं है. "
-        summary += f"टारगेट {target} पर पहुंचने पर विचार करें. स्टॉप लॉस {stop}. "
-        summary += f"स्कोर {combined_score}, स्थिति स्थिर है."
+        summary = f"🔄 {symbol} को होल्ड करें. टारगेट {target}, स्टॉप {stop}. स्कोर {combined_score}."
     elif decision == "SELL":
-        summary = f"🔴 {symbol} को बेचने का समय आ गया है. "
-        summary += f"मौजूदा कीमत {close} है, टारगेट से नीचे. "
-        summary += f"स्टॉप लॉस {stop} पार कर चुके हैं. "
-        summary += f"स्कोर {combined_score}, कमज़ोर दिख रहा है. जल्दी से निकलें!"
-    else:  # DO NOT BUY
-        summary = f"❌ {symbol} अभी न खरीदें. "
-        summary += f"तकनीकी और फंडामेंटल दोनों कमज़ोर हैं, स्कोर {combined_score}. "
+        summary = f"🔴 {symbol} को बेचें. कीमत {close}, टारगेट से नीचे. स्टॉप {stop} पार. स्कोर {combined_score}."
+    else:
+        summary = f"❌ {symbol} अभी न खरीदें. स्कोर {combined_score}. "
         tech = reasons.get("technical", [])
         if tech:
             summary += f"तकनीकी: {tech[0]}. "
         fund = reasons.get("fundamental", [])
         if fund:
             summary += f"फंडामेंटल: {fund[0]}. "
-        summary += "बेहतर होगा कि कुछ दिन और देखें."
+        summary += "कुछ दिन और देखें."
     return summary
 
 # ── Build scan universe ──────────────────────────────────────────────────────
 def _build_scan_universe() -> List[str]:
-    """
-    Build a fresh scan universe by combining:
-    1. Base liquid universe (100+ stocks)
-    2. User watchlist
-    3. Previously searched symbols
-    4. Weekly momentum movers (top 10 gainers + top 10 losers)
-    5. News-mentioned symbols
-    6. Real-time IPOs (from NSE API)
-    Deduped and capped at 120 symbols.
-    """
     cached = _redis_get(SCAN_UNIVERSE_KEY)
     if cached:
         return cached
@@ -397,7 +348,6 @@ def _build_scan_universe() -> List[str]:
 
     result = clean[:120]
     _redis_set(SCAN_UNIVERSE_KEY, result, ttl=21600)
-    logger.info("Scan universe built: %d symbols", len(result))
     return result
 
 # ── Pydantic models ──────────────────────────────────────────────────────────
@@ -410,6 +360,101 @@ class NotificationChannelUpdate(BaseModel):
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     enabled: dict | None = None
+
+# ── Asynchronous scan with progress ──────────────────────────────────────
+async def run_scan_async(task_id: str, universe: List[str]):
+    """Background task to run scan and update progress in Redis."""
+    start_time = time.time()
+    results = []
+    errors = []
+    total = len(universe)
+    processed = 0
+
+    # Initial state
+    _redis_set(SCAN_TASK_PREFIX + task_id, {
+        "status": "running",
+        "total": total,
+        "processed": 0,
+        "elapsed": 0,
+        "result": None,
+        "error": None,
+    }, ttl=3600)
+
+    async with httpx.AsyncClient(timeout=150) as client:
+        for symbol in universe:
+            try:
+                resp = await client.get(f"{DECISION_URL}/decide/{symbol}")
+                resp.raise_for_status()
+                result = resp.json()
+                result["natural_language_summary"] = _generate_summary(result)
+                results.append(result)
+            except httpx.HTTPError as e:
+                logger.warning("Scan skipped %s: %s", symbol, e)
+                errors.append({"symbol": symbol, "error": str(e)})
+
+            processed += 1
+            elapsed = round(time.time() - start_time, 1)
+            # Update progress every 5 stocks or every 2 seconds (whichever)
+            if processed % 5 == 0 or processed == total:
+                _redis_set(SCAN_TASK_PREFIX + task_id, {
+                    "status": "running",
+                    "total": total,
+                    "processed": processed,
+                    "elapsed": elapsed,
+                    "result": None,
+                    "error": None,
+                }, ttl=3600)
+
+    # Sort and compute final result
+    results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
+    actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
+    top_picks = actionable[:5]
+    watchlist_candidates = []
+    if not top_picks:
+        watchlist_candidates = results[:3]
+
+    buy_count = len([r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")])
+    sell_count = len([r for r in results if r.get("decision") == "SELL"])
+    hold_count = len([r for r in results if r.get("decision") == "HOLD"])
+
+    if buy_count >= 5:
+        market_mood = "Bullish"
+    elif sell_count > buy_count:
+        market_mood = "Bearish"
+    elif buy_count > 0:
+        market_mood = "Selective"
+    else:
+        market_mood = "Cautious"
+
+    verdict = f"{len(top_picks)} strong opportunity(ies) found" if top_picks else "DO NOT BUY ANY STOCK TODAY — market conditions cautious"
+
+    final_result = {
+        "scanned": len(results),
+        "universe_size": len(universe),
+        "watchlist_size": len(_load_watchlist()),
+        "recommendations": top_picks,
+        "watchlist_candidates": watchlist_candidates,
+        "verdict": verdict,
+        "market_mood": market_mood,
+        "market_stats": {
+            "buy_signals": buy_count,
+            "sell_signals": sell_count,
+            "hold_signals": hold_count,
+            "cautious": len(results) - buy_count - sell_count - hold_count,
+        },
+        "all_results": results,
+        "errors": errors,
+    }
+
+    # Store final result
+    _redis_set(SCAN_TASK_PREFIX + task_id, {
+        "status": "done",
+        "total": total,
+        "processed": total,
+        "elapsed": round(time.time() - start_time, 1),
+        "result": final_result,
+        "error": None,
+    }, ttl=3600)
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 @app.get("/")
@@ -424,8 +469,10 @@ def root():
             "/watchlist": "GET/POST – manage watchlist",
             "/watchlist/add": "POST – add symbols",
             "/watchlist/{symbol}": "DELETE – remove symbol",
-            "/stock/{symbol}": "GET – get decision for a symbol (auto-corrects misspelled symbols)",
-            "/scan": "GET – scan universe (dynamic) – accepts ?force_refresh=true",
+            "/stock/{symbol}": "GET – get decision for a symbol",
+            "/scan": "GET – synchronous scan (legacy)",
+            "/scan/start": "POST – start async scan, returns task_id",
+            "/scan/status/{task_id}": "GET – get progress/result of async scan",
             "/scan/universe": "GET – preview current scan universe",
             "/scan/universe/cache": "DELETE – clear universe cache",
             "/searched": "GET – list searched symbols",
@@ -474,15 +521,7 @@ async def system_health():
     results = await asyncio.gather(
         *(check(name, cfg["url"], cfg["required"]) for name, cfg in SYSTEM_SERVICES.items())
     )
-    services = {
-        "api-gateway": {
-            "ok": True,
-            "required": True,
-            "status": "up",
-            "seconds": 0,
-            "url": None  # gateway URL is not needed for wake
-        }
-    }
+    services = {"api-gateway": {"ok": True, "required": True, "status": "up", "seconds": 0, "url": None}}
     services.update(dict(results))
     required_ok = all(v["ok"] for v in services.values() if v["required"])
     all_ok = all(v["ok"] for v in services.values())
@@ -530,12 +569,11 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision (with auto-correction, alias mapping, and summary) ──────
+# ── Stock decision ──────────────────────────────────────────────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
     resolved = _resolve_symbol(original)
-
     if resolved is None:
         resolved = original.upper()
         corrected_from = None
@@ -547,7 +585,6 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         corrected_from = None
 
     _add_searched(symbol_to_use)
-
     if _redis:
         try:
             _redis.delete(SCAN_UNIVERSE_KEY)
@@ -562,16 +599,11 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         )
         resp.raise_for_status()
         result = resp.json()
-
         if corrected_from:
             result["corrected_from"] = corrected_from
             result["symbol"] = symbol_to_use
-
-        # Add natural language summary
         result["natural_language_summary"] = _generate_summary(result)
-
         return result
-
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             suggestions = difflib.get_close_matches(symbol_to_use, _get_all_known_symbols(), n=3, cutoff=0.5)
@@ -582,7 +614,7 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Decision engine unreachable: {e}")
 
-# ── Scan ──────────────────────────────────────────────────────────────────
+# ── Scan (synchronous, legacy) ─────────────────────────────────────────────
 @app.get("/scan")
 def run_scan(force_refresh: bool = False):
     if force_refresh and _redis:
@@ -601,7 +633,6 @@ def run_scan(force_refresh: bool = False):
                 resp = client.get(f"{DECISION_URL}/decide/{symbol}")
                 resp.raise_for_status()
                 result = resp.json()
-                # Add summary to each result
                 result["natural_language_summary"] = _generate_summary(result)
                 results.append(result)
             except httpx.HTTPError as e:
@@ -609,15 +640,13 @@ def run_scan(force_refresh: bool = False):
                 errors.append({"symbol": symbol, "error": str(e)})
 
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
-
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = actionable[:5]
-
     watchlist_candidates = []
     if not top_picks:
         watchlist_candidates = results[:3]
 
-    buy_count  = len([r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")])
+    buy_count = len([r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")])
     sell_count = len([r for r in results if r.get("decision") == "SELL"])
     hold_count = len([r for r in results if r.get("decision") == "HOLD"])
 
@@ -630,11 +659,7 @@ def run_scan(force_refresh: bool = False):
     else:
         market_mood = "Cautious"
 
-    verdict = (
-        f"{len(top_picks)} strong opportunity(ies) found"
-        if top_picks
-        else "DO NOT BUY ANY STOCK TODAY — market conditions cautious"
-    )
+    verdict = f"{len(top_picks)} strong opportunity(ies) found" if top_picks else "DO NOT BUY ANY STOCK TODAY — market conditions cautious"
 
     return {
         "scanned": len(results),
@@ -653,6 +678,44 @@ def run_scan(force_refresh: bool = False):
         "all_results": results,
         "errors": errors,
     }
+
+# ── Async scan endpoints ──────────────────────────────────────────────────
+@app.post("/scan/start")
+def start_scan(force_refresh: bool = False):
+    """Start an asynchronous scan and return a task ID."""
+    if force_refresh and _redis:
+        try:
+            _redis.delete(SCAN_UNIVERSE_KEY)
+        except Exception:
+            pass
+
+    universe = _build_scan_universe()
+    task_id = str(uuid.uuid4())
+    # Start background task
+    asyncio.create_task(run_scan_async(task_id, universe))
+    return {"task_id": task_id}
+
+@app.get("/scan/status/{task_id}")
+def get_scan_status(task_id: str):
+    """Get progress or result of an async scan task."""
+    data = _redis_get(SCAN_TASK_PREFIX + task_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Task not found or expired")
+
+    # Compute estimated remaining time if running
+    if data.get("status") == "running":
+        processed = data.get("processed", 0)
+        total = data.get("total", 0)
+        elapsed = data.get("elapsed", 0)
+        if processed > 0 and elapsed > 0:
+            avg_time_per_stock = elapsed / processed
+            remaining_stocks = total - processed
+            estimated_remaining = round(remaining_stocks * avg_time_per_stock, 1)
+            data["estimated_remaining"] = estimated_remaining
+        else:
+            data["estimated_remaining"] = None
+
+    return data
 
 # ── Universe preview endpoints ──────────────────────────────────────────────
 @app.get("/scan/universe")
