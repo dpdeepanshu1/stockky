@@ -24,6 +24,7 @@ Each invocation does one "tick":
 import os
 import json
 import logging
+import time
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -125,9 +126,10 @@ def run_event_check():
         logger.warning("Event check failed (non-fatal): %s", e)
 
 
-def run_scan_and_diff():
+def run_scan_and_diff(timeout: int = 120):
+    """Fetch scan results and notify on decision changes."""
     try:
-        resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=90)
+        resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=timeout)
         resp.raise_for_status()
         result = resp.json()
         logger.info("Scan complete: %s", result.get("verdict"))
@@ -138,7 +140,7 @@ def run_scan_and_diff():
         return None
 
 
-def maybe_run_end_of_day(now: datetime, scan_result):
+def maybe_run_end_of_day(now: datetime):
     if now.weekday() >= 5 or now.hour < EOD_HOUR:
         return
     date_key = EOD_KEY_PREFIX + now.strftime("%Y-%m-%d")
@@ -148,14 +150,21 @@ def maybe_run_end_of_day(now: datetime, scan_result):
     except Exception:
         pass
 
-    if scan_result is None:
+    # Try scan with a longer timeout and one retry.
+    scan_result = None
+    for attempt in range(2):
         try:
-            resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=90)
+            resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=120)
             resp.raise_for_status()
             scan_result = resp.json()
+            break
         except httpx.HTTPError as e:
-            logger.error("End-of-day report failed to fetch scan: %s", e)
-            return
+            logger.warning("End-of-day scan attempt %d failed: %s", attempt + 1, e)
+            if attempt == 0:
+                time.sleep(5)  # brief pause before retry
+            else:
+                logger.error("End-of-day report failed after 2 attempts.")
+                return
 
     verdict = scan_result.get("verdict")
     scanned = scan_result.get("scanned")
@@ -179,7 +188,7 @@ def main():
         logger.info("Outside market scan window (%s IST) — skipping scan.", now.strftime("%H:%M"))
 
     run_event_check()
-    maybe_run_end_of_day(now, scan_result)
+    maybe_run_end_of_day(now)
 
 
 if __name__ == "__main__":
