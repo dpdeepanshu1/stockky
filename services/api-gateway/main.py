@@ -4,7 +4,7 @@ API Gateway
 Single entry point for the React frontend.
 Includes async scan with progress (via BackgroundTasks), symbol correction,
 Hinglish summaries, market movers endpoints, watchlist scan, and Telegram notifications.
-Dynamic universe: fetches stocks from Nifty 50, top market cap, news, momentum, IPOs.
+Dynamic universe: fetches stocks from NSE API (all securities, indices, IPOs, news, momentum).
 """
 import os
 import json
@@ -91,7 +91,7 @@ SCAN_TASK_PREFIX    = "stockky:scan_task:"
 
 # ── Symbol Alias Mapping (old → new) ──────────────────────────────────────
 SYMBOL_ALIASES: Dict[str, Union[str, List[str]]] = {
-    "TATAMOTORS": "TMPV",
+    "TATAMOTORS": "TMCV",
     "TATAMOTER": "TMPV",
     "TATAMOT": "TMPV",
     "LTIM": "LTM",
@@ -100,7 +100,7 @@ SYMBOL_ALIASES: Dict[str, Union[str, List[str]]] = {
     "ZOMATO": "ETERNAL",
     "ZOMAT": "ETERNAL",
 }
-EXTRA_NEW_SYMBOLS = ["TMPV", "TMLCV", "LTM", "ETERNAL"]
+EXTRA_NEW_SYMBOLS = ["TMPV", "TMCV", "LTM", "ETERNAL"]
 
 # ── Redis helpers ─────────────────────────────────────────────────────────
 def _redis_get(key: str):
@@ -140,40 +140,76 @@ def _add_searched(symbol: str):
         searched.append(sym)
         _redis_set(SEARCHED_KEY, searched[-200:])
 
-# ── Dynamic Universe Sources ──────────────────────────────────────────────
+# ── Dynamic Universe Sources (all real-time from NSE API) ──────────────────
 
-def _get_nifty50_constituents() -> List[str]:
-    """Fetch Nifty 50 constituents from a reliable list (fallback)."""
-    nifty50_list = [
-        "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-        "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BHARTIARTL", "BPCL",
-        "BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB", "DRREDDY",
-        "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
-        "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "ITC",
-        "INDUSINDBK", "INFY", "JSWSTEEL", "KOTAKBANK", "LT",
-        "LTIM", "M&M", "MARUTI", "NESTLEIND", "NTPC",
-        "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN",
-        "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL",
-        "TCS", "TRENT", "TITAN", "ULTRACEMCO", "WIPRO"
-    ]
-    return nifty50_list
+def _fetch_from_nse_api(endpoint: str, cache_key: str, ttl: int = 21600):
+    """Helper to fetch from NSE API with caching."""
+    cached = _redis_get(cache_key)
+    if cached:
+        return cached
 
-def _get_top_market_cap_stocks(limit: int = 30) -> List[str]:
-    large_caps = [
-        "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HCLTECH",
-        "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "AXISBANK",
-        "SUNPHARMA", "BAJFINANCE", "TITAN", "MARUTI", "WIPRO", "ONGC",
-        "NTPC", "POWERGRID", "ULTRACEMCO", "HINDUNILVR", "M&M", "TATASTEEL",
-        "JSWSTEEL", "HDFCLIFE", "SBILIFE", "DRREDDY", "CIPLA", "DIVISLAB"
-    ]
-    return large_caps[:limit]
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        }
+        resp = httpx.get(f"https://www.nseindia.com/api/{endpoint}", headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            _redis_set(cache_key, data, ttl)
+            return data
+        else:
+            logger.warning(f"NSE API {endpoint} returned {resp.status_code}")
+            return None
+    except Exception as e:
+        logger.warning(f"Failed to fetch {endpoint}: {e}")
+        return None
+
+def _get_all_nse_securities() -> List[str]:
+    """Fetch all equity symbols from NSE (all listed stocks)."""
+    data = _fetch_from_nse_api("equity-stockIndices?index=SECURITIES%20IN%20NSE", "nse:all_securities")
+    symbols = []
+    if data and "data" in data:
+        for item in data["data"]:
+            if item.get("symbol"):
+                symbols.append(item["symbol"].upper())
+    logger.info(f"Fetched {len(symbols)} securities from NSE")
+    return symbols
+
+def _get_nifty_indices() -> List[str]:
+    """Fetch Nifty 50, Next 50, and Midcap 100 constituents."""
+    indices = ["NIFTY%2050", "NIFTY%20NEXT%2050", "NIFTY%20MIDCAP%20100"]
+    all_symbols = []
+    for idx in indices:
+        data = _fetch_from_nse_api(f"equity-stockIndices?index={idx}", f"nse:index_{idx}")
+        if data and "data" in data:
+            for item in data["data"]:
+                if item.get("symbol"):
+                    all_symbols.append(item["symbol"].upper())
+    return all_symbols
+
+def _get_recent_ipos() -> List[str]:
+    """Fetch recently listed IPOs from NSE API."""
+    data = _fetch_from_nse_api("ipo?type=listed", IPO_CACHE_KEY, ttl=86400)
+    symbols = []
+    if data:
+        for item in data:
+            sym = item.get("symbol") or item.get("secCode")
+            if sym:
+                symbols.append(sym.upper())
+    if not symbols:
+        # fallback
+        symbols = ["JIOFIN", "BLUESTONE", "CUPID", "IREDA", "RVNL", "HUDCO", "RAILTEL", "IRFC"]
+    return symbols
 
 def _get_momentum_movers() -> List[str]:
+    """Fetch top 10 gainers and top 10 losers from Nifty 50 (real-time)."""
     movers = []
     try:
-        nifty50_symbols = _get_nifty50_constituents()
+        # We need price data – we'll use yfinance on Nifty 50 constituents
+        nifty_symbols = _get_nifty_indices()[:50]  # take first 50 (Nifty 50)
         performances = []
-        for sym in nifty50_symbols[:50]:
+        for sym in nifty_symbols:
             try:
                 ticker = yf.Ticker(f"{sym}.NS")
                 hist = ticker.history(period="5d", interval="1d")
@@ -196,41 +232,14 @@ def _get_news_mentioned_symbols() -> List[str]:
             "https://news.google.com/rss/search?q=NSE+stock+bulk+deal+earnings+results&hl=en-IN&gl=IN&ceid=IN:en"
         )
         text = " ".join(e.title for e in feed.entries[:30]).upper()
-        known_symbols = _get_nifty50_constituents() + _get_top_market_cap_stocks(50)
-        for sym in known_symbols:
+        # Use all symbols from NSE securities as the search space
+        all_symbols = _get_all_nse_securities()
+        for sym in all_symbols[:200]:  # limit to avoid slowness
             if sym in text:
                 mentioned.append(sym)
     except Exception as e:
         logger.warning("Could not parse news for symbols: %s", e)
     return mentioned[:15]
-
-def _get_recent_ipos() -> List[str]:
-    cached = _redis_get(IPO_CACHE_KEY)
-    if cached:
-        return cached
-    symbols = []
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-        }
-        resp = httpx.get("https://www.nseindia.com/api/ipo?type=listed", headers=headers, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            for item in data:
-                sym = item.get("symbol") or item.get("secCode")
-                if sym:
-                    symbols.append(sym.upper())
-            logger.info("Fetched %d IPOs from NSE API", len(symbols))
-        else:
-            logger.warning("NSE IPO API returned status %d", resp.status_code)
-    except Exception as e:
-        logger.warning("Failed to fetch recent IPOs: %s", e)
-    if not symbols:
-        fallback = ["JIOFIN", "BLUESTONE", "CUPID", "IREDA", "RVNL", "HUDCO", "RAILTEL", "IRFC"]
-        symbols = fallback
-    _redis_set(IPO_CACHE_KEY, symbols, ttl=86400)
-    return symbols
 
 # ── Build scan universe ──────────────────────────────────────────────────────
 def _build_scan_universe() -> List[str]:
@@ -239,14 +248,34 @@ def _build_scan_universe() -> List[str]:
         return cached
 
     universe = set()
-    universe.update(_get_nifty50_constituents())
-    universe.update(_get_top_market_cap_stocks(30))
+    # 1. All NSE securities (capped to 100 for performance)
+    all_stocks = _get_all_nse_securities()
+    universe.update(all_stocks[:100])
+
+    # 2. Nifty indices constituents
+    universe.update(_get_nifty_indices())
+
+    # 3. Momentum movers
     universe.update(_get_momentum_movers())
+
+    # 4. News mentioned
     universe.update(_get_news_mentioned_symbols())
+
+    # 5. Recent IPOs
     universe.update(_get_recent_ipos())
+
+    # 6. User watchlist and searched symbols
     universe.update(_load_watchlist())
     universe.update(_load_searched())
 
+    # 7. Aliases
+    for target in SYMBOL_ALIASES.values():
+        if isinstance(target, list):
+            universe.update(target)
+        else:
+            universe.add(target)
+
+    # Clean and cap at 120
     clean = []
     seen = set()
     for s in universe:
@@ -264,9 +293,10 @@ def _get_all_known_symbols() -> Set[str]:
     cached = _redis_get(KNOWN_SYMBOLS_KEY)
     if cached:
         return set(cached)
+
     combined = set()
-    combined.update(_get_nifty50_constituents())
-    combined.update(_get_top_market_cap_stocks(50))
+    combined.update(_get_all_nse_securities()[:200])
+    combined.update(_get_nifty_indices())
     combined.update(_load_watchlist())
     combined.update(_load_searched())
     combined.update(_get_recent_ipos())
@@ -279,6 +309,7 @@ def _get_all_known_symbols() -> Set[str]:
     scan_universe = _redis_get(SCAN_UNIVERSE_KEY)
     if scan_universe:
         combined.update(scan_universe)
+
     cleaned = set()
     for s in combined:
         s = s.upper().replace(".NS", "").replace(".BO", "")
@@ -471,11 +502,12 @@ async def run_scan_async(task_id: str, universe: List[str]):
 
 # ── Market Movers ──────────────────────────────────────────────────────────
 def _get_nifty50_data() -> List[dict]:
-    nifty50_symbols = [f"{s}.NS" for s in _get_nifty50_constituents()]
+    """Fetch real-time Nifty 50 stock data (from yfinance)."""
+    nifty_symbols = _get_nifty_indices()[:50]  # first 50 are Nifty 50
     data = []
-    for sym in nifty50_symbols:
+    for sym in nifty_symbols:
         try:
-            ticker = yf.Ticker(sym)
+            ticker = yf.Ticker(f"{sym}.NS")
             hist = ticker.history(period="1d", interval="1m")
             if hist.empty:
                 continue
@@ -483,7 +515,7 @@ def _get_nifty50_data() -> List[dict]:
             prev_close = hist.iloc[0]["Close"]
             change_pct = (latest["Close"] - prev_close) / prev_close * 100
             data.append({
-                "symbol": sym.replace(".NS", ""),
+                "symbol": sym,
                 "price": round(latest["Close"], 2),
                 "change": round(latest["Close"] - prev_close, 2),
                 "change_pct": round(change_pct, 2),
@@ -812,7 +844,6 @@ def scan_watchlist():
                 resp = client.get(f"{DECISION_URL}/decide/{symbol}")
                 resp.raise_for_status()
                 result = resp.json()
-                # ✅ Add summary here
                 result["natural_language_summary"] = _generate_summary(result)
                 results.append(result)
             except httpx.HTTPError as e:
