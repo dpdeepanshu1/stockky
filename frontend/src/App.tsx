@@ -42,7 +42,7 @@ export default function App() {
   async function handleSearch(symbol: string) {
     if (!symbol.trim()) return;
     setTab("dashboard");
-    setView({ mode: "loading", label: `Analysing ${symbol.toUpperCase()}…` });
+    setView({ mode: "loading", label: `Analysing ${symbol.toUpperCase()}...` });
     try {
       const data = await api.getStock(symbol.trim());
       setView({ mode: "stock", data });
@@ -53,7 +53,7 @@ export default function App() {
   }
 
   async function handleScan() {
-    setView({ mode: "loading", label: "Running market scan…" });
+    setView({ mode: "loading", label: "Running market scan..." });
     try {
       const data = await api.runScan();
       setView({ mode: "scan", data });
@@ -76,7 +76,7 @@ export default function App() {
             <div>
               <span className="font-display text-xl tracking-tight">Stockky</span>
               <span className="font-mono text-[10px] text-mist tracking-widest uppercase ml-3 hidden sm:inline">
-                NSE · India
+                NSE - India
               </span>
             </div>
             <nav className="flex items-center gap-1 ml-2">
@@ -104,7 +104,7 @@ export default function App() {
               className="text-xs font-mono text-mist hover:text-paper border border-slate rounded-lg px-3 py-2 hover:border-mist/60 transition"
               title="Backend settings"
             >
-              ⚙
+              Settings
             </button>
           </div>
         </div>
@@ -162,7 +162,7 @@ export default function App() {
                 Know your next move. <span className="italic text-mist">In one call.</span>
               </h1>
               <p className="text-mist text-sm max-w-lg mb-8">
-                Technical, fundamental, news and AI signals — combined into a single decision.
+                Technical, fundamental, news and AI signals -- combined into a single decision.
               </p>
 
               <div className="flex flex-col sm:flex-row gap-3">
@@ -172,7 +172,7 @@ export default function App() {
                     value={query}
                     onChange={(e) => setQuery(e.target.value.toUpperCase())}
                     onKeyDown={(e) => e.key === "Enter" && handleSearch(query)}
-                    placeholder="TCS, INFY, RELIANCE…"
+                    placeholder="TCS, INFY, RELIANCE..."
                     className="bg-transparent outline-none flex-1 font-mono text-sm placeholder:text-mist/30 min-w-0"
                     autoComplete="off"
                     spellCheck={false}
@@ -277,7 +277,7 @@ export default function App() {
 
       <footer className="max-w-6xl mx-auto px-4 sm:px-6 py-6 border-t border-slate/40 mt-12">
         <p className="text-[11px] text-mist/40 font-mono">
-          For informational use only — not investment advice. Always verify before trading.
+          For informational use only -- not investment advice. Always verify before trading.
         </p>
       </footer>
     </div>
@@ -314,7 +314,7 @@ function BackendStatusDot({
 }) {
   const color =
     status === "up" ? "bg-signal-buy" : status === "down" ? "bg-signal-sell" : "bg-signal-hold animate-pulse";
-  const label = status === "up" ? "Backend connected" : status === "down" ? "Backend unreachable" : "Checking…";
+  const label = status === "up" ? "Backend connected" : status === "down" ? "Backend unreachable" : "Checking...";
   return (
     <button
       onClick={onClick}
@@ -346,7 +346,7 @@ function SettingsBanner({ onClose, onSaved }: { onClose: () => void; onSaved: ()
             </h3>
             <p className="text-mist/70 text-xs mb-3 max-w-md">
               This is the URL of your deployed API Gateway service. If the app shows "Failed to
-              fetch", it usually means this wasn't set when the frontend was built — set it here
+              fetch", it usually means this wasn't set when the frontend was built -- set it here
               once and it's remembered on this device.
             </p>
             <div className="flex gap-2">

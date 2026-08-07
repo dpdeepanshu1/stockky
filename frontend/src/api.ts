@@ -1,11 +1,10 @@
-const STORAGE_KEY = "https://api-gateway-wizr.onrender.com";
-const DEFAULT_API_URL = import.meta.env.VITE_API_URL || "https://api-gateway-wizr.onrender.com";
+const STORAGE_KEY = "stockky:api_url";
 
 /**
  * Vite bakes VITE_API_URL into the static bundle at BUILD time. If the
  * frontend is deployed without that build-time env var set (a common
  * mistake when frontend + backend are deployed separately), every fetch
- * silently targets http://localhost:8000 from the visitor's browser —
+ * silently targets http://localhost:8000 from the visitor's browser --
  * which fails instantly with "Failed to fetch". To make the app resilient
  * to that misconfiguration without a rebuild, the backend URL can also be
  * set at runtime from the Settings banner and is remembered in
@@ -14,7 +13,7 @@ const DEFAULT_API_URL = import.meta.env.VITE_API_URL || "https://api-gateway-wiz
 export function getApiUrl(): string {
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored) return stored;
-  return DEFAULT_API_URL.replace(/\/$/, "");
+  return (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
 }
 
 export function setApiUrl(url: string) {
@@ -93,7 +92,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     res = await fetch(`${base}${path}`, init);
   } catch {
     throw new Error(
-      `Could not reach ${base}. The backend may be asleep (free-tier cold start — retry in ~30s), down, or the URL is wrong. Check Settings.`
+      `Could not reach ${base}. The backend may be asleep (free-tier cold start -- retry in ~30s), down, or the URL is wrong. Check Settings.`
     );
   }
 

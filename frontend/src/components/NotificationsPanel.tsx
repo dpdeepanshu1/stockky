@@ -3,27 +3,31 @@ import { api, NotificationConfig } from "../api";
 
 type Channel = "telegram" | "discord" | "slack";
 
-const CHANNEL_META: Record
-  Channel,
-  { label: string; blurb: string; setupUrl: string; setupLabel: string }
-> = {
+interface ChannelMeta {
+  label: string;
+  blurb: string;
+  setupUrl: string;
+  setupLabel: string;
+}
+
+const CHANNEL_META: Record<Channel, ChannelMeta> = {
   telegram: {
     label: "Telegram",
     blurb: "Free bot, no billing account. Best for instant phone alerts.",
     setupUrl: "https://core.telegram.org/bots#how-do-i-create-a-bot",
-    setupLabel: "How to create a bot →",
+    setupLabel: "How to create a bot ->",
   },
   discord: {
     label: "Discord",
     blurb: "Free incoming webhook on any server/channel you own.",
     setupUrl: "https://support.discord.com/hc/en-us/articles/228383668",
-    setupLabel: "How to get a webhook URL →",
+    setupLabel: "How to get a webhook URL ->",
   },
   slack: {
     label: "Slack",
     blurb: "Free incoming webhook via a Slack app.",
     setupUrl: "https://api.slack.com/messaging/webhooks",
-    setupLabel: "How to set up Slack webhooks →",
+    setupLabel: "How to set up Slack webhooks ->",
   },
 };
 
@@ -111,8 +115,8 @@ export default function NotificationsPanel() {
       } else {
         const summary = Object.entries(r.results || {})
           .map(([ch, status]) => `${ch}: ${status}`)
-          .join(" · ");
-        setTestResult(`Sent — ${summary}`);
+          .join(" - ");
+        setTestResult(`Sent -- ${summary}`);
       }
     } catch (e) {
       setTestResult((e as Error).message);
@@ -124,7 +128,7 @@ export default function NotificationsPanel() {
   if (loading) {
     return (
       <div className="rounded-xl border border-slate bg-graphite p-8">
-        <p className="font-mono text-xs text-mist">Loading notification settings…</p>
+        <p className="font-mono text-xs text-mist">Loading notification settings...</p>
       </div>
     );
   }
@@ -152,7 +156,7 @@ export default function NotificationsPanel() {
           <h2 className="font-display text-2xl mb-1">Notifications</h2>
           <p className="text-mist text-sm max-w-lg">
             Connect a free channel to get pinged on new BUY NOW calls and SELL flips. Everything
-            here is configured from the page — no code or redeploy needed.
+            here is configured from the page -- no code or redeploy needed.
             {!config.persisted && (
               <span className="block mt-1 text-signal-hold">
                 Redis isn't connected on the backend, so this config resets on restart. Add
@@ -166,7 +170,7 @@ export default function NotificationsPanel() {
           disabled={testing}
           className="border border-slate rounded-lg px-4 py-2.5 font-mono text-xs text-mist hover:text-paper hover:border-mist transition whitespace-nowrap disabled:opacity-50"
         >
-          {testing ? "Sending…" : "Send test notification"}
+          {testing ? "Sending..." : "Send test notification"}
         </button>
       </div>
 
@@ -188,7 +192,7 @@ export default function NotificationsPanel() {
       >
         <Field
           label="Bot token"
-          placeholder={config.telegram.configured ? `Saved: ${config.telegram.masked}` : "123456:ABC-DEF…"}
+          placeholder={config.telegram.configured ? `Saved: ${config.telegram.masked}` : "123456:ABC-DEF..."}
           value={telegramToken}
           onChange={setTelegramToken}
           type="password"
@@ -213,7 +217,7 @@ export default function NotificationsPanel() {
       >
         <Field
           label="Webhook URL"
-          placeholder={config.discord.configured ? `Saved: ${config.discord.masked}` : "https://discord.com/api/webhooks/…"}
+          placeholder={config.discord.configured ? `Saved: ${config.discord.masked}` : "https://discord.com/api/webhooks/..."}
           value={discordUrl}
           onChange={setDiscordUrl}
           type="password"
@@ -232,7 +236,7 @@ export default function NotificationsPanel() {
       >
         <Field
           label="Webhook URL"
-          placeholder={config.slack.configured ? `Saved: ${config.slack.masked}` : "https://hooks.slack.com/services/…"}
+          placeholder={config.slack.configured ? `Saved: ${config.slack.masked}` : "https://hooks.slack.com/services/..."}
           value={slackUrl}
           onChange={setSlackUrl}
           type="password"
@@ -304,7 +308,7 @@ function ChannelCard({
           disabled={saving}
           className="border border-slate rounded-lg px-4 py-2.5 font-mono text-xs text-mist hover:text-paper hover:border-signal-prepare/60 transition disabled:opacity-50 h-fit"
         >
-          {saving ? "Saving…" : connected ? "Update & start" : "Connect & start"}
+          {saving ? "Saving..." : connected ? "Update & start" : "Connect & start"}
         </button>
       </div>
     </div>
