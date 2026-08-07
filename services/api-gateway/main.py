@@ -2,7 +2,8 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-Includes async scan with progress, symbol correction, Hinglish summaries, etc.
+Includes async scan with progress (via BackgroundTasks), symbol correction,
+Hinglish summaries, and manual CORS headers.
 """
 import os
 import json
@@ -11,14 +12,13 @@ import asyncio
 import logging
 import difflib
 import uuid
-from typing import List, Optional, Set, Dict, Union, Any
+from typing import List, Optional, Set, Dict, Union
 
 import httpx
 import yfinance as yf
 import feedparser
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from upstash_redis import Redis
 
@@ -350,7 +350,7 @@ class NotificationChannelUpdate(BaseModel):
     telegram_chat_id: str | None = None
     enabled: dict | None = None
 
-# ── Asynchronous scan with progress ──────────────────────────────────────
+# ── Asynchronous scan with progress (BackgroundTasks) ──────────────────────
 async def run_scan_async(task_id: str, universe: List[str]):
     start_time = time.time()
     results = []
@@ -664,7 +664,8 @@ def run_scan(force_refresh: bool = False):
 
 # ── Async scan endpoints ──────────────────────────────────────────────────
 @app.post("/scan/start")
-def start_scan(force_refresh: bool = False):
+def start_scan(force_refresh: bool = False, background_tasks: BackgroundTasks = None):
+    """Start an asynchronous scan and return a task ID."""
     if force_refresh and _redis:
         try:
             _redis.delete(SCAN_UNIVERSE_KEY)
@@ -673,7 +674,10 @@ def start_scan(force_refresh: bool = False):
 
     universe = _build_scan_universe()
     task_id = str(uuid.uuid4())
-    asyncio.create_task(run_scan_async(task_id, universe))
+
+    # Run the scan in the background using FastAPI's BackgroundTasks
+    background_tasks.add_task(run_scan_async, task_id, universe)
+
     return {"task_id": task_id}
 
 @app.get("/scan/status/{task_id}")
