@@ -8,11 +8,15 @@ Now handles both .NS and non-.NS symbols gracefully.
 import os
 import logging
 import math
+import time
 import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("technical-analysis-service")
@@ -20,9 +24,35 @@ logger = logging.getLogger("technical-analysis-service")
 app = FastAPI(title="Stockky Technical Analysis Service", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Global exception handler for JSON errors
+# --- 配置 requests session 以提升稳定性 ---
+def get_yfinance_session():
+    session = requests.Session()
+    # 伪装成真实浏览器，降低被屏蔽的风险[reference:10]
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    # 配置重试策略，应对临时性网络错误[reference:11]
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+# 应用自定义 session
+yf_session = get_yfinance_session()
+yf.set_session(yf_session)
+
+# 全局异常处理器
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}")
     return JSONResponse(
         status_code=500,
         content={"detail": f"Internal error: {str(exc)}"},
@@ -30,7 +60,6 @@ async def global_exception_handler(request, exc):
     )
 
 def normalize_symbol(symbol: str) -> str:
-    """Ensure symbol has .NS suffix for NSE stocks."""
     sym = symbol.strip().upper()
     if not sym.endswith(".NS") and not sym.endswith(".BO"):
         sym = f"{sym}.NS"
@@ -67,7 +96,8 @@ def analyze(symbol: str):
     try:
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
-        hist = ticker.history(period="1y")
+        # 添加超时控制，避免请求卡死[reference:12]
+        hist = ticker.history(period="1y", timeout=30)
         if hist.empty or len(hist) < 30:
             raise HTTPException(status_code=404, detail=f"Insufficient price data for {sym}")
 
@@ -103,7 +133,7 @@ def analyze(symbol: str):
         # Parabolic SAR (approximated)
         sar_bullish = current_price > close.rolling(window=20).mean().iloc[-1]
 
-        # ADX (simplified for now)
+        # ADX (simplified)
         tr1 = high - low
         tr2 = (high - close.shift()).abs()
         tr3 = (low - close.shift()).abs()
