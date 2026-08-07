@@ -37,6 +37,20 @@ def _safe(val, decimals=2):
         return None
 
 
+def _safe_int(val):
+    try:
+        return int(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_growth(current, previous):
+    """Compute percentage growth from previous to current."""
+    if previous is None or previous == 0:
+        return None
+    return ((current - previous) / previous) * 100
+
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("market-data-service")
 
@@ -162,35 +176,35 @@ def get_quote(symbol: str):
     ticker = yf.Ticker(sym)
     ticker._tz = "Asia/Kolkata"
     try:
-            info = ticker.info
+        info = ticker.info
     except Exception:
-            info = {}
+        info = {}
     if not info:
-            raise HTTPException(status_code=404, detail=f"No fundamentals for {sym}")
+        raise HTTPException(status_code=404, detail=f"No fundamentals for {sym}")
     try:
-            full_info = ticker.info
+        full_info = ticker.info
     except Exception:
-            pass  # fast_info is enough to still return a usable quote
+        pass  # fast_info is enough to still return a usable quote
 
     price = getattr(info, "last_price", None)
     prev_close = getattr(info, "previous_close", None)
     change_pct = None
     if price and prev_close:
-            change_pct = round(((price - prev_close) / prev_close) * 100, 2)
+        change_pct = round(((price - prev_close) / prev_close) * 100, 2)
 
     result = {
-            "symbol": sym,
-            "name": full_info.get("longName") or full_info.get("shortName") or sym,
-            "price": price,
-            "previous_close": prev_close,
-            "day_change_pct": change_pct,
-            "day_high": getattr(info, "day_high", None),
-            "day_low": getattr(info, "day_low", None),
-            "volume": getattr(info, "last_volume", None),
-            "market_cap": getattr(info, "market_cap", None),
-            "pe_ratio": full_info.get("trailingPE"),
-            "fetched_at": datetime.utcnow().isoformat(),
-        }
+        "symbol": sym,
+        "name": full_info.get("longName") or full_info.get("shortName") or sym,
+        "price": price,
+        "previous_close": prev_close,
+        "day_change_pct": change_pct,
+        "day_high": getattr(info, "day_high", None),
+        "day_low": getattr(info, "day_low", None),
+        "volume": getattr(info, "last_volume", None),
+        "market_cap": getattr(info, "market_cap", None),
+        "pe_ratio": full_info.get("trailingPE"),
+        "fetched_at": datetime.utcnow().isoformat(),
+    }
     _cache_set(cache_key, result)
     return result
 
@@ -245,9 +259,9 @@ def get_history(
 
 @app.get("/fundamentals/{symbol}")
 def get_fundamentals_raw(symbol: str):
-    """Fundamental data built from fast_info + quote + dividends history.
-    Yahoo's full .info endpoint is blocked from cloud environments (403),
-    so we assemble what we can from the endpoints that do work."""
+    """Fundamental data built from info, financials, balance sheet, cashflow.
+    Fetches full info (may work), falls back to financials if info fails.
+    """
     sym = normalize_symbol(symbol)
     cache_key = f"fundamentals:{sym}"
     cached = _cache_get(cache_key)
@@ -258,78 +272,180 @@ def get_fundamentals_raw(symbol: str):
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
 
-        # fast_info — price-level data, works from cloud
-        fi = ticker.fast_info
+        # 1. Try to get full info (may work from some IPs)
+        try:
+            info = ticker.info
+        except Exception:
+            info = {}
 
-        def _safe_fi(attr):
+        # 2. Get financials, balance sheet, cashflow
+        financials = ticker.financials
+        balance = ticker.balance_sheet
+        cashflow = ticker.cashflow
+
+        # Helper to safely get info key
+        def _safe_info(key):
+            val = info.get(key)
+            if val is None:
+                return None
             try:
-                v = getattr(fi, attr, None)
-                return None if (v is None or (isinstance(v, float) and (v != v))) else v
-            except Exception:
+                return float(val)
+            except (ValueError, TypeError):
                 return None
 
-        last_price   = _safe_fi("last_price")
-        market_cap   = _safe_fi("market_cap")
-        year_high    = _safe_fi("year_high")
-        year_low     = _safe_fi("year_low")
-        year_change  = _safe_fi("year_change")
-        fifty_day    = _safe_fi("fifty_day_average")
-        two_hundred  = _safe_fi("two_hundred_day_average")
+        # --- Extract metrics from info or financials ---
 
-        # Dividends — works from cloud via history endpoint
-        dividend_yield = None
-        try:
-            divs = ticker.dividends
-            if divs is not None and not divs.empty and last_price:
-                annual_div = float(divs.tail(4).sum())  # trailing 4 quarters
-                dividend_yield = round(annual_div / last_price * 100, 2)
-        except Exception:
-            pass
+        # Revenue growth (from financials)
+        revenue_growth = None
+        if not financials.empty and "Total Revenue" in financials.index:
+            rev_series = financials.loc["Total Revenue"]
+            if len(rev_series) >= 2:
+                current_rev = rev_series.iloc[0]
+                prev_rev = rev_series.iloc[1]
+                revenue_growth = _compute_growth(current_rev, prev_rev)
 
-        # PE ratio — already in quote endpoint, fetch from there
+        # Earnings growth (Net Income)
+        earnings_growth = None
+        if not financials.empty and "Net Income" in financials.index:
+            earnings_series = financials.loc["Net Income"]
+            if len(earnings_series) >= 2:
+                current_earn = earnings_series.iloc[0]
+                prev_earn = earnings_series.iloc[1]
+                earnings_growth = _compute_growth(current_earn, prev_earn)
+
+        # ROE (Net Income / Shareholders' Equity)
+        roe = None
+        if "returnOnEquity" in info:
+            roe = _safe_info("returnOnEquity") * 100 if _safe_info("returnOnEquity") else None
+        elif not balance.empty and "Total Equity Gross Minority Interest" in balance.index:
+            equity = balance.loc["Total Equity Gross Minority Interest"].iloc[0]
+            if not financials.empty and "Net Income" in financials.index:
+                net_income = financials.loc["Net Income"].iloc[0]
+                if equity != 0:
+                    roe = (net_income / equity) * 100
+
+        # Debt to Equity
+        debt_to_equity = None
+        if "debtToEquity" in info:
+            debt_to_equity = _safe_info("debtToEquity")
+        elif not balance.empty and "Total Debt" in balance.index and "Total Equity Gross Minority Interest" in balance.index:
+            total_debt = balance.loc["Total Debt"].iloc[0]
+            equity = balance.loc["Total Equity Gross Minority Interest"].iloc[0]
+            if equity != 0:
+                debt_to_equity = total_debt / equity
+
+        # Free Cash Flow
+        free_cashflow = None
+        if "freeCashflow" in info:
+            free_cashflow = _safe_info("freeCashflow")
+        elif not cashflow.empty and "Free Cash Flow" in cashflow.index:
+            free_cashflow = cashflow.loc["Free Cash Flow"].iloc[0]
+
+        # Profit Margins (Net Margin)
+        profit_margins = None
+        if "profitMargins" in info:
+            profit_margins = _safe_info("profitMargins") * 100
+        else:
+            # Compute from financials
+            if not financials.empty and "Net Income" in financials.index and "Total Revenue" in financials.index:
+                net_income = financials.loc["Net Income"].iloc[0]
+                revenue = financials.loc["Total Revenue"].iloc[0]
+                if revenue != 0:
+                    profit_margins = (net_income / revenue) * 100
+
+        # Institutional Holding
+        held_percent_institutions = None
+        if "heldPercentInstitutions" in info:
+            held_percent_institutions = _safe_info("heldPercentInstitutions") * 100
+        elif "institutionalPercent" in info:
+            held_percent_institutions = _safe_info("institutionalPercent") * 100
+
+        # PE Ratio
         pe_ratio = None
-        try:
-            q_resp = httpx.get(f"http://localhost:{os.getenv('PORT', '8001')}/quote/{symbol}", timeout=10)
-            if q_resp.status_code == 200:
-                pe_ratio = q_resp.json().get("pe_ratio")
-        except Exception:
-            pass
+        if "trailingPE" in info:
+            pe_ratio = _safe_info("trailingPE")
+        elif "peRatio" in info:
+            pe_ratio = _safe_info("peRatio")
 
-        # Price momentum as a proxy for earnings growth
-        momentum = None
-        if year_change is not None:
-            momentum = round(year_change * 100, 2)
+        # Forward PE
+        forward_pe = None
+        if "forwardPE" in info:
+            forward_pe = _safe_info("forwardPE")
 
-        # 52-week range position (0-100%) as valuation proxy
+        # EPS
+        eps = None
+        if "trailingEps" in info:
+            eps = _safe_info("trailingEps")
+        elif "eps" in info:
+            eps = _safe_info("eps")
+
+        # Price to Book
+        price_to_book = None
+        if "priceToBook" in info:
+            price_to_book = _safe_info("priceToBook")
+
+        # Market Cap
+        market_cap = _safe_info("marketCap")
+
+        # Dividend Yield
+        dividend_yield = None
+        if "dividendYield" in info:
+            dividend_yield = _safe_info("dividendYield") * 100
+        else:
+            # Compute from dividends
+            try:
+                divs = ticker.dividends
+                if divs is not None and not divs.empty:
+                    last_price = _safe_info("regularMarketPrice") or _safe_info("last_price")
+                    if last_price:
+                        annual_div = float(divs.tail(4).sum())
+                        dividend_yield = round(annual_div / last_price * 100, 2)
+            except Exception:
+                pass
+
+        # Year high/low, averages
+        year_high = _safe_info("fiftyTwoWeekHigh")
+        year_low = _safe_info("fiftyTwoWeekLow")
+        fifty_day_average = _safe_info("fiftyDayAverage")
+        two_hundred_day_average = _safe_info("twoHundredDayAverage")
+        year_change_pct = _safe_info("52WeekChange")
+        if year_change_pct is not None:
+            year_change_pct = year_change_pct * 100
+
+        # Range position
         range_position = None
-        if year_high and year_low and last_price and year_high != year_low:
-            range_position = round((last_price - year_low) / (year_high - year_low) * 100, 1)
+        if year_high and year_low:
+            last_price = _safe_info("regularMarketPrice") or _safe_info("last_price")
+            if last_price and year_high != year_low:
+                range_position = round((last_price - year_low) / (year_high - year_low) * 100, 1)
+
+        sector = info.get("sector")
+        industry = info.get("industry")
 
         result = {
             "symbol": sym,
             "pe_ratio": pe_ratio,
-            "forward_pe": None,
+            "forward_pe": forward_pe,
             "market_cap": market_cap,
             "dividend_yield": dividend_yield,
-            "year_change_pct": momentum,
+            "year_change_pct": year_change_pct,
             "year_high": year_high,
             "year_low": year_low,
-            "fifty_day_average": fifty_day,
-            "two_hundred_day_average": two_hundred,
+            "fifty_day_average": fifty_day_average,
+            "two_hundred_day_average": two_hundred_day_average,
             "range_position_pct": range_position,
-            # Fields not available from cloud — honest nulls
-            "revenue_growth": None,
-            "earnings_growth": None,
-            "eps": None,
-            "roe": None,
-            "debt_to_equity": None,
-            "free_cashflow": None,
-            "profit_margins": None,
-            "held_percent_insiders": None,
-            "held_percent_institutions": None,
-            "price_to_book": None,
-            "sector": None,
-            "industry": None,
+            "revenue_growth": revenue_growth,
+            "earnings_growth": earnings_growth,
+            "eps": eps,
+            "roe": roe,
+            "debt_to_equity": debt_to_equity,
+            "free_cashflow": free_cashflow,
+            "profit_margins": profit_margins,
+            "held_percent_insiders": _safe_info("heldPercentInsiders") * 100 if _safe_info("heldPercentInsiders") else None,
+            "held_percent_institutions": held_percent_institutions,
+            "price_to_book": price_to_book,
+            "sector": sector,
+            "industry": industry,
         }
 
         _cache_set(cache_key, result, ttl=3600)
@@ -341,9 +457,8 @@ def get_fundamentals_raw(symbol: str):
         logger.exception("Failed to fetch fundamentals for %s", sym)
         raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
 
+
 if __name__ == "__main__":
     import uvicorn
-
-    # Render provides $PORT – always use it
     port = int(os.environ.get("PORT", 8001))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
