@@ -26,9 +26,24 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [backendUp, setBackendUp] = useState<"checking" | "up" | "down">("checking");
 
+  // Timer states for scan
+  const [scanStartTime, setScanStartTime] = useState<number | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
   useEffect(() => {
     checkBackend();
   }, []);
+
+  // Timer interval
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (view.mode === "loading" && scanStartTime) {
+      interval = setInterval(() => {
+        setElapsedSeconds(Math.floor((Date.now() - scanStartTime) / 1000));
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [view.mode, scanStartTime]);
 
   function checkBackend() {
     setBackendUp("checking");
@@ -45,6 +60,9 @@ export default function App() {
     if (!symbol.trim()) return;
     setTab("dashboard");
     setView({ mode: "loading", label: `Analysing ${symbol.toUpperCase()}...` });
+    // Reset timer (not used for single stock)
+    setScanStartTime(null);
+    setElapsedSeconds(0);
     try {
       const data = await api.getStock(symbol.trim());
       setView({ mode: "stock", data });
@@ -55,11 +73,16 @@ export default function App() {
   }
 
   async function handleScan() {
+    // Start timer
+    setScanStartTime(Date.now());
+    setElapsedSeconds(0);
     setView({ mode: "loading", label: "Running market scan..." });
     try {
       const data = await api.runScan();
+      setScanStartTime(null);
       setView({ mode: "scan", data });
     } catch (e) {
+      setScanStartTime(null);
       setView({ mode: "error", message: (e as Error).message });
     }
   }
@@ -233,7 +256,10 @@ export default function App() {
 
               {view.mode === "loading" && (
                 <div className="rounded-xl border border-slate bg-graphite p-8 max-w-sm">
-                  <p className="font-mono text-xs text-mist mb-6">{view.label}</p>
+                  <p className="font-mono text-xs text-mist mb-2">{view.label}</p>
+                  <p className="font-mono text-xs text-mist/60 mb-4">
+                    ⏱️ {elapsedSeconds}s elapsed
+                  </p>
                   <Pipeline running={true} />
                 </div>
               )}

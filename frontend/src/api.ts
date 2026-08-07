@@ -52,6 +52,7 @@ export interface Decision {
   };
   valuation: string;
   sector: string | null;
+  natural_language_summary: string;  // <-- NEW
 }
 
 export interface ScanResult {
@@ -83,6 +84,7 @@ export interface SystemServiceStatus {
   status: string;
   seconds?: number;
   error?: string;
+  url?: string | null;
 }
 
 export interface SystemHealth {

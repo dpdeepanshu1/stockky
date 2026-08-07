@@ -19,7 +19,7 @@ const SERVICE_LABELS: Record<string, string> = {
   notification: "Notifications",
 };
 
-const MAX_AUTO_ATTEMPTS = 6; // ~ up to a couple minutes total, on top of each call's own internal wait
+const MAX_AUTO_ATTEMPTS = 6;
 const ESCAPE_HATCH_AFTER_ATTEMPTS = 3;
 
 export default function SystemCheck({ onReady }: { onReady: () => void }) {
@@ -38,14 +38,14 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
 
   async function runCheck(attempt: number) {
     try {
-      await api.ping(); // wakes + confirms api-gateway itself
+      await api.ping();
     } catch {
       if (!cancelled.current) setStage({ phase: "gateway-down" });
       return;
     }
 
     try {
-      const health = await api.systemHealth(); // wakes + checks every downstream service concurrently
+      const health = await api.systemHealth();
       if (cancelled.current) return;
 
       if (health.required_ok) {
@@ -72,6 +72,23 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
         }
       }
     }
+  }
+
+  async function wakeService(url: string | null | undefined) {
+    if (!url) return;
+    try {
+      await fetch(url + "/health", { mode: "no-cors" });
+      // After a moment, re-run the health check
+      setTimeout(() => runCheck(stage.attempt || 0), 3000);
+    } catch {
+      // even if fetch fails (due to CORS), the request may still wake the service
+      setTimeout(() => runCheck(stage.attempt || 0), 3000);
+    }
+  }
+
+  async function wakeAllServices() {
+    // Re-run the system health check, which pings all services concurrently
+    runCheck(stage.attempt || 0);
   }
 
   function saveGatewayUrl() {
@@ -142,7 +159,7 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
       </p>
       <p className="text-mist/60 text-xs mb-6 max-w-sm">
         Everything runs on free-tier hosting, so a sleeping service can take up to a minute to
-        wake on its first request. This only happens after a period of no activity.
+        wake on its first request. Use the buttons below to wake individual services.
       </p>
 
       <div className="space-y-1.5 mb-6 w-full max-w-sm">
@@ -150,11 +167,22 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
           <p className="font-mono text-[11px] text-mist/40">Checking...</p>
         )}
         {entries.map(([name, s]) => (
-          <ServiceRow key={name} name={SERVICE_LABELS[name] || name} status={s} />
+          <ServiceRow
+            key={name}
+            name={SERVICE_LABELS[name] || name}
+            status={s}
+            onWake={() => wakeService(s.url)}
+          />
         ))}
       </div>
 
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-4">
+        <button
+          onClick={wakeAllServices}
+          className="font-mono text-xs text-paper bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-2 hover:bg-signal-prepare/30 transition"
+        >
+          Wake All Services
+        </button>
         <button
           onClick={() => runCheck(stage.attempt + 1)}
           className="font-mono text-xs text-mist hover:text-paper border border-slate rounded-lg px-3 py-2 hover:border-mist/60 transition"
@@ -174,21 +202,50 @@ export default function SystemCheck({ onReady }: { onReady: () => void }) {
   );
 }
 
-function ServiceRow({ name, status }: { name: string; status: { ok: boolean; required: boolean; status: string } }) {
-  const icon = status.ok ? (
-    <span className="text-signal-buy">up</span>
-  ) : status.status === "not_configured" ? (
-    <span className="text-mist/30">--</span>
-  ) : (
-    <span className="text-signal-hold animate-pulse">waking</span>
-  );
+function ServiceRow({
+  name,
+  status,
+  onWake,
+}: {
+  name: string;
+  status: { ok: boolean; required: boolean; status: string; url?: string | null };
+  onWake: () => void;
+}) {
+  let statusText = status.status;
+  let color = "text-mist/30";
+  let icon = "●";
+
+  if (status.ok) {
+    color = "text-signal-buy";
+    icon = "✅";
+  } else if (status.status === "not_configured") {
+    color = "text-mist/30";
+    icon = "—";
+  } else if (status.status === "unreachable" || status.status.startsWith("http_")) {
+    color = "text-signal-sell";
+    icon = "❌";
+  } else {
+    color = "text-signal-hold animate-pulse";
+    icon = "⏳";
+  }
+
   return (
     <div className="flex items-center justify-between font-mono text-[11px] border-b border-slate/30 py-1.5">
       <span className={status.required ? "text-mist" : "text-mist/50"}>
         {name}
         {!status.required && <span className="text-mist/30"> (optional)</span>}
       </span>
-      {icon}
+      <div className="flex items-center gap-2">
+        <span className={color}>{icon} {statusText}</span>
+        {status.url && !status.ok && (
+          <button
+            onClick={onWake}
+            className="text-xs px-2 py-0.5 border border-slate/60 rounded hover:border-mist/60 hover:text-paper transition"
+          >
+            Wake
+          </button>
+        )}
+      </div>
     </div>
   );
 }

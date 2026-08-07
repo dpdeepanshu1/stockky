@@ -118,6 +118,16 @@ export default function DecisionCard({ data, onBack }: Props) {
           <span className="text-paper">{data.holding_period}</span>
         </div>
       )}
+
+      {/* 🔥 NEW: Natural‑language Hinglish summary */}
+      <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
+        <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
+          💬 Final Remarks
+        </h4>
+        <p className="text-sm text-paper/90 leading-relaxed">
+          {data.natural_language_summary}
+        </p>
+      </div>
     </div>
   );
 }

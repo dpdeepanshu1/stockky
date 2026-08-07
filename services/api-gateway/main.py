@@ -16,6 +16,7 @@ New in v2 (merged):
   - Real-time IPO fetching from NSE API (cached in Redis).
   - Symbol auto-correction with fuzzy matching.
   - Symbol alias mapping for rebranded/split companies (TATAMOTORS → TMPV/TMLCV, LTIM → LTM, Zomato → Eternal).
+  - Natural-language Hinglish summary for every decision.
 """
 import os
 import json
@@ -311,6 +312,58 @@ def _resolve_symbol(misspelled: str) -> Optional[str]:
 
     return None
 
+# ── Hinglish natural-language summary generator ──────────────────────────
+def _generate_summary(data: dict) -> str:
+    """Generate a short, conversational Hinglish summary for the decision."""
+    decision = data.get("decision")
+    symbol = data.get("symbol")
+    confidence = data.get("confidence")
+    combined_score = data.get("combined_score")
+    entry = data.get("entry_range", {})
+    target = data.get("target")
+    stop = data.get("stop_loss")
+    holding = data.get("holding_period")
+    reasons = data.get("reasons", {})
+    close = data.get("close")
+
+    if decision == "BUY NOW":
+        summary = f"🚀 {symbol} अभी खरीदने का बहुत अच्छा मौका है! "
+        summary += f"एंट्री {entry.get('low')}-{entry.get('high')}, टारगेट {target}, स्टॉप लॉस {stop}. "
+        summary += f"अनुमानित होल्डिंग अवधि {holding}. "
+        summary += f"कॉन्फिडेंस {confidence} है, स्कोर {combined_score}. "
+        tech = reasons.get("technical", [])
+        if tech:
+            summary += f"तकनीकी: {tech[0]}. "
+        fund = reasons.get("fundamental", [])
+        if fund:
+            summary += f"फंडामेंटल: {fund[0]}. "
+        summary += "जल्दी से अपने पोर्टफोलियो में शामिल करें!"
+    elif decision == "PREPARE TO BUY":
+        summary = f"⏳ {symbol} के लिए खरीदारी की तैयारी करें, लेकिन अभी थोड़ा इंतज़ार करें. "
+        summary += f"एंट्री {entry.get('low')}-{entry.get('high')}, टारगेट {target}, स्टॉप लॉस {stop}. "
+        summary += f"होल्डिंग {holding} हो सकती है. स्कोर {combined_score}. "
+        summary += "अगले कुछ दिनों में वॉल्यूम और ट्रेंड कन्फर्मेशन का इंतज़ार करें."
+    elif decision == "HOLD":
+        summary = f"🔄 {symbol} को होल्ड करें. अभी बेचने की ज़रूरत नहीं है. "
+        summary += f"टारगेट {target} पर पहुंचने पर विचार करें. स्टॉप लॉस {stop}. "
+        summary += f"स्कोर {combined_score}, स्थिति स्थिर है."
+    elif decision == "SELL":
+        summary = f"🔴 {symbol} को बेचने का समय आ गया है. "
+        summary += f"मौजूदा कीमत {close} है, टारगेट से नीचे. "
+        summary += f"स्टॉप लॉस {stop} पार कर चुके हैं. "
+        summary += f"स्कोर {combined_score}, कमज़ोर दिख रहा है. जल्दी से निकलें!"
+    else:  # DO NOT BUY
+        summary = f"❌ {symbol} अभी न खरीदें. "
+        summary += f"तकनीकी और फंडामेंटल दोनों कमज़ोर हैं, स्कोर {combined_score}. "
+        tech = reasons.get("technical", [])
+        if tech:
+            summary += f"तकनीकी: {tech[0]}. "
+        fund = reasons.get("fundamental", [])
+        if fund:
+            summary += f"फंडामेंटल: {fund[0]}. "
+        summary += "बेहतर होगा कि कुछ दिन और देखें."
+    return summary
+
 # ── Build scan universe ──────────────────────────────────────────────────────
 def _build_scan_universe() -> List[str]:
     """
@@ -392,19 +445,20 @@ def health():
 async def system_health():
     async def check(name: str, url: str, required: bool):
         if not url:
-            return name, {"ok": False, "required": required, "status": "not_configured"}
+            return name, {"ok": False, "required": required, "status": "not_configured", "url": None}
         start = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=70) as client:
                 resp = await client.get(f"{url.rstrip('/')}/health")
             elapsed = round(time.monotonic() - start, 1)
             if resp.status_code == 200:
-                return name, {"ok": True, "required": required, "status": "up", "seconds": elapsed}
+                return name, {"ok": True, "required": required, "status": "up", "seconds": elapsed, "url": url}
             return name, {
                 "ok": False,
                 "required": required,
                 "status": f"http_{resp.status_code}",
                 "seconds": elapsed,
+                "url": url,
             }
         except httpx.HTTPError as e:
             elapsed = round(time.monotonic() - start, 1)
@@ -414,12 +468,21 @@ async def system_health():
                 "status": "unreachable",
                 "seconds": elapsed,
                 "error": str(e)[:200],
+                "url": url,
             }
 
     results = await asyncio.gather(
         *(check(name, cfg["url"], cfg["required"]) for name, cfg in SYSTEM_SERVICES.items())
     )
-    services = {"api-gateway": {"ok": True, "required": True, "status": "up", "seconds": 0}}
+    services = {
+        "api-gateway": {
+            "ok": True,
+            "required": True,
+            "status": "up",
+            "seconds": 0,
+            "url": None  # gateway URL is not needed for wake
+        }
+    }
     services.update(dict(results))
     required_ok = all(v["ok"] for v in services.values() if v["required"])
     all_ok = all(v["ok"] for v in services.values())
@@ -467,7 +530,7 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision (with auto-correction and alias mapping) ────────────────
+# ── Stock decision (with auto-correction, alias mapping, and summary) ──────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
@@ -504,6 +567,9 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
             result["corrected_from"] = corrected_from
             result["symbol"] = symbol_to_use
 
+        # Add natural language summary
+        result["natural_language_summary"] = _generate_summary(result)
+
         return result
 
     except httpx.HTTPStatusError as e:
@@ -534,7 +600,10 @@ def run_scan(force_refresh: bool = False):
             try:
                 resp = client.get(f"{DECISION_URL}/decide/{symbol}")
                 resp.raise_for_status()
-                results.append(resp.json())
+                result = resp.json()
+                # Add summary to each result
+                result["natural_language_summary"] = _generate_summary(result)
+                results.append(result)
             except httpx.HTTPError as e:
                 logger.warning("Scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})
