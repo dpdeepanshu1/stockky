@@ -33,18 +33,21 @@ session.headers.update({
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 })
-# Set session for yfinance (newer versions)
+
+# Set session for yfinance (newer versions use set_session)
 try:
     yf.set_session(session)
 except AttributeError:
-    # Fallback for older versions (though unlikely)
-    import yfinance as yf_old
-    yf_old.shared._session = session
+    # Fallback for older yfinance versions (unlikely)
+    try:
+        yf.shared._session = session
+    except AttributeError:
+        pass
 
-# Also set tz cache location (optional)
+# Optionally set tz cache location
 try:
     yf.set_tz_cache_location("/tmp/yfinance_tz")
-except:
+except AttributeError:
     pass
 
 def _safe(val, decimals=2):
@@ -253,7 +256,7 @@ def get_fundamentals_raw(symbol: str):
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
 
-        # Get info with retry (it might work with custom session)
+        # Get info with retry
         info = {}
         try:
             info = _with_retry(lambda: ticker.info, max_retries=3, base_delay=2)
@@ -277,7 +280,6 @@ def get_fundamentals_raw(symbol: str):
         except Exception as e:
             logger.warning(f"Could not fetch cashflow for {sym}: {e}")
 
-        # Helper to safely get info key
         def _safe_info(key):
             val = info.get(key)
             if val is None:
