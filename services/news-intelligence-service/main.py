@@ -105,6 +105,19 @@ def _fetch_headlines(symbol: str, max_items: int = 12) -> List[dict]:
     return items
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "Stockky News Intelligence Service",
+        "status": "running",
+        "endpoints": {
+            "/health": "GET – health check",
+            "/analyze/{symbol}": "GET – news sentiment score for a symbol",
+            "/docs": "Swagger UI documentation",
+        },
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "news-intelligence-service"}
@@ -151,5 +164,5 @@ def analyze(symbol: str):
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=8005, reload=True)
+    port = int(os.getenv("PORT", 8005))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
