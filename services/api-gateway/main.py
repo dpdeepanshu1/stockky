@@ -2,9 +2,8 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-Includes async scan with progress (via BackgroundTasks), symbol correction,
-Hinglish summaries, market movers endpoints, watchlist scan, and Telegram notifications.
-Dynamic universe: fetches stocks from NSE API (all securities, indices, IPOs, news, momentum).
+Includes async scan with progress, symbol correction, Hinglish summaries,
+market movers, watchlist scan, Telegram notifications, and dynamic universe.
 """
 import os
 import json
@@ -107,7 +106,7 @@ SCAN_TASK_PREFIX    = "stockky:scan_task:"
 # ── Symbol Alias Mapping (old → new) ──────────────────────────────────────
 SYMBOL_ALIASES: Dict[str, Union[str, List[str]]] = {
     "TATAMOTORS": "TMPV",
-    "TATAMOTER": "TMCV",
+    "TATAMOTER": "TMPV",
     "TATAMOT": "TMPV",
     "LTIM": "LTM",
     "LTIMIND": "LTM",
@@ -115,7 +114,7 @@ SYMBOL_ALIASES: Dict[str, Union[str, List[str]]] = {
     "ZOMATO": "ETERNAL",
     "ZOMAT": "ETERNAL",
 }
-EXTRA_NEW_SYMBOLS = ["TMPV", "TMCV", "LTM", "ETERNAL"]
+EXTRA_NEW_SYMBOLS = ["TMPV", "TMLCV", "LTM", "ETERNAL"]
 
 # ── Redis helpers ─────────────────────────────────────────────────────────
 def _redis_get(key: str):
@@ -155,14 +154,12 @@ def _add_searched(symbol: str):
         searched.append(sym)
         _redis_set(SEARCHED_KEY, searched[-200:])
 
-# ── Dynamic Universe Sources (all real-time from NSE API) ──────────────────
+# ── Dynamic Universe Sources ──────────────────────────────────────────────
 
 def _fetch_from_nse_api(endpoint: str, cache_key: str, ttl: int = 21600):
-    """Helper to fetch from NSE API with caching."""
     cached = _redis_get(cache_key)
     if cached:
         return cached
-
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -181,7 +178,6 @@ def _fetch_from_nse_api(endpoint: str, cache_key: str, ttl: int = 21600):
         return None
 
 def _get_all_nse_securities() -> List[str]:
-    """Fetch all equity symbols from NSE (all listed stocks)."""
     data = _fetch_from_nse_api("equity-stockIndices?index=SECURITIES%20IN%20NSE", "nse:all_securities")
     symbols = []
     if data and "data" in data:
@@ -192,7 +188,6 @@ def _get_all_nse_securities() -> List[str]:
     return symbols
 
 def _get_nifty_indices() -> List[str]:
-    """Fetch Nifty 50, Next 50, and Midcap 100 constituents."""
     indices = ["NIFTY%2050", "NIFTY%20NEXT%2050", "NIFTY%20MIDCAP%20100"]
     all_symbols = []
     for idx in indices:
@@ -204,7 +199,6 @@ def _get_nifty_indices() -> List[str]:
     return all_symbols
 
 def _get_recent_ipos() -> List[str]:
-    """Fetch recently listed IPOs from NSE API."""
     data = _fetch_from_nse_api("ipo?type=listed", IPO_CACHE_KEY, ttl=86400)
     symbols = []
     if data:
@@ -213,12 +207,10 @@ def _get_recent_ipos() -> List[str]:
             if sym:
                 symbols.append(sym.upper())
     if not symbols:
-        # fallback
         symbols = ["JIOFIN", "BLUESTONE", "CUPID", "IREDA", "RVNL", "HUDCO", "RAILTEL", "IRFC"]
     return symbols
 
 def _get_momentum_movers() -> List[str]:
-    """Fetch top 10 gainers and top 10 losers from Nifty 50 (real-time)."""
     movers = []
     try:
         nifty_symbols = _get_nifty_indices()[:50]
@@ -261,34 +253,20 @@ def _build_scan_universe() -> List[str]:
         return cached
 
     universe = set()
-    # 1. All NSE securities (capped to 100 for performance)
     all_stocks = _get_all_nse_securities()
     universe.update(all_stocks[:100])
-
-    # 2. Nifty indices constituents
     universe.update(_get_nifty_indices())
-
-    # 3. Momentum movers
     universe.update(_get_momentum_movers())
-
-    # 4. News mentioned
     universe.update(_get_news_mentioned_symbols())
-
-    # 5. Recent IPOs
     universe.update(_get_recent_ipos())
-
-    # 6. User watchlist and searched symbols
     universe.update(_load_watchlist())
     universe.update(_load_searched())
-
-    # 7. Aliases
     for target in SYMBOL_ALIASES.values():
         if isinstance(target, list):
             universe.update(target)
         else:
             universe.add(target)
 
-    # Clean and cap at 120
     clean = []
     seen = set()
     for s in universe:
@@ -306,7 +284,6 @@ def _get_all_known_symbols() -> Set[str]:
     cached = _redis_get(KNOWN_SYMBOLS_KEY)
     if cached:
         return set(cached)
-
     combined = set()
     combined.update(_get_all_nse_securities()[:200])
     combined.update(_get_nifty_indices())
@@ -322,7 +299,6 @@ def _get_all_known_symbols() -> Set[str]:
     scan_universe = _redis_get(SCAN_UNIVERSE_KEY)
     if scan_universe:
         combined.update(scan_universe)
-
     cleaned = set()
     for s in combined:
         s = s.upper().replace(".NS", "").replace(".BO", "")
@@ -392,7 +368,6 @@ def _generate_summary(data: dict) -> str:
 
 # ── Telegram notification helper ──────────────────────────────────────────
 def _send_scan_notification(recommendations: list, verdict: str, scanned: int, universe_size: int):
-    """Send top 5 recommendations to Telegram via notification service."""
     if not recommendations:
         message = f"📊 Market Scan Complete\n\nScanned {scanned} stocks. No strong BUY signals today.\nVerdict: {verdict}"
     else:
@@ -679,17 +654,17 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision ──────────────────────────────────────────────────────────
+# ── Stock decision (FIXED: symbol_to_use always defined) ──────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
     resolved = _resolve_symbol(original)
     if resolved is None:
-        resolved = original.upper()
+        symbol_to_use = original.upper()
         corrected_from = None
     elif resolved != original.upper():
-        corrected_from = original.upper()
         symbol_to_use = resolved
+        corrected_from = original.upper()
     else:
         symbol_to_use = original.upper()
         corrected_from = None

@@ -47,12 +47,17 @@ def analyze(symbol: str):
         resp.raise_for_status()
         f = resp.json()
     except httpx.HTTPError as e:
+        logger.error(f"Market data service error for {symbol}: {e}")
         raise HTTPException(status_code=502, detail=f"Market data service unreachable: {e}")
+
+    # Ensure we have a dict even if the response is empty
+    if not f:
+        f = {}
 
     score = 50
     reasons = []
 
-    # Extract metrics
+    # Extract metrics - use .get() with default None
     rev_growth = f.get("revenue_growth")
     earnings_growth = f.get("earnings_growth")
     roe = f.get("roe")
@@ -63,7 +68,7 @@ def analyze(symbol: str):
     pe = f.get("pe_ratio")
     forward_pe = f.get("forward_pe")
 
-    # Build metrics dict
+    # Build metrics dict (always include all keys)
     metrics = {
         "revenue_growth": rev_growth,
         "earnings_growth": earnings_growth,
@@ -157,6 +162,7 @@ def analyze(symbol: str):
             score += 4
             reasons.append("Forward P/E lower than trailing P/E — earnings expected to grow into valuation")
 
+    # Ensure at least one reason
     if not reasons:
         reasons.append("Fundamental data partially available; score is based on available metrics")
 
