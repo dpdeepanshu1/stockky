@@ -1,23 +1,8 @@
 """
 API Gateway
 ------------
-Single entry point the React frontend talks to.
-Watchlist is now persisted in Upstash Redis — survives restarts.
-New in v2 (merged):
-  - Dynamic scan universe: 50+ stocks including NSE momentum movers,
-    user-searched symbols, news-driven additions, new listings.
-  - Persistent searched symbols saved to Upstash Redis.
-  - Smart scan returns top 3-5 picks with entry/target/stop even when
-    the overall market verdict is cautious.
-  - Watchlist CRUD persisted in Redis.
-  - System health check for all downstream services (concurrent).
-  - Notification configuration proxy.
-  - Expanded universe: 100+ base stocks, top 10 gainers/losers, new listings.
-  - Real-time IPO fetching from NSE API (cached in Redis).
-  - Symbol auto-correction with fuzzy matching.
-  - Symbol alias mapping for rebranded/split companies (TATAMOTORS → TMPV/TMLCV, LTIM → LTM, Zomato → Eternal).
-  - Natural-language Hinglish summary for every decision.
-  - Asynchronous scan with progress tracking (task ID, processed/total, estimated remaining time).
+Single entry point for the React frontend.
+Includes async scan with progress, symbol correction, Hinglish summaries, etc.
 """
 import os
 import json
@@ -33,6 +18,7 @@ import yfinance as yf
 import feedparser
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from upstash_redis import Redis
 
@@ -64,7 +50,24 @@ SYSTEM_SERVICES = {
 }
 
 app = FastAPI(title="Stockky API Gateway", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# --- CORS Middleware (explicit) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Manual CORS header middleware (fallback) ---
+@app.middleware("http")
+async def add_cors_header(request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 # ── Redis ──────────────────────────────────────────────────────────────────────
 _redis = None
@@ -158,7 +161,6 @@ def _get_recent_ipos() -> List[str]:
     cached = _redis_get(IPO_CACHE_KEY)
     if cached:
         return cached
-
     symbols = []
     try:
         headers = {
@@ -177,11 +179,9 @@ def _get_recent_ipos() -> List[str]:
             logger.warning("NSE IPO API returned status %d", resp.status_code)
     except Exception as e:
         logger.warning("Failed to fetch recent IPOs: %s", e)
-
     if not symbols:
         fallback = ["JIOFIN", "BLUESTONE", "CUPID", "IREDA", "RVNL", "HUDCO", "RAILTEL", "IRFC", "ZOMATO", "NYKAA", "PAYTM"]
         symbols = fallback
-
     _redis_set(IPO_CACHE_KEY, symbols, ttl=86400)
     return symbols
 
@@ -237,7 +237,6 @@ def _get_all_known_symbols() -> Set[str]:
     cached = _redis_get(KNOWN_SYMBOLS_KEY)
     if cached:
         return set(cached)
-
     combined = set(BASE_UNIVERSE)
     combined.update(_load_watchlist())
     combined.update(_load_searched())
@@ -248,17 +247,14 @@ def _get_all_known_symbols() -> Set[str]:
             combined.update(target)
         else:
             combined.add(target)
-
     scan_universe = _redis_get(SCAN_UNIVERSE_KEY)
     if scan_universe:
         combined.update(scan_universe)
-
     cleaned = set()
     for s in combined:
         s = s.upper().replace(".NS", "").replace(".BO", "")
         if s:
             cleaned.add(s)
-
     _redis_set(KNOWN_SYMBOLS_KEY, list(cleaned), ttl=21600)
     return cleaned
 
@@ -266,17 +262,14 @@ def _resolve_symbol(misspelled: str) -> Optional[str]:
     if not misspelled:
         return None
     symbol = misspelled.upper().replace(".NS", "").replace(".BO", "")
-
     if symbol in SYMBOL_ALIASES:
         alias = SYMBOL_ALIASES[symbol]
         if isinstance(alias, list):
             return alias[0]
         return alias
-
     known = _get_all_known_symbols()
     if symbol in known:
         return symbol
-
     matches = difflib.get_close_matches(symbol, known, n=1, cutoff=0.7)
     if matches:
         return matches[0]
@@ -294,7 +287,6 @@ def _generate_summary(data: dict) -> str:
     holding = data.get("holding_period")
     reasons = data.get("reasons", {})
     close = data.get("close")
-
     if decision == "BUY NOW":
         summary = f"🚀 {symbol} अभी खरीदने का बहुत अच्छा मौका है! "
         summary += f"एंट्री {entry.get('low')}-{entry.get('high')}, टारगेट {target}, स्टॉप लॉस {stop}. "
@@ -330,14 +322,12 @@ def _build_scan_universe() -> List[str]:
     cached = _redis_get(SCAN_UNIVERSE_KEY)
     if cached:
         return cached
-
     universe = set(BASE_UNIVERSE)
     universe.update(_load_watchlist())
     universe.update(_load_searched())
     universe.update(_get_momentum_movers())
     universe.update(_get_news_mentioned_symbols())
     universe.update(_get_recent_ipos())
-
     clean = []
     seen = set()
     for s in universe:
@@ -345,7 +335,6 @@ def _build_scan_universe() -> List[str]:
         if s and s not in seen:
             seen.add(s)
             clean.append(s)
-
     result = clean[:120]
     _redis_set(SCAN_UNIVERSE_KEY, result, ttl=21600)
     return result
@@ -363,14 +352,12 @@ class NotificationChannelUpdate(BaseModel):
 
 # ── Asynchronous scan with progress ──────────────────────────────────────
 async def run_scan_async(task_id: str, universe: List[str]):
-    """Background task to run scan and update progress in Redis."""
     start_time = time.time()
     results = []
     errors = []
     total = len(universe)
     processed = 0
 
-    # Initial state
     _redis_set(SCAN_TASK_PREFIX + task_id, {
         "status": "running",
         "total": total,
@@ -391,10 +378,8 @@ async def run_scan_async(task_id: str, universe: List[str]):
             except httpx.HTTPError as e:
                 logger.warning("Scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})
-
             processed += 1
             elapsed = round(time.time() - start_time, 1)
-            # Update progress every 5 stocks or every 2 seconds (whichever)
             if processed % 5 == 0 or processed == total:
                 _redis_set(SCAN_TASK_PREFIX + task_id, {
                     "status": "running",
@@ -405,7 +390,6 @@ async def run_scan_async(task_id: str, universe: List[str]):
                     "error": None,
                 }, ttl=3600)
 
-    # Sort and compute final result
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = actionable[:5]
@@ -446,7 +430,6 @@ async def run_scan_async(task_id: str, universe: List[str]):
         "errors": errors,
     }
 
-    # Store final result
     _redis_set(SCAN_TASK_PREFIX + task_id, {
         "status": "done",
         "total": total,
@@ -682,7 +665,6 @@ def run_scan(force_refresh: bool = False):
 # ── Async scan endpoints ──────────────────────────────────────────────────
 @app.post("/scan/start")
 def start_scan(force_refresh: bool = False):
-    """Start an asynchronous scan and return a task ID."""
     if force_refresh and _redis:
         try:
             _redis.delete(SCAN_UNIVERSE_KEY)
@@ -691,18 +673,14 @@ def start_scan(force_refresh: bool = False):
 
     universe = _build_scan_universe()
     task_id = str(uuid.uuid4())
-    # Start background task
     asyncio.create_task(run_scan_async(task_id, universe))
     return {"task_id": task_id}
 
 @app.get("/scan/status/{task_id}")
 def get_scan_status(task_id: str):
-    """Get progress or result of an async scan task."""
     data = _redis_get(SCAN_TASK_PREFIX + task_id)
     if not data:
         raise HTTPException(status_code=404, detail="Task not found or expired")
-
-    # Compute estimated remaining time if running
     if data.get("status") == "running":
         processed = data.get("processed", 0)
         total = data.get("total", 0)
@@ -714,7 +692,6 @@ def get_scan_status(task_id: str):
             data["estimated_remaining"] = estimated_remaining
         else:
             data["estimated_remaining"] = None
-
     return data
 
 # ── Universe preview endpoints ──────────────────────────────────────────────
