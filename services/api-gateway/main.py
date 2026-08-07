@@ -3,7 +3,7 @@ API Gateway
 ------------
 Single entry point for the React frontend.
 Includes async scan with progress (via BackgroundTasks), symbol correction,
-Hinglish summaries, and manual CORS headers.
+Hinglish summaries, market movers endpoints, and manual CORS headers.
 """
 import os
 import json
@@ -439,6 +439,100 @@ async def run_scan_async(task_id: str, universe: List[str]):
         "error": None,
     }, ttl=3600)
 
+# ── Real-time Market Movers ──────────────────────────────────────────────
+def _get_nifty50_data() -> List[dict]:
+    """Get real-time price and volume data for Nifty 50 stocks."""
+    nifty50_symbols = [
+        "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS", "AXISBANK.NS",
+        "BAJAJ-AUTO.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS", "BHARTIARTL.NS", "BPCL.NS",
+        "BRITANNIA.NS", "CIPLA.NS", "COALINDIA.NS", "DIVISLAB.NS", "DRREDDY.NS",
+        "EICHERMOT.NS", "GRASIM.NS", "HCLTECH.NS", "HDFCBANK.NS", "HDFCLIFE.NS",
+        "HEROMOTOCO.NS", "HINDALCO.NS", "HINDUNILVR.NS", "ICICIBANK.NS", "ITC.NS",
+        "INDUSINDBK.NS", "INFY.NS", "JSWSTEEL.NS", "KOTAKBANK.NS", "LT.NS",
+        "LTIM.NS", "M&M.NS", "MARUTI.NS", "NESTLEIND.NS", "NTPC.NS",
+        "ONGC.NS", "POWERGRID.NS", "RELIANCE.NS", "SBILIFE.NS", "SBIN.NS",
+        "SHRIRAMFIN.NS", "SUNPHARMA.NS", "TATACONSUM.NS", "TATAMOTORS.NS", "TATASTEEL.NS",
+        "TCS.NS", "TRENT.NS", "TITAN.NS", "ULTRACEMCO.NS", "WIPRO.NS"
+    ]
+    data = []
+    for sym in nifty50_symbols:
+        try:
+            ticker = yf.Ticker(sym)
+            hist = ticker.history(period="1d", interval="1m")
+            if hist.empty:
+                continue
+            latest = hist.iloc[-1]
+            prev_close = hist.iloc[0]["Close"]
+            change_pct = (latest["Close"] - prev_close) / prev_close * 100
+            data.append({
+                "symbol": sym.replace(".NS", ""),
+                "price": round(latest["Close"], 2),
+                "change": round(latest["Close"] - prev_close, 2),
+                "change_pct": round(change_pct, 2),
+                "volume": int(latest["Volume"]),
+                "high": round(latest["High"], 2),
+                "low": round(latest["Low"], 2),
+            })
+        except Exception as e:
+            logger.warning(f"Could not fetch {sym}: {e}")
+    return data
+
+# Cache for market data (5 minutes)
+CACHE_TTL = 300
+_market_cache = {}
+
+def _get_cached_market_data(key: str, fetch_func):
+    now = time.time()
+    if key in _market_cache and _market_cache[key]["expires"] > now:
+        return _market_cache[key]["data"]
+    data = fetch_func()
+    _market_cache[key] = {"data": data, "expires": now + CACHE_TTL}
+    return data
+
+# ── Market Routes ──────────────────────────────────────────────────────────
+@app.get("/market/top-gainers")
+def market_top_gainers():
+    data = _get_cached_market_data("top_gainers", _get_nifty50_data)
+    sorted_data = sorted(data, key=lambda x: x["change_pct"], reverse=True)[:10]
+    return {"data": sorted_data, "count": len(sorted_data)}
+
+@app.get("/market/top-losers")
+def market_top_losers():
+    data = _get_cached_market_data("top_losers", _get_nifty50_data)
+    sorted_data = sorted(data, key=lambda x: x["change_pct"])[:10]
+    return {"data": sorted_data, "count": len(sorted_data)}
+
+@app.get("/market/most-active")
+def market_most_active():
+    data = _get_cached_market_data("most_active", _get_nifty50_data)
+    sorted_data = sorted(data, key=lambda x: x["volume"], reverse=True)[:10]
+    return {"data": sorted_data, "count": len(sorted_data)}
+
+@app.get("/market/trending")
+def market_trending():
+    # Combine momentum and news mentions
+    movers = _get_momentum_movers()
+    news = _get_news_mentioned_symbols()
+    trending = list(set(movers + news))
+    trending_data = []
+    for sym in trending[:10]:
+        try:
+            ticker = yf.Ticker(f"{sym}.NS")
+            hist = ticker.history(period="1d")
+            if not hist.empty:
+                price = round(hist["Close"].iloc[-1], 2)
+                change = round(hist["Close"].iloc[-1] - hist["Open"].iloc[-1], 2)
+                change_pct = round(change / hist["Open"].iloc[-1] * 100, 2)
+                trending_data.append({
+                    "symbol": sym,
+                    "price": price,
+                    "change": change,
+                    "change_pct": change_pct,
+                })
+        except:
+            pass
+    return {"data": trending_data, "count": len(trending_data)}
+
 # ── Routes ──────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -459,6 +553,10 @@ def root():
             "/scan/universe": "GET – preview current scan universe",
             "/scan/universe/cache": "DELETE – clear universe cache",
             "/searched": "GET – list searched symbols",
+            "/market/top-gainers": "GET – top 10 gainers",
+            "/market/top-losers": "GET – top 10 losers",
+            "/market/most-active": "GET – top 10 most active by volume",
+            "/market/trending": "GET – trending stocks (momentum + news)",
             "/notifications/health": "GET – notification service health",
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",

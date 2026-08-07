@@ -73,6 +73,21 @@ export interface ScanStatus {
   error?: string;
 }
 
+export interface MarketStock {
+  symbol: string;
+  price: number;
+  change: number;
+  change_pct: number;
+  volume?: number;
+  high?: number;
+  low?: number;
+}
+
+export interface MarketResponse {
+  data: MarketStock[];
+  count: number;
+}
+
 export interface NotificationChannelStatus {
   configured: boolean;
   enabled: boolean;
@@ -102,11 +117,6 @@ export interface SystemHealth {
   services: Record<string, SystemServiceStatus>;
 }
 
-/**
- * Fetch wrapper with timeout and automatic retry.
- * Retries up to 2 times on network errors or 5xx responses.
- * Timeout per request: 30 seconds.
- */
 async function request<T>(path: string, init?: RequestInit, retries = 2): Promise<T> {
   const base = getApiUrl();
   if (!base) {
@@ -152,6 +162,7 @@ async function request<T>(path: string, init?: RequestInit, retries = 2): Promis
 
 /** Helper to wake a service by its URL (used by wake buttons) */
 export async function wakeService(url: string): Promise<void> {
+  if (!url) return;
   try {
     await fetch(url + "/health", { mode: "no-cors" });
   } catch {
@@ -167,10 +178,8 @@ export const api = {
   getStock: (symbol: string, alreadyOwned = false) =>
     request<Decision>(`/stock/${symbol}?already_owned=${alreadyOwned}`),
 
-  // Synchronous scan (legacy)
   runScan: () => request<ScanResult>("/scan"),
 
-  // Asynchronous scan with progress
   scanStart: (forceRefresh = false) =>
     request<{ task_id: string }>(`/scan/start?force_refresh=${forceRefresh}`, { method: "POST" }),
 
@@ -185,6 +194,11 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ symbols }),
     }),
+
+  marketTopGainers: () => request<MarketResponse>("/market/top-gainers"),
+  marketTopLosers: () => request<MarketResponse>("/market/top-losers"),
+  marketMostActive: () => request<MarketResponse>("/market/most-active"),
+  marketTrending: () => request<MarketResponse>("/market/trending"),
 
   getNotificationConfig: () => request<NotificationConfig>("/notifications/config"),
 

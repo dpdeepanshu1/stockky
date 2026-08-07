@@ -11,7 +11,7 @@ export default function ScanPanel({ result, onSelect, onBack }: Props) {
   const allSorted = [...result.all_results].sort((a, b) => b.combined_score - a.combined_score);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 animate-fadeIn">
       <div className="flex items-center justify-between">
         <button
           onClick={onBack}
@@ -19,16 +19,39 @@ export default function ScanPanel({ result, onSelect, onBack }: Props) {
         >
           ← Back
         </button>
-        <span className="font-mono text-xs text-mist">{result.scanned} stocks scanned</span>
+        <div className="text-right">
+          <div className="font-mono text-xs text-mist/60">
+            Scanned {result.scanned} stocks · {result.universe_size} in universe
+          </div>
+          <div className="font-mono text-xs text-mist/60">
+            {result.market_stats.buy_signals} BUY · {result.market_stats.sell_signals} SELL · {result.market_stats.hold_signals} HOLD
+          </div>
+        </div>
       </div>
 
       {/* Verdict banner */}
       {result.recommendations.length === 0 ? (
-        <div className="rounded-2xl border border-slate bg-graphite p-10 text-center">
+        <div className="rounded-2xl border border-slate bg-graphite/50 p-10 text-center">
           <div className="font-display text-4xl text-signal-avoid mb-3">DO NOT BUY ANY STOCK TODAY</div>
           <p className="text-mist text-sm max-w-md mx-auto">
             {result.scanned} stocks scanned. None cleared the conviction bar today. Waiting is the decision.
           </p>
+          {result.watchlist_candidates.length > 0 && (
+            <div className="mt-6">
+              <p className="text-mist/60 text-sm mb-2">But these are worth watching:</p>
+              <div className="flex flex-wrap justify-center gap-3">
+                {result.watchlist_candidates.slice(0, 5).map((d) => (
+                  <button
+                    key={d.symbol}
+                    onClick={() => onSelect(d.symbol)}
+                    className="font-mono text-sm border border-slate/60 px-4 py-2 rounded-lg hover:border-mist/60 hover:text-paper transition"
+                  >
+                    {d.symbol} <span className="text-mist/50">({d.combined_score})</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       ) : (
         <>
@@ -39,6 +62,18 @@ export default function ScanPanel({ result, onSelect, onBack }: Props) {
             ))}
           </div>
         </>
+      )}
+
+      {/* Watchlist candidates (fallback when no recommendations, but shown as separate section if any) */}
+      {result.recommendations.length === 0 && result.watchlist_candidates.length > 0 && (
+        <div className="mt-6">
+          <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">Watchlist Candidates</div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {result.watchlist_candidates.slice(0, 6).map((d) => (
+              <CandidateCard key={d.symbol} data={d} onSelect={onSelect} />
+            ))}
+          </div>
+        </div>
       )}
 
       {/* Full results table */}
@@ -121,5 +156,26 @@ function TopPick({ rank, data, onSelect }: { rank: number; data: Decision; onSel
         View full analysis →
       </div>
     </button>
+  );
+}
+
+function CandidateCard({ data, onSelect }: { data: Decision; onSelect: (s: string) => void }) {
+  const style = decisionStyle[data.decision];
+  return (
+    <div
+      onClick={() => onSelect(data.symbol)}
+      className="border border-slate/60 bg-graphite/30 rounded-xl p-4 hover:border-mist/60 cursor-pointer transition-all duration-300 hover:shadow-glow-sm"
+    >
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="font-mono text-sm text-paper">{data.symbol}</div>
+          <div className={`font-display text-lg ${style.color}`}>{data.decision}</div>
+        </div>
+        <div className="text-right">
+          <div className="text-sm font-mono text-paper">₹{data.close.toLocaleString("en-IN")}</div>
+          <div className="text-xs text-mist/60">Score: {data.combined_score}</div>
+        </div>
+      </div>
+    </div>
   );
 }

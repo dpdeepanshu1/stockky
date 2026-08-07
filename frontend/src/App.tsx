@@ -6,6 +6,8 @@ import ScanPanel from "./components/ScanPanel";
 import WatchlistManager from "./components/WatchlistManager";
 import NotificationsPanel from "./components/NotificationsPanel";
 import SystemCheck from "./components/SystemCheck";
+import MarketMovers from "./components/MarketMovers";
+
 
 type ViewState =
   | { mode: "idle" }
@@ -276,6 +278,11 @@ export default function App() {
                   Run market scan
                 </button>
               </div>
+  // ... inside the dashboard view, after the hero section:
+
+           <section className="mb-8">
+              <MarketMovers onSelect={handleSearch} />
+           </section>            
 
               {/* Quick watchlist chips */}
               {watchlist.length > 0 && view.mode === "idle" && (
