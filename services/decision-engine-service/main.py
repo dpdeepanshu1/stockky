@@ -124,45 +124,68 @@ def _decide(technical_score: int, fundamental_score: int, news_score: int | None
 
 @app.get("/decide/{symbol}")
 async def decide(symbol: str, already_owned: bool = False):
+    # Initialize default dicts early
+    technical = {
+        "technical_score": 50,
+        "trend_strength": "unknown",
+        "volume_surge": False,
+        "close": None,
+        "support": None,
+        "resistance": None,
+        "reasons": ["Technical data unavailable"],
+    }
+    fundamental = {
+        "fundamental_score": 50,
+        "valuation": "fair",
+        "sector": None,
+        "reasons": ["Fundamental data unavailable"],
+        "metrics": {},
+        "fallback_used": True
+    }
+    news = None
+    prediction = None
+    events = None
+
     try:
         async with httpx.AsyncClient(timeout=70) as client:
-            # Technical: handle missing data gracefully
+            # Fetch technical analysis
             try:
                 technical_resp = await client.get(f"{TECHNICAL_URL}/analyze/{symbol}", timeout=70)
                 technical_resp.raise_for_status()
                 technical = technical_resp.json()
-                # If technical returned data_insufficient, still use it
-                if technical.get("data_insufficient"):
-                    logger.info(f"Technical data insufficient for {symbol}, using default values")
+                if not isinstance(technical, dict):
+                    technical = {
+                        "technical_score": 50,
+                        "trend_strength": "unknown",
+                        "volume_surge": False,
+                        "close": None,
+                        "support": None,
+                        "resistance": None,
+                        "reasons": ["Technical data invalid format"],
+                    }
             except Exception as e:
                 logger.warning(f"Technical analysis failed for {symbol}, using default: {e}")
-                technical = {
-                    "technical_score": 50,
-                    "trend_strength": "unknown",
-                    "volume_surge": False,
-                    "close": None,
-                    "support": None,
-                    "resistance": None,
-                    "reasons": ["Technical data temporarily unavailable"],
-                }
+                # technical already has default
 
-            # Fundamental: catch any exception and use default
+            # Fetch fundamental analysis
             try:
                 fundamental_resp = await client.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=70)
                 fundamental_resp.raise_for_status()
                 fundamental = fundamental_resp.json()
+                if not isinstance(fundamental, dict):
+                    fundamental = {
+                        "fundamental_score": 50,
+                        "valuation": "fair",
+                        "sector": None,
+                        "reasons": ["Fundamental data invalid format"],
+                        "metrics": {},
+                        "fallback_used": True
+                    }
             except Exception as e:
                 logger.warning(f"Fundamental analysis failed for {symbol}, using default: {e}")
-                fundamental = {
-                    "fundamental_score": 50,
-                    "valuation": "fair",
-                    "sector": None,
-                    "reasons": ["Fundamental data temporarily unavailable"],
-                    "metrics": {},
-                    "fallback_used": True
-                }
+                # fundamental already has default
 
-            # Optional services
+            # Fetch optional services
             news_task = _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
             prediction_task = _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
             events_task = _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
@@ -171,10 +194,11 @@ async def decide(symbol: str, already_owned: bool = False):
                 news_task, prediction_task, events_task
             )
 
+        # Now process the data
         technical_score = technical.get("technical_score", 50)
         fundamental_score = fundamental.get("fundamental_score", 50)
-        news_score = news["news_score"] if news else None
-        prediction_score = prediction["prediction_score"] if prediction and prediction.get("model_loaded") else None
+        news_score = news.get("news_score") if news else None
+        prediction_score = prediction.get("prediction_score") if prediction and prediction.get("model_loaded") else None
         fundamental_metrics = fundamental.get("metrics")
 
         close = technical.get("close")
@@ -190,7 +214,7 @@ async def decide(symbol: str, already_owned: bool = False):
 
         event_risk = False
         event_reason = None
-        if events and events.get("next_earnings_date"):
+        if events and isinstance(events, dict) and events.get("next_earnings_date"):
             try:
                 from datetime import datetime
                 earnings_date = datetime.fromisoformat(events["next_earnings_date"][:10])
@@ -225,10 +249,10 @@ async def decide(symbol: str, already_owned: bool = False):
             "technical": technical.get("reasons", ["No technical data"]),
             "fundamental": fundamental.get("reasons", ["No fundamental data"]),
         }
-        if news:
-            reasons["news"] = news["reasons"]
-        if prediction and prediction.get("model_loaded"):
-            reasons["prediction"] = [prediction["note"]]
+        if news and isinstance(news, dict):
+            reasons["news"] = news.get("reasons", ["No news data"])
+        if prediction and isinstance(prediction, dict) and prediction.get("model_loaded"):
+            reasons["prediction"] = [prediction.get("note", "Prediction available")]
         if event_reason:
             reasons["event"] = [event_reason]
 
@@ -254,10 +278,11 @@ async def decide(symbol: str, already_owned: bool = False):
             "sector": fundamental.get("sector"),
         }
 
-        if fundamental_metrics:
+        if fundamental_metrics and isinstance(fundamental_metrics, dict):
             response["fundamental_metrics"] = fundamental_metrics
 
         return response
+
     except Exception as e:
         logger.error(f"Decision failed for {symbol}: {e}")
         raise HTTPException(status_code=502, detail=f"Decision failed: {str(e)}")
