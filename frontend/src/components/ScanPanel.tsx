@@ -5,7 +5,7 @@ interface Props {
   result: ScanResult;
   onSelect: (symbol: string) => void;
   onBack: () => void;
-  onAddToWatchlist: (symbol: string) => void; // NEW
+  onAddToWatchlist: (symbol: string) => void;
 }
 
 export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist }: Props) {
@@ -71,7 +71,7 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist }
         </>
       )}
 
-      {/* Watchlist candidates (fallback when no recommendations, but shown as separate section if any) */}
+      {/* Watchlist candidates (fallback) */}
       {result.recommendations.length === 0 && result.watchlist_candidates.length > 0 && (
         <div className="mt-6">
           <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">Watchlist Candidates</div>
@@ -107,7 +107,9 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist }
                     <td className="px-4 py-3 text-paper font-semibold">{r.symbol}</td>
                     <td className={`px-4 py-3 text-xs ${style.color}`}>{r.decision}</td>
                     <td className="px-4 py-3 text-right text-mist">{r.combined_score}</td>
-                    <td className="px-4 py-3 text-right text-paper">₹{r.close.toLocaleString("en-IN")}</td>
+                    <td className="px-4 py-3 text-right text-paper">
+                      {r.close != null ? `₹${r.close.toLocaleString("en-IN")}` : "N/A"}
+                    </td>
                     <td className="px-4 py-3 text-right text-mist hidden md:table-cell">{r.technical_score}</td>
                     <td className="px-4 py-3 text-right text-mist hidden md:table-cell">{r.fundamental_score}</td>
                     <td className="px-4 py-3 text-right">
@@ -152,7 +154,7 @@ function TopPick({
   onAddToWatchlist: (s: string) => void;
 }) {
   const style = decisionStyle[data.decision];
-  const upside = (((data.target - data.close) / data.close) * 100).toFixed(1);
+  const upside = data.close != null && data.target != null ? (((data.target - data.close) / data.close) * 100).toFixed(1) : "N/A";
 
   return (
     <button
@@ -166,7 +168,7 @@ function TopPick({
       <div className="font-mono text-sm text-mist mb-1">{data.symbol}</div>
       <div className={`font-display text-2xl ${style.color} mb-3`}>{data.decision}</div>
       <div className="flex justify-between font-mono text-xs text-mist">
-        <span>₹{data.close.toLocaleString("en-IN")}</span>
+        <span>{data.close != null ? `₹${data.close.toLocaleString("en-IN")}` : "N/A"}</span>
         <span>Score {data.combined_score}/100</span>
       </div>
       <div className="mt-3 pt-3 border-t border-slate/40 flex items-center justify-between">
@@ -205,7 +207,7 @@ function CandidateCard({
           <div className={`font-display text-lg ${style.color}`}>{data.decision}</div>
         </div>
         <div className="text-right">
-          <div className="text-sm font-mono text-paper">₹{data.close.toLocaleString("en-IN")}</div>
+          <div className="text-sm font-mono text-paper">{data.close != null ? `₹${data.close.toLocaleString("en-IN")}` : "N/A"}</div>
           <div className="text-xs text-mist/60">Score: {data.combined_score}</div>
         </div>
       </div>

@@ -20,7 +20,7 @@ export default function DecisionCard({ data, onBack }: Props) {
 
   const metrics = data.fundamental_metrics;
   const hasMetrics = metrics && Object.values(metrics).some(v => v != null);
-  const hasPriceData = data.close != null && data.close !== undefined;
+  const hasPrice = data.close != null;
 
   return (
     <div className="space-y-4">
@@ -46,22 +46,14 @@ export default function DecisionCard({ data, onBack }: Props) {
             <p className="text-mist text-sm">{style.verb} · {data.confidence} confidence</p>
           </div>
 
-          {hasPriceData && (
-            <div className="text-right font-mono">
-              <div className="text-4xl text-paper">₹{data.close.toLocaleString("en-IN")}</div>
-              <div className="text-xs text-mist/60 mt-1">
-                Combined {data.combined_score}/100
-              </div>
+          <div className="text-right font-mono">
+            <div className="text-4xl text-paper">
+              {hasPrice ? `₹${data.close!.toLocaleString("en-IN")}` : "N/A"}
             </div>
-          )}
-          {!hasPriceData && (
-            <div className="text-right font-mono">
-              <div className="text-sm text-mist/60">Price data unavailable</div>
-              <div className="text-xs text-mist/60 mt-1">
-                Combined {data.combined_score}/100
-              </div>
+            <div className="text-xs text-mist/60 mt-1">
+              Combined {data.combined_score}/100
             </div>
-          )}
+          </div>
         </div>
 
         {/* Event risk banner */}
@@ -73,20 +65,21 @@ export default function DecisionCard({ data, onBack }: Props) {
         )}
 
         {/* Trade levels */}
-        {isBullish && hasPriceData && (
+        {isBullish && data.entry_range && hasPrice && (
           <div className="grid grid-cols-3 gap-4 mt-8 pt-6 border-t border-slate/40">
             <div>
               <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-1">Entry range</div>
               <div className="font-mono text-sm text-paper">
-                {data.entry_range ? `₹${data.entry_range.low.toLocaleString("en-IN")} – ₹${data.entry_range.high.toLocaleString("en-IN")}` : "N/A"}
+                ₹{data.entry_range.low?.toLocaleString("en-IN") ?? "N/A"} – 
+                ₹{data.entry_range.high?.toLocaleString("en-IN") ?? "N/A"}
               </div>
             </div>
             <div>
               <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-1">Target</div>
               <div className="font-mono text-sm text-signal-buy">
-                {data.target ? `₹${data.target.toLocaleString("en-IN")}` : "N/A"}
+                ₹{data.target?.toLocaleString("en-IN") ?? "N/A"}
               </div>
-              {data.target && data.close && (
+              {data.target != null && data.close != null && data.close !== 0 && (
                 <div className="font-mono text-[10px] text-mist/50 mt-0.5">
                   +{(((data.target - data.close) / data.close) * 100).toFixed(1)}%
                 </div>
@@ -95,9 +88,9 @@ export default function DecisionCard({ data, onBack }: Props) {
             <div>
               <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-1">Stop loss</div>
               <div className="font-mono text-sm text-signal-sell">
-                {data.stop_loss ? `₹${data.stop_loss.toLocaleString("en-IN")}` : "N/A"}
+                ₹{data.stop_loss?.toLocaleString("en-IN") ?? "N/A"}
               </div>
-              {data.stop_loss && data.close && (
+              {data.stop_loss != null && data.close != null && data.close !== 0 && (
                 <div className="font-mono text-[10px] text-mist/50 mt-0.5">
                   -{(((data.close - data.stop_loss) / data.close) * 100).toFixed(1)}%
                 </div>
@@ -111,10 +104,10 @@ export default function DecisionCard({ data, onBack }: Props) {
       <div className="grid grid-cols-2 gap-4">
         <div className="rounded-xl border border-slate bg-graphite p-5">
           <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">Price levels</div>
-          {hasPriceData && data.support != null && data.resistance != null ? (
-            <PriceLevelBar close={data.close} support={data.support} resistance={data.resistance} />
+          {hasPrice && data.support != null && data.resistance != null ? (
+            <PriceLevelBar close={data.close!} support={data.support} resistance={data.resistance} />
           ) : (
-            <p className="text-sm text-mist/40 italic">Insufficient data for price levels</p>
+            <p className="text-sm text-mist/60 italic">Insufficient data for price levels</p>
           )}
         </div>
         <div className="rounded-xl border border-slate bg-graphite p-5">
@@ -164,7 +157,9 @@ export default function DecisionCard({ data, onBack }: Props) {
               )}
             </div>
           ) : (
-            <p className="text-sm text-mist/60 italic">No fundamental metrics available for this symbol. The score is based on limited available data.</p>
+            <p className="text-sm text-mist/60 italic">
+              No fundamental metrics available for this symbol. The score is based on limited available data.
+            </p>
           )}
         </div>
       )}
@@ -182,7 +177,7 @@ export default function DecisionCard({ data, onBack }: Props) {
       </div>
 
       {/* Holding period */}
-      {data.holding_period && data.holding_period !== "N/A" && (
+      {data.holding_period !== "N/A" && (
         <div className="rounded-xl border border-slate bg-graphite px-5 py-4 font-mono text-xs text-mist flex justify-between">
           <span className="uppercase tracking-widest">Suggested holding period</span>
           <span className="text-paper">{data.holding_period}</span>
@@ -190,19 +185,19 @@ export default function DecisionCard({ data, onBack }: Props) {
       )}
 
       {/* Natural-language Hinglish summary */}
-      <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
-        <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
-          💬 Final Remarks
-        </h4>
-        <p className="text-sm text-paper/90 leading-relaxed">
-          {data.natural_language_summary}
-        </p>
-      </div>
+      {data.natural_language_summary && (
+        <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
+          <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
+            💬 Final Remarks
+          </h4>
+          <p className="text-sm text-paper/90 leading-relaxed">
+            {data.natural_language_summary}
+          </p>
+        </div>
+      )}
     </div>
   );
 }
-
-// ... (all helper components remain the same)
 
 function PriceLevelBar({ close, support, resistance }: { close: number; support: number; resistance: number }) {
   const range = resistance - support;
