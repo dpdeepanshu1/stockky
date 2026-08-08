@@ -404,6 +404,7 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
         },
         "valuation": "fair",
         "sector": None,
+        "data_insufficient": False,
         "fundamental_metrics": None,
     }
     merged = {**default, **raw}
@@ -446,18 +447,31 @@ def _fetch_fundamental_metrics(symbol: str) -> Optional[dict]:
         logger.warning(f"Fundamental fetch failed for {symbol}: {e}")
     return None
 
-def _fetch_quote_and_metrics(symbol: str):
-    """Fetch both price and metrics in one shot (used in scans)."""
-    price = None
-    metrics = None
-    
-    # Try price first
-    price = _fetch_price_from_quote(symbol)
-    
-    # Try metrics
-    metrics = _fetch_fundamental_metrics(symbol)
-    
-    return price, metrics
+def _fetch_news(symbol: str) -> Optional[dict]:
+    """Fetch news from news intelligence service."""
+    try:
+        resp = httpx.get(f"{NEWS_URL}/analyze/{symbol}", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and isinstance(data, dict):
+                logger.info(f"News fallback for {symbol}")
+                return data
+    except Exception as e:
+        logger.warning(f"News fetch failed for {symbol}: {e}")
+    return None
+
+def _fetch_events(symbol: str) -> Optional[dict]:
+    """Fetch events from event tracker service."""
+    try:
+        resp = httpx.get(f"{EVENT_URL}/events/{symbol}", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and isinstance(data, dict):
+                logger.info(f"Events fallback for {symbol}")
+                return data
+    except Exception as e:
+        logger.warning(f"Events fetch failed for {symbol}: {e}")
+    return None
 
 # ── Hinglish summary ──────────────────────────────────────────────────────
 def _generate_summary(data) -> str:
@@ -559,7 +573,7 @@ async def run_scan_async(task_id: str, universe: List[str]):
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
-                # If close is missing or data_insufficient flag is present, fetch price
+                # Fallbacks
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -569,11 +583,27 @@ async def run_scan_async(task_id: str, universe: List[str]):
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                # If fundamental_metrics is missing, fetch it
                 if not normalized.get("fundamental_metrics"):
                     metrics = _fetch_fundamental_metrics(symbol)
                     if metrics:
                         normalized["fundamental_metrics"] = metrics
+
+                if normalized.get("news_score") is None:
+                    news = _fetch_news(symbol)
+                    if news:
+                        normalized["news_score"] = news.get("news_score")
+                        reasons = normalized.get("reasons", {})
+                        if news.get("reasons"):
+                            reasons["news"] = news["reasons"]
+                            normalized["reasons"] = reasons
+
+                if normalized.get("event_risk") is False and normalized.get("reasons", {}).get("event") is None:
+                    events = _fetch_events(symbol)
+                    if events and events.get("next_earnings_date"):
+                        normalized["event_risk"] = True
+                        reasons = normalized.get("reasons", {})
+                        reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
+                        normalized["reasons"] = reasons
 
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
@@ -809,7 +839,7 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision (with robust fallbacks) ────────────────────────────────
+# ── Stock decision (with all fallbacks) ──────────────────────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
@@ -851,7 +881,6 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                     result["support"] = round(price * 0.95, 2)
                 if result.get("resistance") is None:
                     result["resistance"] = round(price * 1.05, 2)
-                logger.info(f"Price set to {price} for {symbol_to_use}")
 
         # --- Fallback: Fundamental Metrics ---
         if not result.get("fundamental_metrics"):
@@ -859,7 +888,27 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
             metrics = _fetch_fundamental_metrics(symbol_to_use)
             if metrics:
                 result["fundamental_metrics"] = metrics
-                logger.info(f"Fundamental metrics set for {symbol_to_use}")
+
+        # --- Fallback: News ---
+        if result.get("news_score") is None:
+            logger.info(f"News missing for {symbol_to_use}, fetching from news service...")
+            news = _fetch_news(symbol_to_use)
+            if news:
+                result["news_score"] = news.get("news_score")
+                reasons = result.get("reasons", {})
+                if news.get("reasons"):
+                    reasons["news"] = news["reasons"]
+                    result["reasons"] = reasons
+
+        # --- Fallback: Events ---
+        if result.get("event_risk") is False and not result.get("reasons", {}).get("event"):
+            logger.info(f"Events missing for {symbol_to_use}, fetching from event tracker...")
+            events = _fetch_events(symbol_to_use)
+            if events and events.get("next_earnings_date"):
+                result["event_risk"] = True
+                reasons = result.get("reasons", {})
+                reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
+                result["reasons"] = reasons
 
         if corrected_from:
             result["corrected_from"] = corrected_from
@@ -898,6 +947,7 @@ def run_scan(force_refresh: bool = False):
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
+                # Apply all fallbacks (same as in get_stock_decision)
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -911,6 +961,23 @@ def run_scan(force_refresh: bool = False):
                     metrics = _fetch_fundamental_metrics(symbol)
                     if metrics:
                         normalized["fundamental_metrics"] = metrics
+
+                if normalized.get("news_score") is None:
+                    news = _fetch_news(symbol)
+                    if news:
+                        normalized["news_score"] = news.get("news_score")
+                        reasons = normalized.get("reasons", {})
+                        if news.get("reasons"):
+                            reasons["news"] = news["reasons"]
+                            normalized["reasons"] = reasons
+
+                if normalized.get("event_risk") is False and not normalized.get("reasons", {}).get("event"):
+                    events = _fetch_events(symbol)
+                    if events and events.get("next_earnings_date"):
+                        normalized["event_risk"] = True
+                        reasons = normalized.get("reasons", {})
+                        reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
+                        normalized["reasons"] = reasons
 
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
@@ -1031,6 +1098,7 @@ def scan_watchlist():
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
+                # Apply all fallbacks
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -1044,6 +1112,23 @@ def scan_watchlist():
                     metrics = _fetch_fundamental_metrics(symbol)
                     if metrics:
                         normalized["fundamental_metrics"] = metrics
+
+                if normalized.get("news_score") is None:
+                    news = _fetch_news(symbol)
+                    if news:
+                        normalized["news_score"] = news.get("news_score")
+                        reasons = normalized.get("reasons", {})
+                        if news.get("reasons"):
+                            reasons["news"] = news["reasons"]
+                            normalized["reasons"] = reasons
+
+                if normalized.get("event_risk") is False and not normalized.get("reasons", {}).get("event"):
+                    events = _fetch_events(symbol)
+                    if events and events.get("next_earnings_date"):
+                        normalized["event_risk"] = True
+                        reasons = normalized.get("reasons", {})
+                        reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
+                        normalized["reasons"] = reasons
 
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)

@@ -91,6 +91,9 @@ def _combined_score(technical_score: int, fundamental_score: int, news_score: in
         weights = {"technical": 0.45, "fundamental": 0.35, "news": 0.20, "prediction": 0.0}
     elif prediction_score is not None:
         weights = {"technical": 0.40, "fundamental": 0.30, "news": 0.0, "prediction": 0.30}
+    else:
+        # Only technical and fundamental
+        weights = {"technical": 0.55, "fundamental": 0.45, "news": 0.0, "prediction": 0.0}
     total = technical_score * weights["technical"] + fundamental_score * weights["fundamental"]
     if news_score is not None:
         total += news_score * weights["news"]
@@ -102,7 +105,7 @@ def _decide(technical_score: int, fundamental_score: int, news_score: int | None
             trend_strength: str, volume_surge: bool, dist_to_resistance_pct: float, 
             event_risk: bool, already_owned: bool, data_insufficient: bool = False) -> Decision:
     
-    # ✅ NEW: If data is insufficient (e.g., newly listed stock), always return DO NOT BUY
+    # If data is insufficient (e.g., newly listed stock), always return DO NOT BUY
     if data_insufficient:
         return Decision.DO_NOT_BUY
     
@@ -132,7 +135,7 @@ def _decide(technical_score: int, fundamental_score: int, news_score: int | None
 async def decide(symbol: str, already_owned: bool = False):
     try:
         async with httpx.AsyncClient(timeout=70) as client:
-            # Technical: handle missing data gracefully
+            # Technical
             technical = {}
             data_insufficient = False
             try:
@@ -141,7 +144,6 @@ async def decide(symbol: str, already_owned: bool = False):
                 technical = technical_resp.json()
                 if not isinstance(technical, dict):
                     technical = {}
-                # Check for data_insufficient flag
                 if technical.get("data_insufficient"):
                     data_insufficient = True
                     logger.info(f"Technical data insufficient for {symbol}")
@@ -158,7 +160,7 @@ async def decide(symbol: str, already_owned: bool = False):
                 }
                 data_insufficient = True
 
-            # Fundamental: catch any exception and use default
+            # Fundamental
             fundamental = {}
             try:
                 fundamental_resp = await client.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=70)
@@ -177,14 +179,12 @@ async def decide(symbol: str, already_owned: bool = False):
                     "fallback_used": True
                 }
 
-            # Optional services
-            news_task = _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
-            prediction_task = _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
-            events_task = _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
-            
-            news, prediction, events = await asyncio.gather(
-                news_task, prediction_task, events_task
-            )
+            # News (optional)
+            news = await _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
+            # Events (optional)
+            events = await _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
+            # Prediction (optional)
+            prediction = await _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
 
         technical_score = technical.get("technical_score", 50)
         fundamental_score = fundamental.get("fundamental_score", 50)
@@ -203,6 +203,7 @@ async def decide(symbol: str, already_owned: bool = False):
         if close and resistance and resistance > 0:
             dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
 
+        # Event risk
         event_risk = False
         event_reason = None
         if events and isinstance(events, dict):
@@ -218,6 +219,7 @@ async def decide(symbol: str, already_owned: bool = False):
                 except (ValueError, TypeError):
                     pass
 
+        # Decision
         decision = _decide(technical_score, fundamental_score, news_score, prediction_score,
                            trend_strength, volume_surge, dist_to_resistance_pct,
                            event_risk, already_owned, data_insufficient)
@@ -269,11 +271,17 @@ async def decide(symbol: str, already_owned: bool = False):
             "reasons": reasons,
             "valuation": fundamental.get("valuation", "fair"),
             "sector": fundamental.get("sector"),
-            "data_insufficient": data_insufficient,  # Pass through to API gateway
+            "data_insufficient": data_insufficient,
         }
 
         if fundamental_metrics and isinstance(fundamental_metrics, dict):
             response["fundamental_metrics"] = fundamental_metrics
+
+        # Also pass through news and event raw data if needed
+        if news:
+            response["news_data"] = news.get("raw", {})
+        if events:
+            response["event_data"] = events
 
         return response
 

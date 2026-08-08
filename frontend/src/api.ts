@@ -38,11 +38,11 @@ export interface Decision {
   news_score: number | null;
   prediction_score: number | null;
   event_risk: boolean;
-  entry_range: { low: number | null; high: number | null } | null; // can be null
+  entry_range: { low: number | null; high: number | null } | null;
   target: number | null;
   stop_loss: number | null;
   holding_period: string;
-  close: number | null; // can be null (for newly listed stocks)
+  close: number | null;
   support: number | null;
   resistance: number | null;
   reasons: {
@@ -56,6 +56,7 @@ export interface Decision {
   sector: string | null;
   natural_language_summary?: string;
   fundamental_metrics?: FundamentalMetrics;
+  data_insufficient?: boolean;
 }
 
 export interface ScanResult {

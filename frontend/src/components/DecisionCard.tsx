@@ -11,16 +11,19 @@ export default function DecisionCard({ data, onBack }: Props) {
   const style = decisionStyle[data.decision] ?? decisionStyle["DO NOT BUY"];
   const isBullish = data.decision === "BUY NOW" || data.decision === "PREPARE TO BUY";
 
+  // Build score breakdown including news and prediction if available
   const scores = [
     { label: "Technical", value: data.technical_score },
     { label: "Fundamental", value: data.fundamental_score },
-    ...(data.news_score !== null ? [{ label: "News", value: data.news_score }] : []),
-    ...(data.prediction_score !== null ? [{ label: "AI Model", value: data.prediction_score }] : []),
+    ...(data.news_score !== null && data.news_score !== undefined ? [{ label: "News", value: data.news_score }] : []),
+    ...(data.prediction_score !== null && data.prediction_score !== undefined ? [{ label: "AI Model", value: data.prediction_score }] : []),
   ];
 
   const metrics = data.fundamental_metrics;
   const hasMetrics = metrics && Object.values(metrics).some(v => v != null);
   const hasPrice = data.close != null;
+  const hasNews = data.reasons.news && data.reasons.news.length > 0;
+  const hasEvent = data.reasons.event && data.reasons.event.length > 0;
 
   return (
     <div className="space-y-4">
@@ -164,16 +167,15 @@ export default function DecisionCard({ data, onBack }: Props) {
         </div>
       )}
 
-      {/* Reasons */}
+      {/* Reasons – including News and Event */}
       <div className="grid md:grid-cols-2 gap-4">
         <ReasonList title="Technical" items={data.reasons.technical} />
         <ReasonList title="Fundamental" items={data.reasons.fundamental} />
-        {data.reasons.news && data.reasons.news.length > 0 && (
-          <ReasonList title="News" items={data.reasons.news} />
-        )}
+        {hasNews && <ReasonList title="News" items={data.reasons.news!} />}
         {data.reasons.prediction && data.reasons.prediction.length > 0 && (
           <ReasonList title="AI Prediction" items={data.reasons.prediction} />
         )}
+        {hasEvent && <ReasonList title="Event Tracker" items={data.reasons.event!} />}
       </div>
 
       {/* Holding period */}
@@ -199,6 +201,7 @@ export default function DecisionCard({ data, onBack }: Props) {
   );
 }
 
+// Helper components (unchanged)
 function PriceLevelBar({ close, support, resistance }: { close: number; support: number; resistance: number }) {
   const range = resistance - support;
   const closePct = range > 0 ? ((close - support) / range) * 100 : 50;
