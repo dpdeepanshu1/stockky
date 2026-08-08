@@ -14,8 +14,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from llama_cpp import Llama
-# We import hf_hub_download to fallback if the build step fails, though it shouldn't
-from huggingface_hub import hf_hub_download 
+from huggingface_hub import hf_hub_download
 
 from features import latest_feature_vector, FEATURE_COLUMNS
 
@@ -49,13 +48,12 @@ try:
     )
     _llm = Llama(
         model_path=model_path,
-        n_ctx=512,      # Low context to keep memory usage under 300MB
-        n_threads=2,    # Render CPU thread limit
+        n_ctx=512,           # Low context to keep memory usage under 300MB
+        n_threads=None,      # Let Llama.cpp handle CPU threading automatically
         verbose=False
     )
     logger.info("GenAI model loaded successfully!")
 except Exception as e:
-    # We log the REPR of the error, so we'll see exactly what went wrong if it fails again
     logger.warning(f"Could not load GenAI model: {repr(e)}. Falling back to templated strings.")
 
 
