@@ -12,9 +12,10 @@ from typing import List
 from urllib.parse import quote
 
 import feedparser
+import torch # <--- FIX: Import torch for dtype
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from transformers import pipeline # <--- GenAI Import
+from transformers import pipeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("news-intelligence-service")
@@ -22,13 +23,15 @@ logger = logging.getLogger("news-intelligence-service")
 app = FastAPI(title="Stockky News Intelligence Service", version="0.2.0-genai")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Load the DistilBERT sentiment model (free, runs on CPU, ~67MB)
+# Load the DistilBERT sentiment model
 logger.info("Loading DistilBERT sentiment model...")
-# FIXED: Removed device_map="cpu" to avoid needing the 'accelerate' package.
-# The pipeline will default to CPU automatically, which is perfect for Render's free tier.
+
+# FIXED: Added torch_dtype=torch.float16 to reduce RAM usage by 50% and prevent Status 137 OOM.
 classifier = pipeline(
     "sentiment-analysis", 
-    model="distilbert-base-uncased-finetuned-sst-2-english"
+    model="distilbert-base-uncased-finetuned-sst-2-english",
+    device="cpu",
+    torch_dtype=torch.float16
 )
 logger.info("DistilBERT model loaded successfully!")
 
@@ -66,20 +69,17 @@ def _company_query(symbol: str) -> str:
 
 
 def _score_headline(title: str) -> float:
-    # GenAI Prediction: Use DistilBERT
     try:
         result = classifier(title)[0]
         label = result['label'] # 'POSITIVE' or 'NEGATIVE'
         confidence = result['score']
         
-        # Map to -1 to 1 scale
         base = confidence if label == "POSITIVE" else -confidence
     except Exception as e:
         logger.warning(f"Error in HuggingFace pipeline, falling back to 0 for title: {title[:30]}... Error: {e}")
         base = 0.0
         
     lowered = title.lower()
-    # Apply manual domain-specific adjustments for stocks
     if any(term in lowered for term in HIGH_IMPACT_NEGATIVE):
         base -= 0.4
     if any(term in lowered for term in HIGH_IMPACT_POSITIVE):
@@ -141,9 +141,8 @@ def analyze(symbol: str):
         }
 
     scored = [(_score_headline(h["title"]), h) for h in headlines]
-    avg_sentiment = sum(s for s, _ in scored) / len(scored)  # -1 .. +1
+    avg_sentiment = sum(s for s, _ in scored) / len(scored)
 
-    # Map -1..+1 sentiment to 0..100 score
     news_score = round((avg_sentiment + 1) * 50)
     news_score = max(0, min(100, news_score))
 
