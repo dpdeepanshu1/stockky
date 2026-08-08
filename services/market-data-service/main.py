@@ -88,6 +88,9 @@ UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 
+# NEW: Alpha Vantage fallback for IPO/new stocks
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
+
 app = FastAPI(title="Stockky Market Data Service", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -195,8 +198,42 @@ def get_quote(symbol: str):
         info = ticker.info
     except Exception:
         info = {}
+    
+    # UPDATED: If yfinance gives no info, try Alpha Vantage as a fallback
     if not info:
-        raise HTTPException(status_code=404, detail=f"No data for {sym}")
+        price = None
+        if ALPHA_VANTAGE_API_KEY:
+            try:
+                alpha_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={sym}&apikey={ALPHA_VANTAGE_API_KEY}"
+                alpha_resp = httpx.get(alpha_url, timeout=10)
+                if alpha_resp.status_code == 200:
+                    alpha_data = alpha_resp.json()
+                    quote = alpha_data.get("Global Quote", {})
+                    if quote:
+                        price = _safe(quote.get("05. price"))
+                        logger.info(f"Alpha Vantage fallback found price for {sym}: {price}")
+            except Exception as e:
+                logger.warning(f"Alpha Vantage fallback failed for {sym}: {e}")
+
+        if price is None:
+            raise HTTPException(status_code=404, detail=f"No data for {sym}")
+
+        # Construct minimal quote response
+        result = {
+            "symbol": sym,
+            "name": sym,
+            "price": price,
+            "previous_close": None,
+            "day_change_pct": None,
+            "day_high": None,
+            "day_low": None,
+            "volume": None,
+            "market_cap": None,
+            "pe_ratio": None,
+            "fetched_at": datetime.utcnow().isoformat(),
+        }
+        _cache_set(cache_key, result, ttl=300) # Cache fallback price for 5 mins to stay within limits
+        return result
 
     price = info.get("regularMarketPrice") or info.get("last_price")
     prev_close = info.get("previousClose")
@@ -271,8 +308,6 @@ def get_fundamentals_raw(symbol: str):
     cache_key = f"fundamentals:{sym}"
     cached = _cache_get(cache_key)
     if cached:
-        # If cached data has meaningful fields (not all null), return it
-        # But we'll still refresh in the background (not now, just return)
         return cached
 
     try:
@@ -469,12 +504,9 @@ def get_fundamentals_raw(symbol: str):
 
         logger.info(f"Fundamentals for {sym}: PE={pe_ratio}, ROE={roe}, Revenue growth={revenue_growth}")
 
-        # Store in fallback cache if we got any meaningful data
-        meaningful_fields = [
-            revenue_growth, earnings_growth, roe, debt_to_equity,
-            free_cashflow, profit_margins, pe_ratio,
-        ]
-        if any(v is not None for v in meaningful_fields):
+        # UPDATED: Store in fallback cache ONLY if we got *any* form of data (Info only or metrics)
+        # This prevents empty dicts from being returned on partial failures
+        if info or any(v is not None for v in [pe_ratio, sector, market_cap, revenue_growth, roe]):
             _fallback_set(cache_key, result)
 
         # Cache for 1 day (fundamentals change slowly)
@@ -490,7 +522,6 @@ def get_fundamentals_raw(symbol: str):
         stale = _fallback_get(cache_key)
         if stale:
             logger.info(f"Serving fallback fundamentals for {sym} (stale data)")
-            # Mark as stale
             stale = dict(stale)
             stale["stale"] = True
             _cache_set(cache_key, stale, ttl=1800)  # short TTL, retry soon

@@ -69,15 +69,16 @@ def analyze(symbol: str):
         f = {}
         fallback_used = True
 
-    # UPDATED: Check if we actually got meaningful data. If all primary metrics are None, treat as fallback!
+    # UPDATED: Only mark fallback_used if absolutely no metrics were returned.
+    # If a partial dict with e.g., pe_ratio or sector was returned, treat it as live data.
     primary_fields = [
         f.get("revenue_growth"), f.get("earnings_growth"), f.get("roe"), 
         f.get("debt_to_equity"), f.get("free_cashflow"), f.get("profit_margins"), 
         f.get("pe_ratio")
     ]
-    if not any(v is not None for v in primary_fields):
-        f = {}
-        fallback_used = True
+    if fallback_used or not any(v is not None for v in primary_fields):
+        if not f.get("sector") and not f.get("pe_ratio"):
+            fallback_used = True
 
     score = 50
     reasons = []
