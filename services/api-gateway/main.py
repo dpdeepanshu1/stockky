@@ -473,6 +473,14 @@ def _fetch_events(symbol: str) -> Optional[dict]:
         logger.warning(f"Events fetch failed for {symbol}: {e}")
     return None
 
+def _wake_notification_service() -> bool:
+    """Ping notification service to wake it up."""
+    try:
+        resp = httpx.get(f"{NOTIFICATION_URL}/health", timeout=5)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
 # ── Hinglish summary ──────────────────────────────────────────────────────
 def _generate_summary(data) -> str:
     if not data or not isinstance(data, dict):
@@ -530,12 +538,25 @@ def _send_scan_notification(recommendations: list, verdict: str, scanned: int, u
             close = r.get("close")
             target = r.get("target")
             stop_loss = r.get("stop_loss")
+            entry = r.get("entry_range") or {}
+            entry_low = entry.get("low")
+            entry_high = entry.get("high")
             lines.append(f"{i}. *{symbol}* – {decision} (Score: {combined_score})")
-            lines.append(f"   Price: ₹{close:.2f} | Target: ₹{target:.2f} | Stop: ₹{stop_loss:.2f}")
+            if close:
+                lines.append(f"   Current: ₹{close:.2f}")
+            if entry_low and entry_high:
+                lines.append(f"   Entry: ₹{entry_low:.2f} – ₹{entry_high:.2f}")
+            if target:
+                upside = ((target - close) / close * 100) if close else 0
+                lines.append(f"   Target: ₹{target:.2f} (+{upside:.1f}%)")
+            if stop_loss:
+                lines.append(f"   Stop: ₹{stop_loss:.2f}")
             lines.append("")
         message = "\n".join(lines)
 
     try:
+        # Wake notification service first
+        _wake_notification_service()
         resp = httpx.post(f"{NOTIFICATION_URL}/notify", json={
             "title": "Market Scan Complete",
             "message": message,
@@ -750,6 +771,7 @@ def root():
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
             "/notifications/test": "POST – test notifications",
+            "/notifications/send-picks": "POST – manually send picks to Telegram",
             "/docs": "Swagger UI documentation",
         },
     }
@@ -1283,6 +1305,70 @@ def test_notification_channels():
         return resp.json()
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
+
+# ── Manual Telegram notification endpoint ──────────────────────────────────
+@app.post("/notifications/send-picks")
+def send_picks_to_telegram(payload: dict):
+    """
+    Manual trigger: send top picks or all actionable stocks to Telegram.
+    Payload: { "type": "top5" | "all_actionable", "recommendations": [...] }
+    """
+    recs = payload.get("recommendations", [])
+    if not recs:
+        raise HTTPException(status_code=400, detail="No recommendations provided")
+
+    # Wake notification service
+    _wake_notification_service()
+
+    # Build message
+    msg_type = payload.get("type", "top5")
+    if msg_type == "top5":
+        title = "📊 *Top 5 Picks from Market Scan*"
+        picks = recs[:5]
+    else:
+        title = "📊 *All Actionable Stocks (BUY NOW / PREPARE TO BUY)*"
+        picks = recs
+
+    lines = [title, ""]
+    for i, r in enumerate(picks, 1):
+        symbol = r.get("symbol", "?")
+        decision = r.get("decision", "UNKNOWN")
+        score = r.get("combined_score", 0)
+        close = r.get("close")
+        target = r.get("target")
+        stop = r.get("stop_loss")
+        entry = r.get("entry_range", {})
+        entry_low = entry.get("low")
+        entry_high = entry.get("high")
+        holding = r.get("holding_period", "N/A")
+
+        lines.append(f"{i}. *{symbol}* – {decision} (Score: {score})")
+        if close:
+            lines.append(f"   Current: ₹{close:.2f}")
+        if entry_low and entry_high:
+            lines.append(f"   Entry: ₹{entry_low:.2f} – ₹{entry_high:.2f}")
+        if target:
+            upside = ((target - close) / close * 100) if close else 0
+            lines.append(f"   Target: ₹{target:.2f} (+{upside:.1f}%)")
+        if stop:
+            lines.append(f"   Stop: ₹{stop:.2f}")
+        if holding != "N/A":
+            lines.append(f"   Hold: {holding}")
+        lines.append("")
+
+    message = "\n".join(lines)
+
+    # Send via notification service
+    try:
+        resp = httpx.post(
+            f"{NOTIFICATION_URL}/notify",
+            json={"title": "Market Scan Picks", "message": message, "channel": "telegram"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return {"success": True, "sent": len(picks), "message": "Notification sent"}
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Notification service failed: {e}")
 
 if __name__ == "__main__":
     import uvicorn

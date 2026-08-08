@@ -195,6 +195,44 @@ export default function App() {
     }
   }
 
+  // ── New handlers for manual Telegram notifications ──────────────────────
+  async function handleSendTopPicks() {
+    if (view.mode !== "scan") return;
+    const recs = view.data.recommendations || [];
+    if (recs.length === 0) {
+      setStatusMessage("❌ No recommendations to send");
+      setTimeout(() => setStatusMessage(null), 3000);
+      return;
+    }
+    try {
+      await api.sendPicksToTelegram({ type: "top5", recommendations: recs });
+      setStatusMessage("✅ Top 5 picks sent to Telegram!");
+      setTimeout(() => setStatusMessage(null), 3000);
+    } catch (e) {
+      setStatusMessage("❌ Failed to send: " + (e as Error).message);
+      setTimeout(() => setStatusMessage(null), 5000);
+    }
+  }
+
+  async function handleSendAllActionable() {
+    if (view.mode !== "scan") return;
+    const all = view.data.all_results || [];
+    const actionable = all.filter(r => r.decision === "BUY NOW" || r.decision === "PREPARE TO BUY");
+    if (actionable.length === 0) {
+      setStatusMessage("❌ No actionable stocks found");
+      setTimeout(() => setStatusMessage(null), 3000);
+      return;
+    }
+    try {
+      await api.sendPicksToTelegram({ type: "all_actionable", recommendations: actionable });
+      setStatusMessage(`✅ ${actionable.length} picks sent to Telegram!`);
+      setTimeout(() => setStatusMessage(null), 3000);
+    } catch (e) {
+      setStatusMessage("❌ Failed to send: " + (e as Error).message);
+      setTimeout(() => setStatusMessage(null), 5000);
+    }
+  }
+
   if (!systemReady) {
     return <SystemCheck onReady={() => setSystemReady(true)} />;
   }
@@ -468,6 +506,8 @@ export default function App() {
                   onSelect={handleSearch}
                   onBack={() => setView({ mode: "idle" })}
                   onAddToWatchlist={handleAddToWatchlist}
+                  onSendTopPicks={handleSendTopPicks}
+                  onSendAllActionable={handleSendAllActionable}
                 />
               )}
             </section>

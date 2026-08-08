@@ -6,9 +6,11 @@ interface Props {
   onSelect: (symbol: string) => void;
   onBack: () => void;
   onAddToWatchlist: (symbol: string) => void;
+  onSendTopPicks: () => void;      // NEW
+  onSendAllActionable: () => void; // NEW
 }
 
-export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist }: Props) {
+export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, onSendTopPicks, onSendAllActionable }: Props) {
   const allSorted = [...result.all_results].sort((a, b) => b.combined_score - a.combined_score);
 
   return (
@@ -28,6 +30,22 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist }
             {result.market_stats.buy_signals} BUY · {result.market_stats.sell_signals} SELL · {result.market_stats.hold_signals} HOLD
           </div>
         </div>
+      </div>
+
+      {/* Action buttons */}
+      <div className="flex flex-wrap gap-3">
+        <button
+          onClick={onSendTopPicks}
+          className="font-mono text-xs bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-2 hover:bg-signal-prepare/30 transition"
+        >
+          📤 Send Top 5 Picks
+        </button>
+        <button
+          onClick={onSendAllActionable}
+          className="font-mono text-xs bg-signal-buy/20 border border-signal-buy/40 rounded-lg px-4 py-2 hover:bg-signal-buy/30 transition"
+        >
+          📤 Send All Actionable
+        </button>
       </div>
 
       {/* Verdict banner */}

@@ -57,6 +57,7 @@ export interface Decision {
   natural_language_summary?: string;
   fundamental_metrics?: FundamentalMetrics;
   data_insufficient?: boolean;
+  event_score_delta?: number; // from decision engine v0.3.0
 }
 
 export interface ScanResult {
@@ -267,6 +268,19 @@ export const api = {
     request<{ delivered: boolean; note?: string; results?: Record<string, string> }>(
       "/notifications/test",
       { method: "POST" },
+      2,
+      30000
+    ),
+
+  // ── NEW: Manual Telegram notification ──────────────────────────────────────
+  sendPicksToTelegram: (payload: { type: string; recommendations: Decision[] }) =>
+    request<{ success: boolean; sent: number; message: string }>(
+      "/notifications/send-picks",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
       2,
       30000
     ),
