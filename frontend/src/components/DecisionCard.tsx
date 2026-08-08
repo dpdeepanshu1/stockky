@@ -21,6 +21,16 @@ export default function DecisionCard({ data, onBack }: Props) {
   const metrics = data.fundamental_metrics;
   const hasMetrics = metrics && Object.values(metrics).some(v => v != null);
 
+  // Safe price display
+  const formatPrice = (price: number | null | undefined) => {
+    if (price == null) return "N/A";
+    return `₹${price.toLocaleString("en-IN")}`;
+  };
+
+  const safeEntryRange = data.entry_range && data.entry_range.low != null && data.entry_range.high != null;
+  const hasTarget = data.target != null;
+  const hasStopLoss = data.stop_loss != null;
+
   return (
     <div className="space-y-4">
       <button
@@ -46,7 +56,7 @@ export default function DecisionCard({ data, onBack }: Props) {
           </div>
 
           <div className="text-right font-mono">
-            <div className="text-4xl text-paper">₹{data.close.toLocaleString("en-IN")}</div>
+            <div className="text-4xl text-paper">{formatPrice(data.close)}</div>
             <div className="text-xs text-mist/60 mt-1">
               Combined {data.combined_score}/100
             </div>
@@ -61,12 +71,14 @@ export default function DecisionCard({ data, onBack }: Props) {
           </div>
         )}
 
-        {/* Trade levels */}
-        {isBullish && (
+        {/* Trade levels - only if bullish and we have valid numbers */}
+        {isBullish && data.close != null && safeEntryRange && hasTarget && hasStopLoss && (
           <div className="grid grid-cols-3 gap-4 mt-8 pt-6 border-t border-slate/40">
             <div>
               <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-1">Entry range</div>
-              <div className="font-mono text-sm text-paper">₹{data.entry_range.low.toLocaleString("en-IN")} – ₹{data.entry_range.high.toLocaleString("en-IN")}</div>
+              <div className="font-mono text-sm text-paper">
+                ₹{data.entry_range.low.toLocaleString("en-IN")} – ₹{data.entry_range.high.toLocaleString("en-IN")}
+              </div>
             </div>
             <div>
               <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-1">Target</div>
@@ -90,7 +102,11 @@ export default function DecisionCard({ data, onBack }: Props) {
       <div className="grid grid-cols-2 gap-4">
         <div className="rounded-xl border border-slate bg-graphite p-5">
           <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">Price levels</div>
-          <PriceLevelBar close={data.close} support={data.support} resistance={data.resistance} />
+          {data.close != null && data.support != null && data.resistance != null ? (
+            <PriceLevelBar close={data.close} support={data.support} resistance={data.resistance} />
+          ) : (
+            <p className="text-sm text-mist/40 italic">Insufficient data for price levels</p>
+          )}
         </div>
         <div className="rounded-xl border border-slate bg-graphite p-5">
           <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">Score breakdown</div>
@@ -159,7 +175,7 @@ export default function DecisionCard({ data, onBack }: Props) {
       </div>
 
       {/* Holding period */}
-      {data.holding_period !== "N/A" && (
+      {data.holding_period && data.holding_period !== "N/A" && (
         <div className="rounded-xl border border-slate bg-graphite px-5 py-4 font-mono text-xs text-mist flex justify-between">
           <span className="uppercase tracking-widest">Suggested holding period</span>
           <span className="text-paper">{data.holding_period}</span>
@@ -167,14 +183,16 @@ export default function DecisionCard({ data, onBack }: Props) {
       )}
 
       {/* Natural-language Hinglish summary */}
-      <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
-        <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
-          💬 Final Remarks
-        </h4>
-        <p className="text-sm text-paper/90 leading-relaxed">
-          {data.natural_language_summary}
-        </p>
-      </div>
+      {data.natural_language_summary && (
+        <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
+          <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
+            💬 Final Remarks
+          </h4>
+          <p className="text-sm text-paper/90 leading-relaxed">
+            {data.natural_language_summary}
+          </p>
+        </div>
+      )}
     </div>
   );
 }
