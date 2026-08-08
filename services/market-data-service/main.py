@@ -26,6 +26,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+# --- FIXED: Added missing httpx import ---
+import httpx
+
 # --- Patch yfinance session with a proper User-Agent ---
 session = requests.Session()
 session.headers.update({
@@ -219,8 +222,6 @@ def get_quote(symbol: str):
                 except Exception as e:
                     logger.warning(f"Alpha Vantage fallback for {alpha_sym} failed: {e}")
 
-        # UPDATED: Return 200 with price: None instead of raising 404.
-        # This allows the Technical Analysis Service to gracefully flag data_insufficient.
         result = {
             "symbol": sym,
             "name": sym,
@@ -322,6 +323,10 @@ def get_fundamentals_raw(symbol: str):
             info = _with_retry(lambda: ticker.info, max_retries=5, base_delay=3)
         except Exception as e:
             logger.warning(f"Could not fetch info for {sym}: {e}")
+        
+        # --- FIXED: Prevent "NoneType is not iterable" error ---
+        if info is None:
+            info = {}
 
         # Try to get financial statements (may be None)
         financials = None
@@ -506,7 +511,7 @@ def get_fundamentals_raw(symbol: str):
 
         logger.info(f"Fundamentals for {sym}: PE={pe_ratio}, ROE={roe}, Revenue growth={revenue_growth}")
 
-        # UPDATED: Do NOT wipe the result if financial statements fail. Always preserve `info` data.
+        # Store in fallback cache if we got any valid data
         if any(v is not None for v in [pe_ratio, sector, market_cap, revenue_growth, roe]):
             _fallback_set(cache_key, result)
 
