@@ -42,7 +42,7 @@ async def global_exception_handler(request, exc):
 
 class Decision(str, Enum):
     BUY_NOW = "BUY NOW"
-    PREPARE_TO_BUY = "PREPARE TO BUY"
+    PREPARE_TO_BUY = "PREPARE_TO_BUY"
     HOLD = "HOLD"
     DO_NOT_BUY = "DO NOT BUY"
     SELL = "SELL"
@@ -70,18 +70,40 @@ async def _fetch_required(client: httpx.AsyncClient, url: str, label: str) -> di
     try:
         resp = await client.get(url, timeout=70)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        if not isinstance(data, dict):
+            logger.warning(f"{label} returned non-dict: {type(data).__name__}")
+            return {}
+        return data
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"{label} unavailable: {e}")
+    except Exception as e:
+        logger.warning(f"Error parsing {label} response: {e}")
+        return {}
 
 async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
     try:
         resp = await client.get(url, timeout=70)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        if not isinstance(data, dict):
+            logger.warning(f"{label} returned non-dict: {type(data).__name__}")
+            return None
+        return data
     except httpx.HTTPError as e:
         logger.warning("%s unavailable, continuing without it: %s", label, e)
         return None
+    except Exception as e:
+        logger.warning(f"Error parsing {label} response: {e}")
+        return None
+
+def _safe_get(data, key, default=None):
+    """Safely get a key from a dict, even if data is None."""
+    if data is None:
+        return default
+    if not isinstance(data, dict):
+        return default
+    return data.get(key, default)
 
 def _combined_score(technical_score: int, fundamental_score: int, news_score: int | None, prediction_score: int | None) -> float:
     weights = {"technical": 0.55, "fundamental": 0.45, "news": 0.0, "prediction": 0.0}
@@ -124,113 +146,80 @@ def _decide(technical_score: int, fundamental_score: int, news_score: int | None
 
 @app.get("/decide/{symbol}")
 async def decide(symbol: str, already_owned: bool = False):
-    # Initialize default dicts early
-    technical = {
-        "technical_score": 50,
-        "trend_strength": "unknown",
-        "volume_surge": False,
-        "close": None,
-        "support": None,
-        "resistance": None,
-        "reasons": ["Technical data unavailable"],
-    }
-    fundamental = {
-        "fundamental_score": 50,
-        "valuation": "fair",
-        "sector": None,
-        "reasons": ["Fundamental data unavailable"],
-        "metrics": {},
-        "fallback_used": True
-    }
-    news = None
-    prediction = None
-    events = None
-
     try:
         async with httpx.AsyncClient(timeout=70) as client:
-            # Fetch technical analysis
+            # --- Technical ---
+            technical = {}
             try:
                 technical_resp = await client.get(f"{TECHNICAL_URL}/analyze/{symbol}", timeout=70)
                 technical_resp.raise_for_status()
                 technical = technical_resp.json()
                 if not isinstance(technical, dict):
-                    technical = {
-                        "technical_score": 50,
-                        "trend_strength": "unknown",
-                        "volume_surge": False,
-                        "close": None,
-                        "support": None,
-                        "resistance": None,
-                        "reasons": ["Technical data invalid format"],
-                    }
+                    logger.warning(f"Technical response not dict: {type(technical).__name__}")
+                    technical = {}
             except Exception as e:
-                logger.warning(f"Technical analysis failed for {symbol}, using default: {e}")
-                # technical already has default
+                logger.warning(f"Technical analysis failed: {e}")
+                technical = {}
 
-            # Fetch fundamental analysis
+            # --- Fundamental ---
+            fundamental = {}
             try:
                 fundamental_resp = await client.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=70)
                 fundamental_resp.raise_for_status()
                 fundamental = fundamental_resp.json()
                 if not isinstance(fundamental, dict):
-                    fundamental = {
-                        "fundamental_score": 50,
-                        "valuation": "fair",
-                        "sector": None,
-                        "reasons": ["Fundamental data invalid format"],
-                        "metrics": {},
-                        "fallback_used": True
-                    }
+                    logger.warning(f"Fundamental response not dict: {type(fundamental).__name__}")
+                    fundamental = {}
             except Exception as e:
-                logger.warning(f"Fundamental analysis failed for {symbol}, using default: {e}")
-                # fundamental already has default
+                logger.warning(f"Fundamental analysis failed: {e}")
+                fundamental = {}
 
-            # Fetch optional services
-            news_task = _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
-            prediction_task = _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
-            events_task = _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
-            
-            news, prediction, events = await asyncio.gather(
-                news_task, prediction_task, events_task
-            )
+            # --- Optional services ---
+            news = await _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
+            prediction = await _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
+            events = await _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
 
-        # Now process the data
-        technical_score = technical.get("technical_score", 50)
-        fundamental_score = fundamental.get("fundamental_score", 50)
-        news_score = news.get("news_score") if news else None
-        prediction_score = prediction.get("prediction_score") if prediction and prediction.get("model_loaded") else None
-        fundamental_metrics = fundamental.get("metrics")
+        # --- Extract values safely ---
+        technical_score = _safe_get(technical, "technical_score", 50)
+        fundamental_score = _safe_get(fundamental, "fundamental_score", 50)
+        news_score = _safe_get(news, "news_score") if news else None
+        prediction_score = _safe_get(prediction, "prediction_score") if prediction and _safe_get(prediction, "model_loaded") else None
+        fundamental_metrics = _safe_get(fundamental, "metrics")
 
-        close = technical.get("close")
-        support = technical.get("support")
-        resistance = technical.get("resistance")
-        trend_strength = technical.get("trend_strength", "unknown")
-        volume_surge = technical.get("volume_surge", False)
+        close = _safe_get(technical, "close")
+        support = _safe_get(technical, "support")
+        resistance = _safe_get(technical, "resistance")
+        trend_strength = _safe_get(technical, "trend_strength", "unknown")
+        volume_surge = _safe_get(technical, "volume_surge", False)
 
-        # Calculate distance to resistance if we have close and resistance
+        # Distance to resistance
         dist_to_resistance_pct = None
         if close and resistance and resistance > 0:
             dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
 
+        # Event risk
         event_risk = False
         event_reason = None
-        if events and isinstance(events, dict) and events.get("next_earnings_date"):
-            try:
-                from datetime import datetime
-                earnings_date = datetime.fromisoformat(events["next_earnings_date"][:10])
-                days_out = (earnings_date - datetime.utcnow()).days
-                if 0 <= days_out <= EVENT_RISK_WINDOW_DAYS:
-                    event_risk = True
-                    event_reason = f"Earnings due in {days_out} day(s) ({events['next_earnings_date'][:10]}) — elevated volatility risk"
-            except (ValueError, TypeError):
-                pass
+        if events and isinstance(events, dict):
+            next_earnings = _safe_get(events, "next_earnings_date")
+            if next_earnings:
+                try:
+                    from datetime import datetime
+                    earnings_date = datetime.fromisoformat(next_earnings[:10])
+                    days_out = (earnings_date - datetime.utcnow()).days
+                    if 0 <= days_out <= EVENT_RISK_WINDOW_DAYS:
+                        event_risk = True
+                        event_reason = f"Earnings due in {days_out} day(s) ({next_earnings[:10]}) — elevated volatility risk"
+                except (ValueError, TypeError):
+                    pass
 
+        # --- Decision ---
         decision = _decide(technical_score, fundamental_score, news_score, prediction_score,
                            trend_strength, volume_surge, dist_to_resistance_pct,
                            event_risk, already_owned)
         combined_score = _combined_score(technical_score, fundamental_score, news_score, prediction_score)
 
-        # Entry/target/stop only if we have a price
+        # --- Entry/Target/Stop ---
         entry_low, entry_high = None, None
         target = None
         stop_loss = None
@@ -245,17 +234,19 @@ async def decide(symbol: str, already_owned: bool = False):
 
         confidence = "High" if combined_score >= 75 else "Medium" if combined_score >= 55 else "Low"
 
+        # --- Reasons ---
         reasons = {
-            "technical": technical.get("reasons", ["No technical data"]),
-            "fundamental": fundamental.get("reasons", ["No fundamental data"]),
+            "technical": _safe_get(technical, "reasons", ["No technical data"]),
+            "fundamental": _safe_get(fundamental, "reasons", ["No fundamental data"]),
         }
         if news and isinstance(news, dict):
-            reasons["news"] = news.get("reasons", ["No news data"])
-        if prediction and isinstance(prediction, dict) and prediction.get("model_loaded"):
-            reasons["prediction"] = [prediction.get("note", "Prediction available")]
+            reasons["news"] = _safe_get(news, "reasons", [])
+        if prediction and isinstance(prediction, dict) and _safe_get(prediction, "model_loaded"):
+            reasons["prediction"] = [_safe_get(prediction, "note", "Prediction available")]
         if event_reason:
             reasons["event"] = [event_reason]
 
+        # --- Response ---
         response = {
             "symbol": symbol.upper(),
             "decision": decision.value,
@@ -274,8 +265,8 @@ async def decide(symbol: str, already_owned: bool = False):
             "support": support,
             "resistance": resistance,
             "reasons": reasons,
-            "valuation": fundamental.get("valuation", "fair"),
-            "sector": fundamental.get("sector"),
+            "valuation": _safe_get(fundamental, "valuation", "fair"),
+            "sector": _safe_get(fundamental, "sector"),
         }
 
         if fundamental_metrics and isinstance(fundamental_metrics, dict):

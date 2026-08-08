@@ -50,14 +50,14 @@ def analyze(symbol: str):
         resp = httpx.get(f"{MARKET_DATA_URL}/fundamentals/{symbol}", timeout=60)
         resp.raise_for_status()
         f = resp.json()
-        if not f:
+        if not f or not isinstance(f, dict):
             f = {}
+            fallback_used = True
     except httpx.TimeoutException:
         logger.warning(f"Market data service timed out for {symbol}")
         fallback_used = True
     except httpx.HTTPStatusError as e:
         logger.error(f"Market data service error for {symbol}: {e}")
-        # If we get a 502/504 from market-data, treat as unavailable
         if e.response.status_code >= 500:
             fallback_used = True
         else:
@@ -66,8 +66,7 @@ def analyze(symbol: str):
         logger.error(f"Unexpected error: {e}")
         fallback_used = True
 
-    # If we have no data, create a minimal fallback object
-    if not f:
+    if not f or not isinstance(f, dict):
         f = {}
         fallback_used = True
 
@@ -97,7 +96,7 @@ def analyze(symbol: str):
         "forward_pe": forward_pe,
     }
 
-    # Scoring and reasons (same as before)
+    # Scoring and reasons
     if rev_growth is not None:
         if rev_growth > 15:
             score += 12
@@ -178,7 +177,6 @@ def analyze(symbol: str):
             score += 4
             reasons.append("Forward P/E lower than trailing P/E — earnings expected to grow into valuation")
 
-    # If we're using fallback, add a note
     if fallback_used:
         reasons.append("Live data temporarily unavailable — score is based on last known or default values")
 
