@@ -41,8 +41,8 @@ def _safe(val, decimals=2):
         return None
 
 
-def _fetch_history(symbol: str) -> pd.DataFrame:
-    """Fetch OHLCV candles from market-data-service (cached, no rate limits)."""
+def _fetch_history(symbol: str):
+    """Fetch OHLCV candles from market-data-service. Returns DataFrame or None if insufficient data."""
     try:
         resp = httpx.get(
             f"{MARKET_DATA_URL}/history/{symbol}",
@@ -56,7 +56,8 @@ def _fetch_history(symbol: str) -> pd.DataFrame:
 
     candles = data.get("candles", [])
     if len(candles) < 30:
-        raise HTTPException(status_code=422, detail=f"Not enough history for {symbol}")
+        # Insufficient data — return None instead of raising error
+        return None
 
     df = pd.DataFrame(candles)
     df["date"] = pd.to_datetime(df["date"])
@@ -153,6 +154,24 @@ def root():
 def analyze(symbol: str):
     sym = normalize_symbol(symbol)
     df  = _fetch_history(sym)
+
+    # ----- NEW: Handle insufficient data (newly listed stocks) -----
+    if df is None:
+        return {
+            "symbol": sym,
+            "technical_score": 50,
+            "trend_strength": "unknown",
+            "volume_surge": False,
+            "close": None,
+            "support": None,
+            "resistance": None,
+            "data_insufficient": True,
+            "reasons": [
+                f"Insufficient price data for {sym} (newly listed stock). "
+                "Please check back in 2-3 days after Yahoo Finance updates its database."
+            ],
+        }
+    # -------------------------------------------------------------
 
     close  = df["Close"]
     high   = df["High"]
