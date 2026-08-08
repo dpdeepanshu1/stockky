@@ -15,7 +15,7 @@ from features import latest_feature_vector, FEATURE_COLUMNS
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("prediction-service")
 
-MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data-service:8001")
+MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com/")
 MODEL_PATH = os.getenv("MODEL_PATH", "model.pkl")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
