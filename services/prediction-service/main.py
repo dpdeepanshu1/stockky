@@ -14,7 +14,8 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from llama_cpp import Llama
-from huggingface_hub import hf_hub_download # <--- Added for v0.1.78 compatibility
+# We import hf_hub_download to fallback if the build step fails, though it shouldn't
+from huggingface_hub import hf_hub_download 
 
 from features import latest_feature_vector, FEATURE_COLUMNS
 
@@ -41,7 +42,7 @@ else:
 _llm = None
 try:
     logger.info("Loading GenAI model (TinyLlama)...")
-    # FIXED: v0.1.78 does not support .from_pretrained. We download it via huggingface_hub first.
+    # This looks in the cache. The Build Phase ensures it's already there!
     model_path = hf_hub_download(
         repo_id="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
         filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
@@ -54,7 +55,8 @@ try:
     )
     logger.info("GenAI model loaded successfully!")
 except Exception as e:
-    logger.warning(f"Could not load GenAI model: {e}. Falling back to templated strings.")
+    # We log the REPR of the error, so we'll see exactly what went wrong if it fails again
+    logger.warning(f"Could not load GenAI model: {repr(e)}. Falling back to templated strings.")
 
 
 @app.get("/")
@@ -107,7 +109,7 @@ def _generate_llm_note(feature_dict: dict, probability: float) -> str:
         res = _llm(prompt, max_tokens=60, temperature=0.7, stop=["</s>", "<|"])
         return res['choices'][0]['text'].strip()
     except Exception as e:
-        logger.warning(f"GenAI generation failed: {e}")
+        logger.warning(f"GenAI generation failed: {repr(e)}")
         return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days, based on current technical setup."
 
 @app.get("/predict/{symbol}")
