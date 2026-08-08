@@ -157,7 +157,6 @@ def _add_searched(symbol: str):
 # ── Dynamic Universe Sources ──────────────────────────────────────────────
 
 def _fetch_from_nse_api(endpoint: str, cache_key: str, ttl: int = 21600):
-    """Fetch from NSE API, but only return data if it's a dict; else None."""
     cached = _redis_get(cache_key)
     if cached and isinstance(cached, dict):
         return cached
@@ -194,7 +193,6 @@ def _get_all_nse_securities() -> List[str]:
     return symbols
 
 def _get_nifty_indices() -> List[str]:
-    """Fetch Nifty 50, Next 50, Midcap 100 constituents, always returning a list."""
     indices = ["NIFTY%2050", "NIFTY%20NEXT%2050", "NIFTY%20MIDCAP%20100"]
     all_symbols = []
     for idx in indices:
@@ -716,7 +714,7 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision ──────────────────────────────────────────────────────────
+# ── Stock decision (FIXED: robust handling) ──────────────────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
@@ -746,14 +744,42 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         )
         resp.raise_for_status()
         result = resp.json()
+        
+        # Handle non-dict response
+        if not isinstance(result, dict):
+            result = {
+                "symbol": symbol_to_use,
+                "decision": "DO NOT BUY",
+                "confidence": "Low",
+                "combined_score": 0,
+                "technical_score": 50,
+                "fundamental_score": 50,
+                "news_score": None,
+                "prediction_score": None,
+                "event_risk": False,
+                "entry_range": None,
+                "target": None,
+                "stop_loss": None,
+                "holding_period": "N/A",
+                "close": None,
+                "support": None,
+                "resistance": None,
+                "reasons": {"technical": ["Data unavailable"], "fundamental": ["Data unavailable"]},
+                "valuation": "fair",
+                "sector": None,
+                "natural_language_summary": "Data unavailable"
+            }
+        else:
+            # Add summary if missing
+            if "natural_language_summary" not in result:
+                result["natural_language_summary"] = _generate_summary(result)
+        
         if corrected_from:
             result["corrected_from"] = corrected_from
             result["symbol"] = symbol_to_use
-        if isinstance(result, dict):
-            result["natural_language_summary"] = _generate_summary(result)
-        else:
-            result = {"error": "Invalid response from decision engine", "symbol": symbol_to_use}
+        
         return result
+        
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             suggestions = difflib.get_close_matches(symbol_to_use, _get_all_known_symbols(), n=3, cutoff=0.5)
