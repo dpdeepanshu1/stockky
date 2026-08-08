@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fundamental-analysis-service")
 
-# The service is named "stockky-market-data" on Render.
+# MUST point to your market-data-service
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
 
 app = FastAPI(title="Stockky Fundamental Analysis Service", version="0.1.0")
@@ -72,7 +72,7 @@ def analyze(symbol: str):
     score = 50
     reasons = []
 
-    # Extract metrics (use .get with fallback None)
+    # Extract metrics
     rev_growth = f.get("revenue_growth")
     earnings_growth = f.get("earnings_growth")
     roe = f.get("roe")
@@ -83,7 +83,7 @@ def analyze(symbol: str):
     pe = f.get("pe_ratio")
     forward_pe = f.get("forward_pe")
 
-    # ✅ Build metrics dict (always include, even if all values are None)
+    # ✅ MUST return these metrics
     metrics = {
         "revenue_growth": rev_growth,
         "earnings_growth": earnings_growth,
@@ -96,7 +96,7 @@ def analyze(symbol: str):
         "forward_pe": forward_pe,
     }
 
-    # Scoring and reasons
+    # Scoring logic (same as before)
     if rev_growth is not None:
         if rev_growth > 15:
             score += 12
@@ -188,7 +188,7 @@ def analyze(symbol: str):
 
     score = max(0, min(100, round(score)))
 
-    # ✅ IMPORTANT: Return `metrics` in the response
+    # ✅ Return includes "metrics" – critical!
     return {
         "symbol": symbol.upper(),
         "fundamental_score": score,
@@ -196,7 +196,7 @@ def analyze(symbol: str):
         "sector": f.get("sector"),
         "industry": f.get("industry"),
         "reasons": reasons,
-        "metrics": metrics,        # <-- Key field for API gateway
+        "metrics": metrics,
         "raw": f,
         "fallback_used": fallback_used,
     }
