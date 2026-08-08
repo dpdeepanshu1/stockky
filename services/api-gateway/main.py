@@ -376,21 +376,59 @@ def _resolve_symbol(misspelled: str) -> Optional[str]:
         return matches[0]
     return None
 
+# ── Safe response normalization ──────────────────────────────────────────
+def _normalize_decision_response(raw, symbol: str) -> dict:
+    """
+    Ensure the response from decision engine is a valid dict with all required keys.
+    """
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    # Defaults
+    default = {
+        "symbol": symbol,
+        "decision": "DO NOT BUY",
+        "confidence": "Low",
+        "combined_score": 0,
+        "technical_score": 50,
+        "fundamental_score": 50,
+        "news_score": None,
+        "prediction_score": None,
+        "event_risk": False,
+        "entry_range": None,
+        "target": None,
+        "stop_loss": None,
+        "holding_period": "N/A",
+        "close": None,
+        "support": None,
+        "resistance": None,
+        "reasons": {
+            "technical": ["Data unavailable"],
+            "fundamental": ["Data unavailable"]
+        },
+        "valuation": "fair",
+        "sector": None,
+    }
+
+    # Merge – raw overrides default for keys that exist
+    merged = {**default, **raw}
+    return merged
+
 # ── Hinglish summary ──────────────────────────────────────────────────────
-def _generate_summary(data: dict) -> str:
-    if not isinstance(data, dict):
+def _generate_summary(data) -> str:
+    if not data or not isinstance(data, dict):
         return "Data unavailable"
     decision = data.get("decision")
-    symbol = data.get("symbol")
-    if not symbol:
-        symbol = "Unknown"
+    symbol = data.get("symbol") or "Unknown"
     confidence = data.get("confidence")
     combined_score = data.get("combined_score")
-    entry = data.get("entry_range", {})
+    entry = data.get("entry_range") or {}
     target = data.get("target")
     stop = data.get("stop_loss")
     holding = data.get("holding_period")
-    reasons = data.get("reasons", {})
+    reasons = data.get("reasons") or {}
     close = data.get("close")
     if decision == "BUY NOW":
         summary = f"🚀 {symbol} अभी खरीदने का बहुत अच्छा मौका है! "
@@ -475,12 +513,10 @@ async def run_scan_async(task_id: str, universe: List[str]):
             try:
                 resp = await client.get(f"{DECISION_URL}/decide/{symbol}")
                 resp.raise_for_status()
-                result = resp.json()
-                if isinstance(result, dict):
-                    result["natural_language_summary"] = _generate_summary(result)
-                    results.append(result)
-                else:
-                    errors.append({"symbol": symbol, "error": f"Invalid response (expected dict, got {type(result).__name__})"})
+                raw = resp.json()
+                normalized = _normalize_decision_response(raw, symbol)
+                normalized["natural_language_summary"] = _generate_summary(normalized)
+                results.append(normalized)
             except httpx.HTTPError as e:
                 logger.warning("Scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})
@@ -496,7 +532,6 @@ async def run_scan_async(task_id: str, universe: List[str]):
                     "error": None,
                 }, ttl=3600)
 
-    results = [r for r in results if isinstance(r, dict)]
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = actionable[:5]
@@ -714,7 +749,7 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision (FIXED: robust handling for None) ──────────────────────
+# ── Stock decision (fully null‑safe) ─────────────────────────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
@@ -743,71 +778,12 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
             timeout=30,
         )
         resp.raise_for_status()
-        result = resp.json()
-
-        # ✅ 关键修复：处理 result 为 None 的情况
-        if result is None:
-            result = {
-                "symbol": symbol_to_use,
-                "decision": "DO NOT BUY",
-                "confidence": "Low",
-                "combined_score": 0,
-                "technical_score": 50,
-                "fundamental_score": 50,
-                "news_score": None,
-                "prediction_score": None,
-                "event_risk": False,
-                "entry_range": None,
-                "target": None,
-                "stop_loss": None,
-                "holding_period": "N/A",
-                "close": None,
-                "support": None,
-                "resistance": None,
-                "reasons": {
-                    "technical": ["Insufficient data for newly listed stock"],
-                    "fundamental": ["Data temporarily unavailable"]
-                },
-                "valuation": "fair",
-                "sector": None,
-                "natural_language_summary": f"❌ {symbol_to_use} अभी न खरीदें. नए लिस्टेड स्टॉक के लिए डेटा उपलब्ध नहीं है. कुछ दिन बाद दोबारा चेक करें."
-            }
-
-        # 检查 result 是否为 dict
-        if not isinstance(result, dict):
-            result = {
-                "symbol": symbol_to_use,
-                "decision": "DO NOT BUY",
-                "confidence": "Low",
-                "combined_score": 0,
-                "technical_score": 50,
-                "fundamental_score": 50,
-                "news_score": None,
-                "prediction_score": None,
-                "event_risk": False,
-                "entry_range": None,
-                "target": None,
-                "stop_loss": None,
-                "holding_period": "N/A",
-                "close": None,
-                "support": None,
-                "resistance": None,
-                "reasons": {
-                    "technical": ["Data unavailable"],
-                    "fundamental": ["Data unavailable"]
-                },
-                "valuation": "fair",
-                "sector": None,
-                "natural_language_summary": "Data unavailable"
-            }
-
+        raw = resp.json()
+        result = _normalize_decision_response(raw, symbol_to_use)
         if corrected_from:
             result["corrected_from"] = corrected_from
             result["symbol"] = symbol_to_use
-
-        if "natural_language_summary" not in result:
-            result["natural_language_summary"] = _generate_summary(result)
-
+        result["natural_language_summary"] = _generate_summary(result)
         return result
 
     except httpx.HTTPStatusError as e:
@@ -838,17 +814,14 @@ def run_scan(force_refresh: bool = False):
             try:
                 resp = client.get(f"{DECISION_URL}/decide/{symbol}")
                 resp.raise_for_status()
-                result = resp.json()
-                if isinstance(result, dict):
-                    result["natural_language_summary"] = _generate_summary(result)
-                    results.append(result)
-                else:
-                    errors.append({"symbol": symbol, "error": f"Invalid response (expected dict, got {type(result).__name__})"})
+                raw = resp.json()
+                normalized = _normalize_decision_response(raw, symbol)
+                normalized["natural_language_summary"] = _generate_summary(normalized)
+                results.append(normalized)
             except httpx.HTTPError as e:
                 logger.warning("Scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})
 
-    results = [r for r in results if isinstance(r, dict)]
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = actionable[:5]
@@ -959,17 +932,14 @@ def scan_watchlist():
             try:
                 resp = client.get(f"{DECISION_URL}/decide/{symbol}")
                 resp.raise_for_status()
-                result = resp.json()
-                if isinstance(result, dict):
-                    result["natural_language_summary"] = _generate_summary(result)
-                    results.append(result)
-                else:
-                    errors.append({"symbol": symbol, "error": f"Invalid response (expected dict, got {type(result).__name__})"})
+                raw = resp.json()
+                normalized = _normalize_decision_response(raw, symbol)
+                normalized["natural_language_summary"] = _generate_summary(normalized)
+                results.append(normalized)
             except httpx.HTTPError as e:
                 logger.warning("Watchlist scan skipped %s: %s", symbol, e)
                 errors.append({"symbol": symbol, "error": str(e)})
 
-    results = [r for r in results if isinstance(r, dict)]
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = actionable[:5]
