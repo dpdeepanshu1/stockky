@@ -1,0 +1,47 @@
+name: Retrain Prediction Model
+
+on:
+  # Run weekly on Sunday at 00:00 UTC
+  schedule:
+    - cron: '0 0 * * 0'
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write  # Needed to push the model file back to the repo
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        working-directory: services/prediction-service
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Retrain model
+        working-directory: services/prediction-service
+        run: python train.py
+
+      - name: Commit and push updated model
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add services/prediction-service/model.pkl
+          # Only commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to model.pkl"
+          else
+            git commit -m "Auto-retrain prediction model [skip ci]"
+            git push
+          fi
