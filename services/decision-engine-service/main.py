@@ -1,27 +1,24 @@
-"""Decision Engine Service v0.3.0
+"""
+Decision Engine Service v0.3.1
 --------------------------------
 Combines Technical + Fundamental + News + Event + Prediction scores.
 
-v0.3 changes:
-  - News score now meaningfully shifts combined score (+/- up to 10pts)
-  - Events actively boost score: earnings approaching = event_risk flag,
-    recent positive result = +8 pts, analyst upgrade = +6 pts, 
-    insider buying = +5 pts, bulk deal = +4 pts
-  - Quarterly results within 7 days → score boost (anticipation signal)
-  - Newly listed stocks handled gracefully with data_insufficient flag
-  - Combined score weights updated to include event_score as 4th pillar
+v0.3.1 changes:
+  - Added `WAIT` decision state for newly listed / insufficient data stocks with positive news.
+  - Refined `data_insufficient` flag to strictly check for missing price data.
+  - Improved fallback messages for fundamental scores to clarify "default values".
+  - Added `fundamental_fallback` flag to the API response for UI visibility.
 """
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("decision-engine-service")
@@ -32,10 +29,10 @@ NEWS_URL        = os.getenv("NEWS_URL",         "https://news-intelligence-servi
 EVENT_URL       = os.getenv("EVENT_URL",        "https://event-tracker-service-m1lw.onrender.com")
 PREDICTION_URL  = os.getenv("PREDICTION_URL",   "https://prediction-service-wowb.onrender.com")
 
-EARNINGS_RISK_DAYS   = 3   # flag event_risk if earnings within 3 days
-EARNINGS_BOOST_DAYS  = 7   # boost score if earnings within 7 days (anticipation)
+EARNINGS_RISK_DAYS   = 3
+EARNINGS_BOOST_DAYS  = 7
 
-app = FastAPI(title="Stockky Decision Engine", version="0.3.0")
+app = FastAPI(title="Stockky Decision Engine", version="0.3.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -53,13 +50,14 @@ class Decision(str, Enum):
     BUY_NOW        = "BUY NOW"
     PREPARE_TO_BUY = "PREPARE TO BUY"
     HOLD           = "HOLD"
+    WAIT           = "WAIT"        # NEW: For newly listed/insufficient data but positive news
     DO_NOT_BUY     = "DO NOT BUY"
     SELL           = "SELL"
 
 
 @app.get("/")
 def root():
-    return {"service": "Stockky Decision Engine", "version": "0.3.0", "status": "running"}
+    return {"service": "Stockky Decision Engine", "version": "0.3.1", "status": "running"}
 
 
 @app.get("/health")
@@ -80,13 +78,6 @@ async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
 
 # ── Event signal extraction ────────────────────────────────────────────────────
 def _extract_event_signals(events: dict | None) -> dict:
-    """
-    Parse event data and return:
-      - event_score_delta: int  (can be positive or negative, added to combined)
-      - event_risk: bool        (earnings imminent)
-      - event_reasons: list[str]
-      - earnings_days_out: int | None
-    """
     if not events or not isinstance(events, dict):
         return {"event_score_delta": 0, "event_risk": False,
                 "event_reasons": [], "earnings_days_out": None}
@@ -97,7 +88,6 @@ def _extract_event_signals(events: dict | None) -> dict:
     earnings_days_out = None
     now = datetime.utcnow()
 
-    # 1. Earnings date proximity
     next_earnings = events.get("next_earnings_date")
     if next_earnings:
         try:
@@ -108,36 +98,28 @@ def _extract_event_signals(events: dict | None) -> dict:
             if 0 <= days_out <= EARNINGS_RISK_DAYS:
                 event_risk = True
                 reasons.append(f"⚠ Earnings in {days_out}d ({next_earnings[:10]}) — hold off, high volatility risk")
-                delta -= 5  # penalise — unclear which way price will move
-
+                delta -= 5
             elif 0 < days_out <= EARNINGS_BOOST_DAYS:
                 delta += 8
                 reasons.append(f"📅 Earnings in {days_out}d — pre-results momentum window")
-
             elif days_out < 0 and days_out >= -30:
-                # Recent result — positive anticipation already priced, neutral
                 reasons.append(f"📋 Recent earnings ({abs(days_out)}d ago)")
-
         except (ValueError, TypeError):
             pass
 
-    # 2. Analyst upgrades (most recent)
     analyst_actions = events.get("recent_analyst_actions") or []
     for action in analyst_actions[:2]:
         act = str(action.get("action", "")).lower()
         grade = str(action.get("to_grade", "")).lower()
-        firm = action.get("firm", "")
-
         if act in ("upgrade", "upgraded") or grade in ("buy", "strong buy", "outperform", "overweight"):
             delta += 6
-            reasons.append(f"📈 Analyst upgrade: {firm} → {action.get('to_grade')}")
+            reasons.append(f"📈 Analyst upgrade: {action.get('firm')} → {action.get('to_grade')}")
             break
         elif act in ("downgrade", "downgraded") or grade in ("sell", "underperform", "underweight"):
             delta -= 6
-            reasons.append(f"📉 Analyst downgrade: {firm} → {action.get('to_grade')}")
+            reasons.append(f"📉 Analyst downgrade: {action.get('firm')} → {action.get('to_grade')}")
             break
 
-    # 3. Insider buying
     insider_txns = events.get("recent_insider_transactions") or []
     for txn in insider_txns[:2]:
         txn_type = str(txn.get("transaction", "")).lower()
@@ -152,7 +134,6 @@ def _extract_event_signals(events: dict | None) -> dict:
             reasons.append(f"🔴 Insider selling: {txn.get('insider', 'insider')} sold shares")
             break
 
-    # 4. Recent positive news from event tracker
     recent_news = events.get("recent_news") or []
     positive_keywords = ["beats", "record", "upgrade", "wins contract", "buyback", "bonus", "expansion", "profit"]
     negative_keywords = ["fraud", "probe", "penalty", "fine", "raid", "downgrade", "loss", "default"]
@@ -189,7 +170,6 @@ def _combined_score(
     prediction_score: int | None,
     event_delta: int = 0,
 ) -> float:
-    # Base weighted score
     if news_score is not None and prediction_score is not None:
         weights = {"t": 0.38, "f": 0.28, "n": 0.14, "p": 0.20}
     elif news_score is not None:
@@ -206,14 +186,11 @@ def _combined_score(
         + (prediction_score or 0) * weights["p"]
     )
 
-    # News sentiment bonus/penalty (up to ±10 pts, proportional)
     if news_score is not None:
         news_delta = (news_score - 50) / 50 * 10  # -10 to +10
         total += news_delta
 
-    # Event delta (already capped ±15)
     total += event_delta
-
     return round(max(0, min(100, total)), 1)
 
 
@@ -231,14 +208,20 @@ def _decide(
     combined: float,
     data_insufficient: bool = False,
 ) -> Decision:
+    # 1. Handle newly listed / insufficient price data
     if data_insufficient:
+        # Give "WAIT" instead of "DO NOT BUY" if news sentiment is strongly positive
+        if news_score is not None and news_score >= 60:
+            return Decision.WAIT
         return Decision.DO_NOT_BUY
 
+    # 2. Sell / Hold signals if already owned
     if already_owned and combined < 35:
         return Decision.SELL
     if already_owned and 35 <= combined < 60:
         return Decision.HOLD
 
+    # 3. Buy / Prepare signals if not owned
     news_ok       = news_score is None or news_score >= 35
     model_ok      = prediction_score is None or prediction_score >= 50
     resistance_ok = dist_to_resistance_pct is None or dist_to_resistance_pct > 1
@@ -270,22 +253,11 @@ def _decide(
 async def decide(symbol: str, already_owned: bool = False):
     try:
         async with httpx.AsyncClient(timeout=70) as client:
-            # Run all optional fetches concurrently
-            technical_task   = asyncio.create_task(
-                _fetch_optional(client, f"{TECHNICAL_URL}/analyze/{symbol}", "Technical")
-            )
-            fundamental_task = asyncio.create_task(
-                _fetch_optional(client, f"{FUNDAMENTAL_URL}/analyze/{symbol}", "Fundamental")
-            )
-            news_task        = asyncio.create_task(
-                _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News")
-            )
-            events_task      = asyncio.create_task(
-                _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Events")
-            )
-            prediction_task  = asyncio.create_task(
-                _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction")
-            )
+            technical_task   = asyncio.create_task(_fetch_optional(client, f"{TECHNICAL_URL}/analyze/{symbol}", "Technical"))
+            fundamental_task = asyncio.create_task(_fetch_optional(client, f"{FUNDAMENTAL_URL}/analyze/{symbol}", "Fundamental"))
+            news_task        = asyncio.create_task(_fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News"))
+            events_task      = asyncio.create_task(_fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Events"))
+            prediction_task  = asyncio.create_task(_fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction"))
 
             technical, fundamental, news, events, prediction = await asyncio.gather(
                 technical_task, fundamental_task, news_task, events_task, prediction_task
@@ -294,22 +266,28 @@ async def decide(symbol: str, already_owned: bool = False):
         # ── Extract scores ─────────────────────────────────────────────────────
         data_insufficient = False
 
+        # FIX: If Technical service fails, default to Neutral (50)
         if not technical or not isinstance(technical, dict):
             technical = {
                 "technical_score": 50,
                 "trend_strength": "unknown",
                 "volume_surge": False,
                 "close": None, "support": None, "resistance": None,
-                "reasons": ["Technical data temporarily unavailable"],
+                "reasons": ["Technical service temporarily unavailable"],
             }
+        # FIX: Only set insufficient to True if we explicitly lack price data
+        if technical.get("close") is None:
             data_insufficient = True
 
+        # FIX: If Fundamental service fails, default to Neutral (50) and flag fallback
         if not fundamental or not isinstance(fundamental, dict):
             fundamental = {
                 "fundamental_score": 50,
-                "valuation": "fair", "sector": None,
-                "reasons": ["Fundamental data temporarily unavailable"],
-                "metrics": {}, "fallback_used": True,
+                "valuation": "fair",
+                "sector": None,
+                "reasons": ["Live data temporarily unavailable — score is based on last known or default values"],
+                "metrics": {},
+                "fallback_used": True
             }
 
         technical_score   = int(technical.get("technical_score", 50))
@@ -359,12 +337,11 @@ async def decide(symbol: str, already_owned: bool = False):
             entry_low  = round(support_val * 1.01, 2)
             entry_high = round(close * 1.005, 2)
 
-            # Target expands if earnings approaching (anticipation)
             target_pct = 0.08
             if event_signals["earnings_days_out"] is not None:
                 d = event_signals["earnings_days_out"]
                 if 0 < d <= EARNINGS_BOOST_DAYS:
-                    target_pct = 0.12  # wider target near earnings
+                    target_pct = 0.12
             if prediction_score is not None:
                 target_pct = target_pct * 0.7 + (prediction_score / 100) * 0.05
 
@@ -399,7 +376,7 @@ async def decide(symbol: str, already_owned: bool = False):
             "entry_range":      {"low": entry_low, "high": entry_high} if entry_low else None,
             "target":           target,
             "stop_loss":        stop_loss,
-            "holding_period":   "2-6 weeks" if decision == Decision.BUY_NOW else "N/A",
+            "holding_period":   "2-6 weeks" if decision in [Decision.BUY_NOW, Decision.PREPARE_TO_BUY] else "N/A",
             "close":            close,
             "support":          support,
             "resistance":       resistance,
@@ -407,9 +384,9 @@ async def decide(symbol: str, already_owned: bool = False):
             "valuation":        fundamental.get("valuation", "fair"),
             "sector":           fundamental.get("sector"),
             "data_insufficient": data_insufficient,
+            "fundamental_fallback": fundamental.get("fallback_used", False), # Signal to Frontend
         }
 
-        # Pass through rich data for News & Events tab in frontend
         if news and isinstance(news, dict):
             response["news_data"] = {
                 "headline_count": news.get("headline_count", 0),

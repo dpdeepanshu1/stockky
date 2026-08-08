@@ -23,6 +23,13 @@ export const decisionStyle: Record<
     glyph: "◆",
     verb: "Stay in",
   },
+  "WAIT": { // <--- NEW: Added for newly listed stocks
+    color: "text-signal-hold",
+    bg: "bg-signal-hold/10",
+    border: "border-signal-hold/40",
+    glyph: "◐",
+    verb: "Monitor",
+  },
   "DO NOT BUY": {
     color: "text-signal-avoid",
     bg: "bg-signal-avoid/10",

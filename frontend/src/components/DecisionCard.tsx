@@ -110,7 +110,12 @@ export default function DecisionCard({ data, onBack }: Props) {
           {hasPrice && data.support != null && data.resistance != null ? (
             <PriceLevelBar close={data.close!} support={data.support} resistance={data.resistance} />
           ) : (
-            <p className="text-sm text-mist/60 italic">Insufficient data for price levels</p>
+            // UPDATED: Show explicit new stock message if data_insufficient is true
+            <p className="text-sm text-mist/60 italic">
+              {data.data_insufficient 
+                ? `Insufficient price data for ${data.symbol} (newly listed stock). Please check back in 2-3 days after Yahoo Finance updates its database.` 
+                : "Insufficient data for price levels"}
+            </p>
           )}
         </div>
         <div className="rounded-xl border border-slate bg-graphite p-5">
@@ -129,7 +134,12 @@ export default function DecisionCard({ data, onBack }: Props) {
           <h3 className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">
             📊 Fundamental Metrics
           </h3>
-          {hasMetrics ? (
+          {/* UPDATED: Render specific fallback message when fundamental_fallback is true */}
+          {data.fundamental_fallback ? (
+            <p className="text-sm text-mist/60 italic">
+              Live data temporarily unavailable — score is based on last known or default values.
+            </p>
+          ) : hasMetrics ? (
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
               {metrics.revenue_growth != null && (
                 <MetricItem label="Revenue Growth" value={`${metrics.revenue_growth.toFixed(1)}%`} />

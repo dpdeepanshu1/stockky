@@ -30,7 +30,7 @@ export interface FundamentalMetrics {
 
 export interface Decision {
   symbol: string;
-  decision: "BUY NOW" | "PREPARE TO BUY" | "HOLD" | "DO NOT BUY" | "SELL";
+  decision: "BUY NOW" | "PREPARE TO BUY" | "HOLD" | "DO NOT BUY" | "SELL" | "WAIT";
   confidence: "High" | "Medium" | "Low";
   combined_score: number;
   technical_score: number;
@@ -57,7 +57,8 @@ export interface Decision {
   natural_language_summary?: string;
   fundamental_metrics?: FundamentalMetrics;
   data_insufficient?: boolean;
-  event_score_delta?: number; // from decision engine v0.3.0
+  fundamental_fallback?: boolean; // <--- NEW: For showing fallback messaging
+  event_score_delta?: number;
 }
 
 export interface ScanResult {
@@ -132,7 +133,6 @@ export interface SystemHealth {
   services: Record<string, SystemServiceStatus>;
 }
 
-/** Flexible request wrapper with configurable timeout */
 async function request<T>(path: string, init?: RequestInit, retries = 2, timeoutMs = 60000): Promise<T> {
   const base = getApiUrl();
   if (!base) {
@@ -176,7 +176,6 @@ async function request<T>(path: string, init?: RequestInit, retries = 2, timeout
   }
 }
 
-/** Helper to wake a service by its URL */
 export async function wakeService(url: string): Promise<void> {
   if (!url) return;
   try {
@@ -272,7 +271,6 @@ export const api = {
       30000
     ),
 
-  // ── NEW: Manual Telegram notification ──────────────────────────────────────
   sendPicksToTelegram: (payload: { type: string; recommendations: Decision[] }) =>
     request<{ success: boolean; sent: number; message: string }>(
       "/notifications/send-picks",

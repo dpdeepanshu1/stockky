@@ -406,6 +406,7 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
         "sector": None,
         "data_insufficient": False,
         "fundamental_metrics": None,
+        "fundamental_fallback": False, # UPDATED: Added to guarantee this field exists
     }
     merged = {**default, **raw}
     return merged
