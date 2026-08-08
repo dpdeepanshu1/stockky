@@ -41,8 +41,8 @@ def _safe(val, decimals=2):
         return None
 
 
-def _fetch_history(symbol: str):
-    """Fetch OHLCV candles from market-data-service. Returns DataFrame or None if insufficient data."""
+def _fetch_history(symbol: str, min_candles: int = 5):
+    """Fetch OHLCV candles from market-data-service. Returns None if less than min_candles."""
     try:
         resp = httpx.get(
             f"{MARKET_DATA_URL}/history/{symbol}",
@@ -55,8 +55,7 @@ def _fetch_history(symbol: str):
         raise HTTPException(status_code=502, detail=f"Market data service unreachable: {e}")
 
     candles = data.get("candles", [])
-    if len(candles) < 30:
-        # Insufficient data — return None instead of raising error
+    if len(candles) < min_candles:
         return None
 
     df = pd.DataFrame(candles)
@@ -134,7 +133,7 @@ def _bollinger(close: pd.Series, period: int = 20):
 
 
 def _support_resistance(df: pd.DataFrame, window: int = 20):
-    recent = df.tail(window)
+    recent = df.tail(min(window, len(df)))
     return float(recent["Low"].min()), float(recent["High"].max())
 
 
@@ -153,25 +152,39 @@ def root():
 @app.get("/analyze/{symbol}")
 def analyze(symbol: str):
     sym = normalize_symbol(symbol)
-    df  = _fetch_history(sym)
+    df = _fetch_history(sym, min_candles=5)
 
-    # ----- NEW: Handle insufficient data (newly listed stocks) -----
-    if df is None:
+    # ── Handle insufficient data (newly listed stocks) ──
+    if df is None or len(df) < 5:
+        # Try to get at least the current price from quote endpoint
+        price = None
+        try:
+            resp = httpx.get(f"{MARKET_DATA_URL}/quote/{symbol}", timeout=10)
+            if resp.status_code == 200:
+                quote = resp.json()
+                price = quote.get("price")
+        except:
+            pass
+
+        reasons = [
+            f"Insufficient price history for {sym} (newly listed stock). "
+            "Please check back in 2-3 days after Yahoo Finance updates its database."
+        ]
+        if price:
+            reasons.append(f"Current price: ₹{price:.2f}")
+
         return {
             "symbol": sym,
             "technical_score": 50,
             "trend_strength": "unknown",
             "volume_surge": False,
-            "close": None,
+            "close": price,
             "support": None,
             "resistance": None,
             "data_insufficient": True,
-            "reasons": [
-                f"Insufficient price data for {sym} (newly listed stock). "
-                "Please check back in 2-3 days after Yahoo Finance updates its database."
-            ],
+            "reasons": reasons,
         }
-    # -------------------------------------------------------------
+    # ──────────────────────────────────────────────────────
 
     close  = df["Close"]
     high   = df["High"]
@@ -179,25 +192,26 @@ def analyze(symbol: str):
     volume = df["Volume"]
 
     # ── Compute indicators ─────────────────────────────────────────────────────
-    rsi_series     = _rsi(close)
-    macd_line, macd_sig = _macd(close)
-    ema20          = _ema(close, 20)
-    ema50          = _ema(close, 50)
-    ema200         = _ema(close, 200)
-    adx_series     = _adx(high, low, close)
-    atr_series     = _atr(high, low, close)
-    bb_upper, bb_lower = _bollinger(close)
+    # Only compute if we have enough data; else use defaults
+    data_length = len(df)
+    rsi_series = _rsi(close) if data_length >= 14 else pd.Series([50]*data_length, index=df.index)
+    macd_line, macd_sig = _macd(close) if data_length >= 26 else (pd.Series([0]*data_length, index=df.index), pd.Series([0]*data_length, index=df.index))
+    ema20 = _ema(close, min(20, data_length)) if data_length >= 5 else close
+    ema50 = _ema(close, min(50, data_length)) if data_length >= 10 else close
+    ema200 = _ema(close, min(200, data_length)) if data_length >= 30 else close
+    adx_series = _adx(high, low, close) if data_length >= 20 else pd.Series([15]*data_length, index=df.index)
+    atr_series = _atr(high, low, close) if data_length >= 14 else pd.Series([0]*data_length, index=df.index)
+    bb_upper, bb_lower = _bollinger(close, min(20, data_length)) if data_length >= 5 else (close, close)
 
-    latest     = df.iloc[-1]
-    prev       = df.iloc[-2]
-    close_val  = float(latest["Close"])
-    support, resistance = _support_resistance(df)
+    latest = df.iloc[-1]
+    close_val = float(latest["Close"])
+    support, resistance = _support_resistance(df, min(20, len(df)))
 
     rsi_val    = _safe(rsi_series.iloc[-1])   or 50.0
     macd_val   = _safe(macd_line.iloc[-1])    or 0.0
     macd_s_val = _safe(macd_sig.iloc[-1])     or 0.0
-    prev_macd  = _safe(macd_line.iloc[-2])    or 0.0
-    prev_sig   = _safe(macd_sig.iloc[-2])     or 0.0
+    prev_macd  = _safe(macd_line.iloc[-2])    or 0.0 if len(macd_line) > 1 else 0.0
+    prev_sig   = _safe(macd_sig.iloc[-2])     or 0.0 if len(macd_sig) > 1 else 0.0
     ema20_val  = _safe(ema20.iloc[-1])        or close_val
     ema50_val  = _safe(ema50.iloc[-1])        or close_val
     ema200_val = _safe(ema200.iloc[-1])       or close_val
@@ -206,7 +220,7 @@ def analyze(symbol: str):
     bb_up      = _safe(bb_upper.iloc[-1])     or close_val
     bb_lo      = _safe(bb_lower.iloc[-1])     or close_val
     vol_now    = float(latest["Volume"])
-    vol_avg20  = float(volume.tail(20).mean())
+    vol_avg20  = float(volume.tail(min(20, len(volume))).mean()) if len(volume) >= 5 else vol_now
 
     # ── Score (baseline 50) ────────────────────────────────────────────────────
     score   = 50
@@ -222,66 +236,81 @@ def analyze(symbol: str):
     else:
         reasons.append(f"RSI at {rsi_val:.1f} — neutral momentum")
 
-    # MACD
-    bullish_cross = prev_macd < prev_sig and macd_val > macd_s_val
-    bearish_cross = prev_macd > prev_sig and macd_val < macd_s_val
-    if bullish_cross:
-        score += 15
-        reasons.append("MACD just crossed above signal — bullish crossover")
-    elif bearish_cross:
-        score -= 15
-        reasons.append("MACD just crossed below signal — bearish crossover")
-    elif macd_val > macd_s_val:
-        score += 5
-        reasons.append("MACD above signal line — bullish bias intact")
+    # MACD (only if we had enough data)
+    if data_length >= 26:
+        bullish_cross = prev_macd < prev_sig and macd_val > macd_s_val
+        bearish_cross = prev_macd > prev_sig and macd_val < macd_s_val
+        if bullish_cross:
+            score += 15
+            reasons.append("MACD just crossed above signal — bullish crossover")
+        elif bearish_cross:
+            score -= 15
+            reasons.append("MACD just crossed below signal — bearish crossover")
+        elif macd_val > macd_s_val:
+            score += 5
+            reasons.append("MACD above signal line — bullish bias intact")
+        else:
+            score -= 5
+            reasons.append("MACD below signal line — bearish bias intact")
     else:
-        score -= 5
-        reasons.append("MACD below signal line — bearish bias intact")
+        reasons.append("MACD: insufficient data for full calculation")
 
     # EMA trend stack
-    if close_val > ema20_val > ema50_val > ema200_val:
-        score += 15
-        reasons.append("Price above EMA20/50/200 in bullish stack — strong uptrend")
-    elif close_val < ema20_val < ema50_val < ema200_val:
-        score -= 15
-        reasons.append("Price below EMA20/50/200 in bearish stack — strong downtrend")
-    elif close_val > ema200_val:
-        score += 5
-        reasons.append("Price above 200 EMA — long-term trend bullish")
+    if data_length >= 30:
+        if close_val > ema20_val > ema50_val > ema200_val:
+            score += 15
+            reasons.append("Price above EMA20/50/200 in bullish stack — strong uptrend")
+        elif close_val < ema20_val < ema50_val < ema200_val:
+            score -= 15
+            reasons.append("Price below EMA20/50/200 in bearish stack — strong downtrend")
+        elif close_val > ema200_val:
+            score += 5
+            reasons.append("Price above 200 EMA — long-term trend bullish")
+        else:
+            score -= 5
+            reasons.append("Price below 200 EMA — long-term trend bearish")
     else:
-        score -= 5
-        reasons.append("Price below 200 EMA — long-term trend bearish")
+        reasons.append("EMA trend: insufficient data for full trend analysis")
 
     # Parabolic SAR proxy (price vs 20-period SMA)
-    sma20 = float(close.tail(20).mean())
-    sar_bullish = close_val > sma20
-    if sar_bullish:
-        score += 8
-        reasons.append("Price above 20-day average — short-term momentum positive")
+    if data_length >= 20:
+        sma20 = float(close.tail(20).mean())
+        sar_bullish = close_val > sma20
+        if sar_bullish:
+            score += 8
+            reasons.append("Price above 20-day average — short-term momentum positive")
+        else:
+            score -= 8
+            reasons.append("Price below 20-day average — short-term momentum negative")
     else:
-        score -= 8
-        reasons.append("Price below 20-day average — short-term momentum negative")
+        reasons.append("Short-term momentum: insufficient data")
 
     # ADX trend strength
     trend_strength = "strong" if adx_val >= 25 else "moderate" if adx_val >= 20 else "weak"
-    if adx_val >= 25:
-        reasons.append(f"ADX at {adx_val:.1f} — strong trend, higher conviction signal")
+    if data_length >= 20:
+        if adx_val >= 25:
+            reasons.append(f"ADX at {adx_val:.1f} — strong trend, higher conviction signal")
+        else:
+            reasons.append(f"ADX at {adx_val:.1f} — weak/no trend, range-bound caution")
     else:
-        reasons.append(f"ADX at {adx_val:.1f} — weak/no trend, range-bound caution")
+        reasons.append("ADX: insufficient data for trend strength")
 
     # Bollinger Band position
-    bb_range = bb_up - bb_lo if bb_up != bb_lo else 1
-    bb_pct   = (close_val - bb_lo) / bb_range * 100
-    if bb_pct < 20:
-        score += 8
-        reasons.append(f"Price near lower Bollinger Band ({bb_pct:.0f}%) — oversold zone")
-    elif bb_pct > 80:
-        score -= 8
-        reasons.append(f"Price near upper Bollinger Band ({bb_pct:.0f}%) — overbought zone")
+    if data_length >= 20:
+        bb_range = bb_up - bb_lo if bb_up != bb_lo else 1
+        bb_pct   = (close_val - bb_lo) / bb_range * 100
+        if bb_pct < 20:
+            score += 8
+            reasons.append(f"Price near lower Bollinger Band ({bb_pct:.0f}%) — oversold zone")
+        elif bb_pct > 80:
+            score -= 8
+            reasons.append(f"Price near upper Bollinger Band ({bb_pct:.0f}%) — overbought zone")
+    else:
+        reasons.append("Bollinger Bands: insufficient data")
 
     # Proximity to support/resistance
-    dist_res = round(((resistance - close_val) / close_val) * 100, 2)
-    dist_sup = round(((close_val - support)   / close_val) * 100, 2)
+    dist_res = round(((resistance - close_val) / close_val) * 100, 2) if resistance and close_val else 999
+    dist_sup = round(((close_val - support)   / close_val) * 100, 2) if support and close_val else 999
     if dist_res < 2:
         score -= 8
         reasons.append(f"Price only {dist_res}% below resistance ({resistance:.0f}) — breakout needed")
@@ -302,8 +331,8 @@ def analyze(symbol: str):
         "close":           round(close_val, 2),
         "technical_score": score,
         "trend_strength":  trend_strength,
-        "support":         round(support, 2),
-        "resistance":      round(resistance, 2),
+        "support":         round(support, 2) if support else None,
+        "resistance":      round(resistance, 2) if resistance else None,
         "rsi":             round(rsi_val, 1),
         "adx":             round(adx_val, 1),
         "atr":             round(atr_val, 2),
@@ -313,6 +342,7 @@ def analyze(symbol: str):
         "bb_upper":        round(bb_up, 2),
         "bb_lower":        round(bb_lo, 2),
         "volume_surge":    bool(volume_surge),
+        "data_insufficient": data_length < 30,
         "reasons":         reasons,
     }
 
