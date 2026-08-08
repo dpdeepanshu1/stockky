@@ -80,7 +80,7 @@ def _generate_llm_note(feature_dict: dict, probability: float) -> str:
             "Content-Type": "application/json"
         }
         payload = {
-            "model": "llama3-8b-8192",
+            "model": "llama-3.1-8b-instant", # <--- CHANGED HERE: llama3-8b-8192 is deprecated
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -88,7 +88,7 @@ def _generate_llm_note(feature_dict: dict, probability: float) -> str:
             "temperature": 0.7,
             "max_tokens": 60
         }
-        resp = httpx.post("https://api.groq.com/openai/v1/chat/completions", json=payload, timeout=10)
+        resp = httpx.post("https://api.groq.com/openai/v1/chat/completions", json=payload, timeout=30) # Increased timeout to 30s
         if resp.status_code == 200:
             data = resp.json()
             return data['choices'][0]['message']['content'].strip()
