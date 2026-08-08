@@ -438,22 +438,22 @@ def _fetch_fundamental_metrics(symbol: str) -> tuple[Optional[dict], bool]:
             metrics = data.get("metrics")
             fallback_used = data.get("fallback_used", False)
             logger.info(f"Fundamental fallback for {symbol}: {fallback_used}")
+            # Ensure we return a tuple even if metrics is missing
             return metrics, fallback_used
     except Exception as e:
         logger.warning(f"Fundamental fetch failed for {symbol}: {e}")
-    return None, True
+    return {}, True
 
-# UPDATED: Check if metrics is empty or all None to prevent empty dict passing through
+# UPDATED: Safely checks if metrics is empty and sets fallback flag
 def _merge_fundamentals(normalized: dict, symbol: str):
     current_metrics = normalized.get("fundamental_metrics") or {}
-    current_fallback = normalized.get("fundamental_fallback", False)
     
     # If current metrics are empty or all values are None, re-fetch
-    if not any(current_metrics.values()):
+    if not current_metrics or not any(v is not None for v in current_metrics.values()):
         metrics, fallback_used = _fetch_fundamental_metrics(symbol)
-        if metrics:
-            normalized["fundamental_metrics"] = metrics
-            normalized["fundamental_fallback"] = fallback_used
+        # Explicitly assign even if empty dict
+        normalized["fundamental_metrics"] = metrics if metrics is not None else {}
+        normalized["fundamental_fallback"] = fallback_used
 
 def _fetch_news(symbol: str) -> Optional[dict]:
     try:
@@ -607,7 +607,7 @@ async def run_scan_async(task_id: str, universe: List[str]):
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                # UPDATED: Check metrics emptiness
+                # UPDATED: Robustly handles empty fundamental data
                 _merge_fundamentals(normalized, symbol)
 
                 if normalized.get("news_score") is None:
@@ -903,7 +903,7 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                 if result.get("resistance") is None:
                     result["resistance"] = round(price * 1.05, 2)
 
-        # UPDATED: Check metrics emptiness
+        # UPDATED: Robustly handles empty fundamental data
         _merge_fundamentals(result, symbol_to_use)
 
         if result.get("news_score") is None:
@@ -969,7 +969,7 @@ def run_scan(force_refresh: bool = False):
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                # UPDATED: Check metrics emptiness
+                # UPDATED: Robustly handles empty fundamental data
                 _merge_fundamentals(normalized, symbol)
 
                 if normalized.get("news_score") is None:
@@ -1117,7 +1117,7 @@ def scan_watchlist():
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                # UPDATED: Check metrics emptiness
+                # UPDATED: Robustly handles empty fundamental data
                 _merge_fundamentals(normalized, symbol)
 
                 if normalized.get("news_score") is None:

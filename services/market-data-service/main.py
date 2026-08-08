@@ -88,7 +88,6 @@ UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 
-# NEW: Alpha Vantage fallback for IPO/new stocks
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 
 app = FastAPI(title="Stockky Market Data Service", version="0.1.0")
@@ -203,22 +202,25 @@ def get_quote(symbol: str):
     if not info:
         price = None
         if ALPHA_VANTAGE_API_KEY:
-            try:
-                alpha_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={sym}&apikey={ALPHA_VANTAGE_API_KEY}"
-                alpha_resp = httpx.get(alpha_url, timeout=10)
-                if alpha_resp.status_code == 200:
-                    alpha_data = alpha_resp.json()
-                    quote = alpha_data.get("Global Quote", {})
-                    if quote:
-                        price = _safe(quote.get("05. price"))
-                        logger.info(f"Alpha Vantage fallback found price for {sym}: {price}")
-            except Exception as e:
-                logger.warning(f"Alpha Vantage fallback failed for {sym}: {e}")
+            # Try with the exact sym (e.g., MVELECTRO.NS) then without .NS
+            possible_symbols = [sym, sym.replace(".NS", "")]
+            for alpha_sym in possible_symbols:
+                try:
+                    alpha_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={alpha_sym}&apikey={ALPHA_VANTAGE_API_KEY}"
+                    alpha_resp = httpx.get(alpha_url, timeout=10)
+                    if alpha_resp.status_code == 200:
+                        alpha_data = alpha_resp.json()
+                        quote = alpha_data.get("Global Quote", {})
+                        if quote:
+                            price = _safe(quote.get("05. price"))
+                            if price is not None:
+                                logger.info(f"Alpha Vantage fallback found price for {alpha_sym}: {price}")
+                                break
+                except Exception as e:
+                    logger.warning(f"Alpha Vantage fallback for {alpha_sym} failed: {e}")
 
-        if price is None:
-            raise HTTPException(status_code=404, detail=f"No data for {sym}")
-
-        # Construct minimal quote response
+        # UPDATED: Return 200 with price: None instead of raising 404.
+        # This allows the Technical Analysis Service to gracefully flag data_insufficient.
         result = {
             "symbol": sym,
             "name": sym,
@@ -232,7 +234,7 @@ def get_quote(symbol: str):
             "pe_ratio": None,
             "fetched_at": datetime.utcnow().isoformat(),
         }
-        _cache_set(cache_key, result, ttl=300) # Cache fallback price for 5 mins to stay within limits
+        _cache_set(cache_key, result, ttl=300)
         return result
 
     price = info.get("regularMarketPrice") or info.get("last_price")
@@ -504,9 +506,8 @@ def get_fundamentals_raw(symbol: str):
 
         logger.info(f"Fundamentals for {sym}: PE={pe_ratio}, ROE={roe}, Revenue growth={revenue_growth}")
 
-        # UPDATED: Store in fallback cache ONLY if we got *any* form of data (Info only or metrics)
-        # This prevents empty dicts from being returned on partial failures
-        if info or any(v is not None for v in [pe_ratio, sector, market_cap, revenue_growth, roe]):
+        # UPDATED: Do NOT wipe the result if financial statements fail. Always preserve `info` data.
+        if any(v is not None for v in [pe_ratio, sector, market_cap, revenue_growth, roe]):
             _fallback_set(cache_key, result)
 
         # Cache for 1 day (fundamentals change slowly)
@@ -524,7 +525,7 @@ def get_fundamentals_raw(symbol: str):
             logger.info(f"Serving fallback fundamentals for {sym} (stale data)")
             stale = dict(stale)
             stale["stale"] = True
-            _cache_set(cache_key, stale, ttl=1800)  # short TTL, retry soon
+            _cache_set(cache_key, stale, ttl=1800)
             return stale
         raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
 
