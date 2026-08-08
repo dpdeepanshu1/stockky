@@ -1,7 +1,7 @@
 """
 Prediction Service - GenAI Enhanced (512MB Optimized)
 --------------------
-Uses TinyLlama 1.1B GGUF via llama-cpp-python 0.2.26.
+Uses TinyLlama 1.1B GGUF via llama-cpp-python 0.1.78.
 """
 import os
 import logging
@@ -40,17 +40,21 @@ _llm = None
 try:
     logger.info("Loading GenAI model (TinyLlama)...")
     
-    # Use hf_hub_download to locate the cached model (downloaded during build)
+    # Locate the cached model (downloaded during build)
     model_path = hf_hub_download(
         repo_id="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
         filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
     )
     
-    # Load the model with safe CPU parameters
+    # Verify the file exists and is not empty
+    if not os.path.exists(model_path) or os.path.getsize(model_path) == 0:
+        raise FileNotFoundError(f"Model file missing or empty: {model_path}")
+    
+    # Load the model with safe CPU parameters (n_threads=1 prevents threading issues on Render)
     _llm = Llama(
         model_path=model_path,
         n_ctx=512,
-        n_threads=1,          # Prevents threading issues on Render
+        n_threads=1,          # Force single-threaded to avoid AssertionError on 0.1.78
         verbose=False
     )
     logger.info("GenAI model loaded successfully!")
