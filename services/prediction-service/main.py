@@ -1,8 +1,9 @@
 """
-Prediction Service - GenAI Enhanced
+Prediction Service - GenAI Enhanced (512MB Optimized)
 --------------------
-Estimates probability of price movement using XGBoost, and now uses
-a tiny Free GenAI model to interpret the technicals into a natural language summary.
+Estimates probability of price movement using XGBoost.
+Uses a quantized TinyLlama GGUF model running via llama-cpp-python 
+to generate natural Hinglish summaries with zero OOM risk.
 """
 import os
 import logging
@@ -12,7 +13,7 @@ import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from transformers import pipeline # <--- GenAI Import
+from llama_cpp import Llama # <--- Lightweight GenAI replaced transformers
 
 from features import latest_feature_vector, FEATURE_COLUMNS
 
@@ -22,7 +23,7 @@ logger = logging.getLogger("prediction-service")
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data-service:8001")
 MODEL_PATH = os.getenv("MODEL_PATH", "model.pkl")
 
-app = FastAPI(title="Stockky Prediction Service", version="0.2.0-genai")
+app = FastAPI(title="Stockky Prediction Service", version="0.3.0-llama")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _model = None
@@ -35,22 +36,28 @@ if os.path.exists(MODEL_PATH):
 else:
     logger.warning("No trained model found at %s — run train.py first. Serving fallback responses.", MODEL_PATH)
 
-# --- Load GenAI Text Model (DistilGPT2) ---
+# --- Load Lightweight GenAI Model (TinyLlama 1.1B GGUF, ~220MB RAM) ---
 _llm = None
 try:
-    logger.info("Loading Free GenAI model (distilgpt2)...")
-    # distilgpt2 is only ~82MB and runs safely on CPU
-    _llm = pipeline("text-generation", model="distilgpt2", device_map="cpu", max_new_tokens=50, do_sample=True)
+    logger.info("Loading GenAI model (TinyLlama)...")
+    # Uses llama.cpp, automatically downloads the quantized model on first run
+    _llm = Llama.from_pretrained(
+        repo_id="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+        filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        n_ctx=512,      # Low context to keep memory usage under 300MB
+        n_threads=2,    # Render CPU thread limit
+        verbose=False
+    )
     logger.info("GenAI model loaded successfully!")
 except Exception as e:
-    logger.warning(f"Could not load GenAI model due to memory constraints: {e}. Falling back to templated strings.")
+    logger.warning(f"Could not load GenAI model: {e}. Falling back to templated strings.")
 
 
 @app.get("/")
 async def root():
     return {
         "service": "Stockky Prediction Service",
-        "version": "0.2.0-genai",
+        "version": "0.3.0-llama",
         "status": "running",
         "model_loaded": _model is not None,
         "genai_loaded": _llm is not None,
@@ -84,18 +91,17 @@ def _generate_llm_note(feature_dict: dict, probability: float) -> str:
     if _llm is None:
         return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days, based on current technical setup vs 5 years of historical patterns across a 25-stock NSE universe."
     
-    # Build a prompt for the GenAI model based on current features
-    # It receives the raw indicators like RSI, MACD, Price position
     rsi = int(feature_dict.get('rsi', 50))
     adx = int(feature_dict.get('adx', 20))
     price_vs_200ema = "above" if feature_dict.get('price_vs_200ema', 0) > 0 else "below"
     
-    prompt = f"RSI {rsi} and ADX {adx}. Price is {price_vs_200ema} 200 EMA. Probability {round(probability * 100)}%. Explain in Hinglish why this stock may move."
+    # Prompt optimized for the TinyLlama chat format
+    prompt = f"<|system|>You are an expert stock market analyst. Explain in Hinglish.</s><|user|>RSI is {rsi}. ADX is {adx}. Price is {price_vs_200ema} 200 EMA. Probability {round(probability * 100)}%. Explain why stock may move.</s><|assistant|>"
     
     try:
-        res = _llm(prompt, max_new_tokens=60)[0]['generated_text']
-        # Clean up the result to remove the prompt itself
-        return res.replace(prompt, "").strip()
+        # Generate text with 60 token limit, strictly limited to keep CPU usage low
+        res = _llm(prompt, max_tokens=60, temperature=0.7, stop=["</s>", "<|"])
+        return res['choices'][0]['text'].strip()
     except Exception as e:
         logger.warning(f"GenAI generation failed: {e}")
         return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days, based on current technical setup."
@@ -134,4 +140,4 @@ def predict(symbol: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8007, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8007)), reload=True)

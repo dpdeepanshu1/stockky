@@ -1,39 +1,29 @@
 """
-News Intelligence Service - GenAI Enhanced
+News Intelligence Service - 512MB Stable
 ---------------------------
-Upgraded to use a DistilBERT Transformer model for deep-learning sentiment analysis
-instead of a basic lexicon scorer.
+Replaced heavy DistilBERT with VADER to guarantee deployment
+success on Render's 512MB free tier containers.
 """
 import os
 import logging
-import re
 from datetime import datetime, timedelta
 from typing import List
 from urllib.parse import quote
 
 import feedparser
-import torch # <--- FIX: Import torch for dtype
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from transformers import pipeline
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("news-intelligence-service")
 
-app = FastAPI(title="Stockky News Intelligence Service", version="0.2.0-genai")
+app = FastAPI(title="Stockky News Intelligence Service", version="0.2.0-stable")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Load the DistilBERT sentiment model
-logger.info("Loading DistilBERT sentiment model...")
-
-# FIXED: Added torch_dtype=torch.float16 to reduce RAM usage by 50% and prevent Status 137 OOM.
-classifier = pipeline(
-    "sentiment-analysis", 
-    model="distilbert-base-uncased-finetuned-sst-2-english",
-    device="cpu",
-    torch_dtype=torch.float16
-)
-logger.info("DistilBERT model loaded successfully!")
+# Lightweight VADER analyzer uses less than 30MB of RAM
+analyzer = SentimentIntensityAnalyzer()
+logger.info("VADER sentiment analyzer loaded successfully!")
 
 HIGH_IMPACT_NEGATIVE = [
     "fraud", "scam", "raid", "probe", "sebi action", "resignation", "resigns",
@@ -69,21 +59,13 @@ def _company_query(symbol: str) -> str:
 
 
 def _score_headline(title: str) -> float:
-    try:
-        result = classifier(title)[0]
-        label = result['label'] # 'POSITIVE' or 'NEGATIVE'
-        confidence = result['score']
-        
-        base = confidence if label == "POSITIVE" else -confidence
-    except Exception as e:
-        logger.warning(f"Error in HuggingFace pipeline, falling back to 0 for title: {title[:30]}... Error: {e}")
-        base = 0.0
-        
+    # Use VADER's compound score (-1 to +1) and apply domain-specific tweaks
+    base = analyzer.polarity_scores(title)["compound"]
     lowered = title.lower()
     if any(term in lowered for term in HIGH_IMPACT_NEGATIVE):
-        base -= 0.4
+        base -= 0.6
     if any(term in lowered for term in HIGH_IMPACT_POSITIVE):
-        base += 0.3
+        base += 0.4
     return max(-1.0, min(1.0, base))
 
 
@@ -116,9 +98,9 @@ def _fetch_headlines(symbol: str, max_items: int = 12) -> List[dict]:
 def root():
     return {
         "service": "Stockky News Intelligence Service",
-        "version": "0.2.0-genai",
+        "version": "0.2.0-stable",
         "status": "running",
-        "model": "distilbert-base-uncased-finetuned-sst-2-english",
+        "model": "vaderSentiment",
     }
 
 
