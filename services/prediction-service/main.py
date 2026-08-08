@@ -1,18 +1,8 @@
 """
-Prediction Service
+Prediction Service - GenAI Enhanced
 --------------------
-Single responsibility: estimate the probability that a stock becomes a
-high-quality buying opportunity (per the training label: ~5%+ gain within
-~10 trading days) — NOT a certainty, a probability. This is the piece of
-the product spec that says "estimate probability... whenever confidence is
-insufficient, wait" — the Decision Engine treats low model confidence the
-same way it treats a weak technical/fundamental score: as a reason to wait,
-not a reason to force a call.
-
-If model.pkl hasn't been trained yet (see train.py), this service falls
-back to an honest "model not trained" response rather than pretending to
-have a number — the Decision Engine is written to treat that as neutral,
-not as a false signal.
+Estimates probability of price movement using XGBoost, and now uses
+a tiny Free GenAI model to interpret the technicals into a natural language summary.
 """
 import os
 import logging
@@ -22,6 +12,7 @@ import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from transformers import pipeline # <--- GenAI Import
 
 from features import latest_feature_vector, FEATURE_COLUMNS
 
@@ -31,7 +22,7 @@ logger = logging.getLogger("prediction-service")
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data-service:8001")
 MODEL_PATH = os.getenv("MODEL_PATH", "model.pkl")
 
-app = FastAPI(title="Stockky Prediction Service", version="0.1.0")
+app = FastAPI(title="Stockky Prediction Service", version="0.2.0-genai")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _model = None
@@ -44,28 +35,31 @@ if os.path.exists(MODEL_PATH):
 else:
     logger.warning("No trained model found at %s — run train.py first. Serving fallback responses.", MODEL_PATH)
 
+# --- Load GenAI Text Model (DistilGPT2) ---
+_llm = None
+try:
+    logger.info("Loading Free GenAI model (distilgpt2)...")
+    # distilgpt2 is only ~82MB and runs safely on CPU
+    _llm = pipeline("text-generation", model="distilgpt2", device_map="cpu", max_new_tokens=50, do_sample=True)
+    logger.info("GenAI model loaded successfully!")
+except Exception as e:
+    logger.warning(f"Could not load GenAI model due to memory constraints: {e}. Falling back to templated strings.")
 
-# ---------- ROOT ROUTE ----------
+
 @app.get("/")
 async def root():
     return {
         "service": "Stockky Prediction Service",
-        "version": "0.1.0",
+        "version": "0.2.0-genai",
         "status": "running",
         "model_loaded": _model is not None,
-        "endpoints": {
-            "/health": "GET – health check",
-            "/predict/{symbol}": "GET – get prediction for a symbol",
-            "/docs": "Swagger UI documentation",
-            "/openapi.json": "OpenAPI schema"
-        },
-        "note": "If model is not loaded, prediction returns a neutral fallback (no signal). Run 'python train.py' to train the model."
+        "genai_loaded": _llm is not None,
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "prediction-service", "model_loaded": _model is not None}
+    return {"status": "ok", "service": "prediction-service", "model_loaded": _model is not None, "genai_loaded": _llm is not None}
 
 
 def _fetch_history(symbol: str) -> pd.DataFrame:
@@ -86,6 +80,25 @@ def _fetch_history(symbol: str) -> pd.DataFrame:
     df.rename(columns=str.title, inplace=True)
     return df
 
+def _generate_llm_note(feature_dict: dict, probability: float) -> str:
+    if _llm is None:
+        return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days, based on current technical setup vs 5 years of historical patterns across a 25-stock NSE universe."
+    
+    # Build a prompt for the GenAI model based on current features
+    # It receives the raw indicators like RSI, MACD, Price position
+    rsi = int(feature_dict.get('rsi', 50))
+    adx = int(feature_dict.get('adx', 20))
+    price_vs_200ema = "above" if feature_dict.get('price_vs_200ema', 0) > 0 else "below"
+    
+    prompt = f"RSI {rsi} and ADX {adx}. Price is {price_vs_200ema} 200 EMA. Probability {round(probability * 100)}%. Explain in Hinglish why this stock may move."
+    
+    try:
+        res = _llm(prompt, max_new_tokens=60)[0]['generated_text']
+        # Clean up the result to remove the prompt itself
+        return res.replace(prompt, "").strip()
+    except Exception as e:
+        logger.warning(f"GenAI generation failed: {e}")
+        return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days, based on current technical setup."
 
 @app.get("/predict/{symbol}")
 def predict(symbol: str):
@@ -95,7 +108,7 @@ def predict(symbol: str):
             "model_loaded": False,
             "probability": None,
             "prediction_score": None,
-            "note": "No trained model yet. Run 'docker compose run --rm prediction-service python train.py' to train one. Decision Engine treats this as neutral, not a signal.",
+            "note": "No trained model yet. Run 'docker compose run --rm prediction-service python train.py' to train one.",
         }
 
     df = _fetch_history(symbol)
@@ -108,17 +121,17 @@ def predict(symbol: str):
     X = pd.DataFrame([features])[FEATURE_COLUMNS]
     probability = float(_model.predict_proba(X)[0, 1])
     prediction_score = round(probability * 100)
+    llm_note = _generate_llm_note(features, probability)
 
     return {
         "symbol": symbol.upper(),
         "model_loaded": True,
         "probability": round(probability, 3),
         "prediction_score": prediction_score,
-        "note": f"Estimated {prediction_score}% probability of a ~5%+ move within 10 trading days, based on current technical setup vs 5 years of historical patterns across a 25-stock NSE universe.",
+        "note": llm_note,
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=8007, reload=True)

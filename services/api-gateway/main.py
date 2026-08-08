@@ -48,7 +48,7 @@ SYSTEM_SERVICES = {
     "notification": {"url": NOTIFICATION_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.0.0")
+app = FastAPI(title="Stockky API Gateway", version="2.1.0")
 
 # --- CORS Middleware (explicit) ---
 app.add_middleware(
@@ -390,6 +390,7 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
         "fundamental_score": 50,
         "news_score": None,
         "prediction_score": None,
+        "prediction_note": None, # <--- Added to preserve LLM note
         "event_risk": False,
         "entry_range": None,
         "target": None,
@@ -429,7 +430,6 @@ def _fetch_price_from_quote(symbol: str) -> Optional[float]:
         logger.warning(f"Price fetch failed for {symbol}: {e}")
     return None
 
-# UPDATED: Returns a tuple of (metrics dict, fallback_used bool)
 def _fetch_fundamental_metrics(symbol: str) -> tuple[Optional[dict], bool]:
     try:
         resp = httpx.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=10)
@@ -438,20 +438,15 @@ def _fetch_fundamental_metrics(symbol: str) -> tuple[Optional[dict], bool]:
             metrics = data.get("metrics")
             fallback_used = data.get("fallback_used", False)
             logger.info(f"Fundamental fallback for {symbol}: {fallback_used}")
-            # Ensure we return a tuple even if metrics is missing
             return metrics, fallback_used
     except Exception as e:
         logger.warning(f"Fundamental fetch failed for {symbol}: {e}")
     return {}, True
 
-# UPDATED: Safely checks if metrics is empty and sets fallback flag
 def _merge_fundamentals(normalized: dict, symbol: str):
     current_metrics = normalized.get("fundamental_metrics") or {}
-    
-    # If current metrics are empty or all values are None, re-fetch
     if not current_metrics or not any(v is not None for v in current_metrics.values()):
         metrics, fallback_used = _fetch_fundamental_metrics(symbol)
-        # Explicitly assign even if empty dict
         normalized["fundamental_metrics"] = metrics if metrics is not None else {}
         normalized["fundamental_fallback"] = fallback_used
 
@@ -486,7 +481,7 @@ def _wake_notification_service() -> bool:
     except Exception:
         return False
 
-# ── Hinglish summary ──────────────────────────────────────────────────────
+# ── Hinglish & GenAI summary ──────────────────────────────────────────────
 def _generate_summary(data) -> str:
     if not data or not isinstance(data, dict):
         return "Data unavailable"
@@ -500,6 +495,10 @@ def _generate_summary(data) -> str:
     holding = data.get("holding_period")
     reasons = data.get("reasons") or {}
     close = data.get("close")
+    
+    # NEW: Grab the GenAI Prediction Note if available
+    prediction_note = data.get("prediction_note")
+
     if decision == "BUY NOW":
         summary = f"🚀 {symbol} अभी खरीदने का बहुत अच्छा मौका है! "
         summary += f"एंट्री {entry.get('low')}-{entry.get('high')}, टारगेट {target}, स्टॉप लॉस {stop}. "
@@ -511,15 +510,19 @@ def _generate_summary(data) -> str:
         if fund:
             summary += f"फंडामेंटल: {fund[0]}. "
         summary += "जल्दी शामिल करें!"
+        
     elif decision == "PREPARE TO BUY":
         summary = f"⏳ {symbol} के लिए, तैयारी करें, अभी इंतज़ार करें. "
         summary += f"एंट्री {entry.get('low')}-{entry.get('high')}, टारगेट {target}, स्टॉप {stop}. "
         summary += f"स्कोर {combined_score}. वॉल्यूम कन्फर्मेशन का इंतज़ार करें."
+        
     elif decision == "HOLD":
         summary = f"🔄 {symbol} को होल्ड करें. टारगेट {target}, स्टॉप {stop}. स्कोर {combined_score}."
+        
     elif decision == "SELL":
         summary = f"🔴 {symbol} को बेचें. कीमत {close}, टारगेट से नीचे. स्टॉप {stop} पार. स्कोर {combined_score}."
-    else:
+        
+    else: # DO NOT BUY / WAIT
         summary = f"❌ {symbol} अभी न खरीदें. स्कोर {combined_score}. "
         tech = reasons.get("technical", [])
         if tech:
@@ -528,6 +531,11 @@ def _generate_summary(data) -> str:
         if fund:
             summary += f"फंडामेंटल: {fund[0]}. "
         summary += "कुछ दिन और देखें."
+
+    # NEW: Append the GenAI prediction note for a truly AI-driven narrative
+    if prediction_note:
+        summary += f" 🤖 {prediction_note}"
+
     return summary
 
 # ── Telegram notification helper ──────────────────────────────────────────
@@ -607,7 +615,6 @@ async def run_scan_async(task_id: str, universe: List[str]):
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                # UPDATED: Robustly handles empty fundamental data
                 _merge_fundamentals(normalized, symbol)
 
                 if normalized.get("news_score") is None:
@@ -748,7 +755,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
@@ -903,7 +910,6 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                 if result.get("resistance") is None:
                     result["resistance"] = round(price * 1.05, 2)
 
-        # UPDATED: Robustly handles empty fundamental data
         _merge_fundamentals(result, symbol_to_use)
 
         if result.get("news_score") is None:
@@ -923,9 +929,24 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                 reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
                 result["reasons"] = reasons
 
+        # --- NEW: Retrieve GenAI prediction note ---
+        if result.get("prediction_score") is None:
+            # Attempt to fetch prediction to get the LLM note
+            try:
+                pred_resp = httpx.get(f"{PREDICTION_URL}/predict/{symbol_to_use}", timeout=15)
+                if pred_resp.status_code == 200:
+                    pred_data = pred_resp.json()
+                    if pred_data.get("model_loaded"):
+                        result["prediction_score"] = pred_data.get("prediction_score")
+                        result["prediction_note"] = pred_data.get("note") # Capture GenAI Narrative
+            except Exception as e:
+                logger.warning(f"Prediction service lookup failed for {symbol_to_use}: {e}")
+
         if corrected_from:
             result["corrected_from"] = corrected_from
             result["symbol"] = symbol_to_use
+            
+        # Generate the composite summary (Hinglish + AI Note)
         result["natural_language_summary"] = _generate_summary(result)
         return result
 
@@ -969,7 +990,6 @@ def run_scan(force_refresh: bool = False):
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                # UPDATED: Robustly handles empty fundamental data
                 _merge_fundamentals(normalized, symbol)
 
                 if normalized.get("news_score") is None:
@@ -988,6 +1008,18 @@ def run_scan(force_refresh: bool = False):
                         reasons = normalized.get("reasons", {})
                         reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
                         normalized["reasons"] = reasons
+
+                # --- NEW: Retrieve GenAI prediction note ---
+                if normalized.get("prediction_score") is None:
+                    try:
+                        pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=15)
+                        if pred_resp.status_code == 200:
+                            pred_data = pred_resp.json()
+                            if pred_data.get("model_loaded"):
+                                normalized["prediction_score"] = pred_data.get("prediction_score")
+                                normalized["prediction_note"] = pred_data.get("note") # Capture GenAI Narrative
+                    except Exception as e:
+                        logger.warning(f"Prediction service lookup failed during scan for {symbol}: {e}")
 
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
@@ -1117,7 +1149,6 @@ def scan_watchlist():
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                # UPDATED: Robustly handles empty fundamental data
                 _merge_fundamentals(normalized, symbol)
 
                 if normalized.get("news_score") is None:
@@ -1136,6 +1167,18 @@ def scan_watchlist():
                         reasons = normalized.get("reasons", {})
                         reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
                         normalized["reasons"] = reasons
+
+                # --- NEW: Retrieve GenAI prediction note ---
+                if normalized.get("prediction_score") is None:
+                    try:
+                        pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=15)
+                        if pred_resp.status_code == 200:
+                            pred_data = pred_resp.json()
+                            if pred_data.get("model_loaded"):
+                                normalized["prediction_score"] = pred_data.get("prediction_score")
+                                normalized["prediction_note"] = pred_data.get("note") # Capture GenAI Narrative
+                    except Exception as e:
+                        logger.warning(f"Prediction service lookup failed during watchlist scan for {symbol}: {e}")
 
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)

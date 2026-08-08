@@ -1,19 +1,8 @@
 """
-News Intelligence Service
+News Intelligence Service - GenAI Enhanced
 ---------------------------
-Single responsibility: pull recent news for a company from free, keyless
-sources (Google News RSS) and turn it into a news sentiment score (0-100)
-plus the headlines behind it. The Decision Engine treats this as one more
-input score, exactly like Technical/Fundamental.
-
-Why VADER instead of a transformer model: VADER (`vaderSentiment`) is a
-tiny, pure-Python lexicon scorer — no multi-GB model download, no GPU,
-starts in milliseconds, and free forever. It's a deliberate MVP trade-off:
-good enough to separate "clearly bad news" from "clearly good news" on
-short headlines. Swap in a `transformers` pipeline
-(`distilbert-base-uncased-finetuned-sst-2-english`, also free) later if you
-want finer-grained accuracy — the `_score_headline` function is the only
-place that needs to change.
+Upgraded to use a DistilBERT Transformer model for deep-learning sentiment analysis
+instead of a basic lexicon scorer.
 """
 import os
 import logging
@@ -25,18 +14,23 @@ from urllib.parse import quote
 import feedparser
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from transformers import pipeline # <--- GenAI Import
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("news-intelligence-service")
 
-app = FastAPI(title="Stockky News Intelligence Service", version="0.1.0")
+app = FastAPI(title="Stockky News Intelligence Service", version="0.2.0-genai")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-analyzer = SentimentIntensityAnalyzer()
+# Load the DistilBERT sentiment model (free, runs on CPU, ~67MB)
+logger.info("Loading DistilBERT sentiment model...")
+classifier = pipeline(
+    "sentiment-analysis", 
+    model="distilbert-base-uncased-finetuned-sst-2-english", 
+    device_map="cpu"
+)
+logger.info("DistilBERT model loaded successfully!")
 
-# Words that matter a lot more than generic positive/negative sentiment for
-# equity news specifically — boost/penalize on top of the base VADER score.
 HIGH_IMPACT_NEGATIVE = [
     "fraud", "scam", "raid", "probe", "sebi action", "resignation", "resigns",
     "downgrade", "default", "insolvency", "bankruptcy", "lawsuit", "penalty",
@@ -71,12 +65,24 @@ def _company_query(symbol: str) -> str:
 
 
 def _score_headline(title: str) -> float:
-    base = analyzer.polarity_scores(title)["compound"]  # -1 .. +1
+    # GenAI Prediction: Use DistilBERT
+    try:
+        result = classifier(title)[0]
+        label = result['label'] # 'POSITIVE' or 'NEGATIVE'
+        confidence = result['score']
+        
+        # Map to -1 to 1 scale
+        base = confidence if label == "POSITIVE" else -confidence
+    except Exception as e:
+        logger.warning(f"Error in HuggingFace pipeline, falling back to 0 for title: {title[:30]}... Error: {e}")
+        base = 0.0
+        
     lowered = title.lower()
+    # Apply manual domain-specific adjustments for stocks
     if any(term in lowered for term in HIGH_IMPACT_NEGATIVE):
-        base -= 0.6
+        base -= 0.4
     if any(term in lowered for term in HIGH_IMPACT_POSITIVE):
-        base += 0.4
+        base += 0.3
     return max(-1.0, min(1.0, base))
 
 
@@ -109,12 +115,9 @@ def _fetch_headlines(symbol: str, max_items: int = 12) -> List[dict]:
 def root():
     return {
         "service": "Stockky News Intelligence Service",
+        "version": "0.2.0-genai",
         "status": "running",
-        "endpoints": {
-            "/health": "GET – health check",
-            "/analyze/{symbol}": "GET – news sentiment score for a symbol",
-            "/docs": "Swagger UI documentation",
-        },
+        "model": "distilbert-base-uncased-finetuned-sst-2-english",
     }
 
 

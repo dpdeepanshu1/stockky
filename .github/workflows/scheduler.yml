@@ -22,6 +22,32 @@ jobs:
       - name: Install dependencies
         run: pip install -r services/scheduler-service/requirements.txt
 
+      # NEW STEP: Wake up all microservices before running the scheduler
+      - name: Wake up services
+        env:
+          API_GATEWAY_URL: ${{ secrets.API_GATEWAY_URL }}
+          MARKET_DATA_URL: ${{ secrets.MARKET_DATA_URL }}
+          TECHNICAL_URL: ${{ secrets.TECHNICAL_URL }}
+          FUNDAMENTAL_URL: ${{ secrets.FUNDAMENTAL_URL }}
+          DECISION_URL: ${{ secrets.DECISION_URL }}
+          NEWS_URL: ${{ secrets.NEWS_URL }}
+          EVENT_TRACKER_URL: ${{ secrets.EVENT_TRACKER_URL }}
+          PREDICTION_URL: ${{ secrets.PREDICTION_URL }}
+          NOTIFICATION_URL: ${{ secrets.NOTIFICATION_URL }}
+        run: |
+          echo "Pinging all services to wake them up (preventing cold starts)..."
+          curl -I $API_GATEWAY_URL/health || true
+          curl -I $MARKET_DATA_URL/health || true
+          curl -I $TECHNICAL_URL/health || true
+          curl -I $FUNDAMENTAL_URL/health || true
+          curl -I $DECISION_URL/health || true
+          curl -I $NEWS_URL/health || true
+          curl -I $EVENT_TRACKER_URL/health || true
+          curl -I $PREDICTION_URL/health || true
+          curl -I $NOTIFICATION_URL/health || true
+          echo "Waiting 60 seconds for services to fully spin up..."
+          sleep 60
+
       - name: Run scheduler tick
         env:
           API_GATEWAY_URL: ${{ secrets.API_GATEWAY_URL }}
