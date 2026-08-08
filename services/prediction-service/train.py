@@ -57,6 +57,9 @@ signal.signal(signal.SIGINT, signal_handler)
 # ----------------------------------------------------------------------
 # Base universe + dynamic extras
 # ----------------------------------------------------------------------
+# Known symbols that consistently fail on Yahoo Finance (removed)
+PROBLEMATIC_SYMBOLS = {"VARUNBEV", "INTERGLOBE", "INDEGENE", "POLICYBZ"}
+
 BASE_TRAINING_UNIVERSE = [
     # === Existing (retained) ===
     "TCS", "INFY", "HDFCBANK", "ICICIBANK", "RELIANCE", "HCLTECH",
@@ -66,17 +69,16 @@ BASE_TRAINING_UNIVERSE = [
     "MARUTI", "SUNPHARMA", "TITAN", "ITC",
     "BAJFINANCE", "ASIANPAINT", "NESTLEIND", "ULTRACEMCO",
 
-    # === New: Top broker picks (August 2026) ===
+    # === Top broker picks (August 2026) ===
     "BHARTIARTL", "M&M", "SHRIRAMFIN",
-    "INDIGO",       # Corrected from INTERGLOBE
+    "INDIGO",       # May or may not work; kept, but filtering will handle failure
     "VARUNBEV", "DMART", "CHOLAFIN", "PHOENIXLTD",
     "FORTIS", "CUMMINSIND", "SYRMA", "ADANIPORTS", "HINDALCO",
     "AUROPHARMA", "NAVINFLUOR",
-    # "POLICYBZ",   # Removed – not available on Yahoo Finance
+    # "POLICYBZ",   # Already removed
     "NEULANDLAB", "BIOCON",
     "BAJAJ-AUTO", "PAYTM",
     "MPHASIS", "RICOAUTO",
-    # NOTE: INDEGENE removed (no data)
 ]
 
 
@@ -99,6 +101,9 @@ def load_dynamic_training_universe():
                         symbols.add(symbol)
                         logger.debug("Added %s from %s", symbol, file)
 
+    # Remove problematic symbols that are known to be unavailable
+    symbols = symbols - PROBLEMATIC_SYMBOLS
+
     return sorted(symbols)
 
 
@@ -110,7 +115,7 @@ logger.info("Total symbols : %d", len(TRAINING_UNIVERSE))
 logger.info("=" * 80)
 
 LOOKAHEAD_DAYS = 10
-TARGET_GAIN_PCT = 5.0
+TARGET_GAIN_PCT = 4.5  # Reduced from 5.0 to get more positive samples
 
 
 def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -267,14 +272,20 @@ def main():
         )
         return
 
+    # Compute scale_pos_weight to handle class imbalance
+    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+    logger.info("Scale pos weight: %.2f", scale_pos_weight)
+
     model = XGBClassifier(
-        n_estimators=200,
+        n_estimators=300,          # Slightly more trees
         max_depth=4,
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
+        scale_pos_weight=scale_pos_weight,   # <-- NEW: penalises false negatives
         eval_metric="logloss",
         random_state=42,
+        use_label_encoder=False,
     )
     model.fit(X_train, y_train)
 
