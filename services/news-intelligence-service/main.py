@@ -24,10 +24,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # Load the DistilBERT sentiment model (free, runs on CPU, ~67MB)
 logger.info("Loading DistilBERT sentiment model...")
+# FIXED: Removed device_map="cpu" to avoid needing the 'accelerate' package.
+# The pipeline will default to CPU automatically, which is perfect for Render's free tier.
 classifier = pipeline(
     "sentiment-analysis", 
-    model="distilbert-base-uncased-finetuned-sst-2-english", 
-    device_map="cpu"
+    model="distilbert-base-uncased-finetuned-sst-2-english"
 )
 logger.info("DistilBERT model loaded successfully!")
 
