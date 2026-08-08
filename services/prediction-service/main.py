@@ -1,7 +1,7 @@
 """
 Prediction Service - GenAI Enhanced (512MB Optimized)
 --------------------
-Uses TinyLlama 1.1B GGUF via llama-cpp-python 0.1.78 (stable generic CPU build).
+Uses TinyLlama 1.1B GGUF via llama-cpp-python 0.2.26.
 """
 import os
 import logging
@@ -12,7 +12,6 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from llama_cpp import Llama
-from huggingface_hub import hf_hub_download
 
 from features import latest_feature_vector, FEATURE_COLUMNS
 
@@ -40,22 +39,13 @@ _llm = None
 try:
     logger.info("Loading GenAI model (TinyLlama)...")
     
-    # Locate the cached model (downloaded during build)
-    model_path = hf_hub_download(
+    # from_pretrained automatically locates the cached model from the build step
+    _llm = Llama.from_pretrained(
         repo_id="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
-        filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
-    )
-    
-    # Verify file exists and is not empty
-    if not os.path.exists(model_path) or os.path.getsize(model_path) == 0:
-        raise FileNotFoundError(f"Model file missing or empty: {model_path}")
-    
-    # Load model with safe CPU parameters (n_threads=1 prevents threading issues on Render)
-    _llm = Llama(
-        model_path=model_path,
+        filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
         n_ctx=512,
-        n_threads=1,          # <--- Force single-threaded to avoid AssertionError
-        verbose=True,         # <--- Enable verbose to see any internal errors
+        n_threads=1,          # Prevents threading issues on Render
+        verbose=False
     )
     logger.info("GenAI model loaded successfully!")
 except Exception as e:
