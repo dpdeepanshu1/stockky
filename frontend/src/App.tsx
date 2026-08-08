@@ -34,6 +34,10 @@ export default function App() {
   const [scanTaskId, setScanTaskId] = useState<string | null>(null);
   const [pollInterval, setPollInterval] = useState<number | null>(null);
 
+  // Retry and status states
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
   useEffect(() => {
     checkBackend();
   }, []);
@@ -97,9 +101,7 @@ export default function App() {
       setPollInterval(interval);
       await pollScanStatus(task_id);
     } catch (e) {
-      // If we have a task ID, check if it's still running before showing error
       if (scanTaskId) {
-        // Resume polling if task exists
         const interval = window.setInterval(() => pollScanStatus(scanTaskId), 1000);
         setPollInterval(interval);
         pollScanStatus(scanTaskId);
@@ -148,21 +150,31 @@ export default function App() {
         setView({ mode: "error", message: status.error || "Scan failed" });
       }
     } catch (e) {
-      // If status fetch fails, keep polling if task exists
       console.warn("Polling error", e);
-      // Don't clear interval; let it retry
     }
   }
 
-  // Retry handler for error view
-  const handleRetry = () => {
-    if (scanTaskId) {
-      // Resume polling the existing task
-      const interval = window.setInterval(() => pollScanStatus(scanTaskId), 1000);
-      setPollInterval(interval);
-      pollScanStatus(scanTaskId);
-    } else {
-      setView({ mode: "idle" });
+  // Retry handler with loading state
+  const handleRetry = async () => {
+    if (isRetrying) return;
+    setIsRetrying(true);
+    setStatusMessage("⏳ Retrying...");
+
+    try {
+      if (scanTaskId) {
+        const interval = window.setInterval(() => pollScanStatus(scanTaskId), 1000);
+        setPollInterval(interval);
+        await pollScanStatus(scanTaskId);
+        setStatusMessage("✅ Resumed scan");
+      } else {
+        setView({ mode: "idle" });
+        setStatusMessage("✅ Reset view");
+      }
+    } catch (e) {
+      setStatusMessage("❌ Retry failed");
+    } finally {
+      setIsRetrying(false);
+      setTimeout(() => setStatusMessage(null), 3000);
     }
   };
 
@@ -171,15 +183,13 @@ export default function App() {
     setWatchlist(symbols);
   }
 
-  // NEW: Add to watchlist from scan results
   async function handleAddToWatchlist(symbol: string) {
     try {
       await api.addToWatchlist(symbol);
-      // Refresh watchlist
       const wl = await api.getWatchlist();
       setWatchlist(wl.symbols);
-      // Optional: show a brief success indication (could be a toast)
-      console.log(`Added ${symbol} to watchlist`);
+      setStatusMessage(`✅ Added ${symbol} to watchlist`);
+      setTimeout(() => setStatusMessage(null), 3000);
     } catch (e) {
       console.error("Failed to add to watchlist", e);
     }
@@ -411,6 +421,11 @@ export default function App() {
 
               {view.mode === "error" && (
                 <div className="rounded-xl border border-signal-sell/40 bg-signal-sell/5 p-6">
+                  {statusMessage && (
+                    <div className="mb-4 font-mono text-xs text-signal-prepare animate-pulse">
+                      {statusMessage}
+                    </div>
+                  )}
                   <p className="font-mono text-xs text-signal-sell/70 uppercase tracking-widest mb-1">
                     Error
                   </p>
@@ -424,9 +439,10 @@ export default function App() {
                   <div className="flex gap-4 mt-4">
                     <button
                       onClick={handleRetry}
-                      className="font-mono text-xs text-paper bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-1.5 hover:bg-signal-prepare/30 transition"
+                      disabled={isRetrying}
+                      className="font-mono text-xs text-paper bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-1.5 hover:bg-signal-prepare/30 transition disabled:opacity-50"
                     >
-                      {scanTaskId ? "Resume Scan" : "Try again"}
+                      {isRetrying ? "⏳ Retrying..." : (scanTaskId ? "Resume Scan" : "Try again")}
                     </button>
                     <button
                       onClick={() => setShowSettings(true)}

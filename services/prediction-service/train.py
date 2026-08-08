@@ -31,7 +31,6 @@ import sys
 import pandas as pd
 import yfinance as yf
 from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, roc_auc_score
 import joblib
 
@@ -194,6 +193,7 @@ def build_dataset() -> pd.DataFrame:
             record = {col: row[col] for col in FEATURE_COLUMNS}
             record["label"] = label
             record["symbol"] = symbol
+            record["date"] = feat_df.index[i]
             rows.append(record)
 
         # Polite delay between symbols (with slight jitter)
@@ -224,9 +224,48 @@ def main():
     X = dataset[FEATURE_COLUMNS]
     y = dataset["label"]
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    # Random splitting is the wrong tool for time-series data like this:
+    # a stock's indicators on day N and day N+1 are nearly identical, so a
+    # random split routinely puts near-duplicate rows on both sides,
+    # letting the model "recognize" test examples it effectively already
+    # saw in training. That inflates the reported accuracy without proving
+    # the model generalizes to genuinely unseen future periods — which is
+    # the only way it'll ever actually be used in production.
+    #
+    # Instead: pick one calendar cutoff shared across every stock. Train on
+    # everything before it, test only on what comes after — mirroring
+    # exactly how the trained model gets used later (trained once on
+    # history, then scored against dates it has never seen).
+    cutoff_date = dataset["date"].quantile(0.8, interpolation="lower")
+    train_mask = dataset["date"] < cutoff_date
+    test_mask = ~train_mask
+
+    X_train, y_train = X[train_mask], y[train_mask]
+    X_test, y_test = X[test_mask], y[test_mask]
+
+    logger.info("Time-based split — cutoff date: %s", cutoff_date.date())
+    logger.info(
+        "Train: %d rows (%s to %s), positive rate %.1f%%",
+        len(X_train),
+        dataset.loc[train_mask, "date"].min().date(),
+        dataset.loc[train_mask, "date"].max().date(),
+        y_train.mean() * 100,
     )
+    logger.info(
+        "Test:  %d rows (%s to %s), positive rate %.1f%%",
+        len(X_test),
+        dataset.loc[test_mask, "date"].min().date(),
+        dataset.loc[test_mask, "date"].max().date(),
+        y_test.mean() * 100,
+    )
+
+    if len(X_test) < 50 or y_test.nunique() < 2:
+        logger.error(
+            "Test set too small or single-class after the time split (%d rows). "
+            "Need a longer training history to get a trustworthy holdout.",
+            len(X_test),
+        )
+        return
 
     model = XGBClassifier(
         n_estimators=200,
@@ -242,6 +281,7 @@ def main():
     preds = model.predict(X_test)
     probs = model.predict_proba(X_test)[:, 1]
 
+    logger.info("\nOut-of-time test performance (dates the model never trained on):")
     logger.info("\n%s", classification_report(y_test, preds))
     logger.info("ROC-AUC: %.3f", roc_auc_score(y_test, probs))
 

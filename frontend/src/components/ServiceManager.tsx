@@ -10,6 +10,8 @@ export default function ServiceManager({ onClose }: ServiceManagerProps) {
   const [loading, setLoading] = useState(true);
   const [waking, setWaking] = useState<Record<string, boolean>>({});
   const [messages, setMessages] = useState<Record<string, string>>({});
+  const [isWakingAll, setIsWakingAll] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   const fetchServices = async () => {
     setLoading(true);
@@ -33,20 +35,17 @@ export default function ServiceManager({ onClose }: ServiceManagerProps) {
     setMessages((prev) => ({ ...prev, [name]: "⏳ Waking..." }));
 
     try {
-      // Open the render URL in a small popup to trigger wake
-      const popup = window.open(url + "/health", "_blank", "width=400,height=200");
-      setTimeout(() => {
-        if (popup) popup.close();
-      }, 3000);
-      // Wait a bit and then re-fetch status
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await wakeService(url);
+      setMessages((prev) => ({ ...prev, [name]: "✅ Woke! Rechecking..." }));
+      await new Promise((resolve) => setTimeout(resolve, 3000));
       await fetchServices();
       setMessages((prev) => ({ ...prev, [name]: "✅ Online" }));
+      setStatusMessage(`✅ ${name} woke successfully!`);
     } catch {
       setMessages((prev) => ({ ...prev, [name]: "❌ Failed" }));
+      setStatusMessage(`❌ Failed to wake ${name}`);
     } finally {
       setWaking((prev) => ({ ...prev, [name]: false }));
-      // Clear message after 5 seconds
       setTimeout(() => {
         setMessages((prev) => {
           const newMsg = { ...prev };
@@ -54,15 +53,36 @@ export default function ServiceManager({ onClose }: ServiceManagerProps) {
           return newMsg;
         });
       }, 5000);
+      setTimeout(() => setStatusMessage(null), 5000);
     }
   };
 
   const handleWakeAll = async () => {
-    for (const [name, status] of Object.entries(services)) {
+    if (isWakingAll) return;
+    setIsWakingAll(true);
+    setStatusMessage("⏳ Waking all services...");
+
+    const entries = Object.entries(services);
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const [name, status] of entries) {
       if (status.url && !status.ok) {
-        await handleWake(name, status.url);
+        try {
+          await wakeService(status.url);
+          successCount++;
+          setStatusMessage(`⏳ Woke ${name} (${successCount}/${entries.filter(([_, s]) => s.url && !s.ok).length})`);
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        } catch {
+          failCount++;
+        }
       }
     }
+
+    setStatusMessage(`✅ Wake complete: ${successCount} services woke, ${failCount} failed`);
+    await fetchServices();
+    setIsWakingAll(false);
+    setTimeout(() => setStatusMessage(null), 5000);
   };
 
   return (
@@ -75,6 +95,12 @@ export default function ServiceManager({ onClose }: ServiceManagerProps) {
           </button>
         </div>
 
+        {statusMessage && (
+          <div className="mb-4 font-mono text-xs text-signal-prepare animate-pulse">
+            {statusMessage}
+          </div>
+        )}
+
         {loading ? (
           <div className="text-center py-8 text-mist/40 font-mono">Loading services...</div>
         ) : (
@@ -82,9 +108,10 @@ export default function ServiceManager({ onClose }: ServiceManagerProps) {
             <div className="flex justify-end mb-4">
               <button
                 onClick={handleWakeAll}
-                className="font-mono text-xs border border-signal-prepare/40 text-signal-prepare px-4 py-1.5 rounded-lg hover:bg-signal-prepare/10 transition"
+                disabled={isWakingAll}
+                className="font-mono text-xs border border-signal-prepare/40 text-signal-prepare px-4 py-1.5 rounded-lg hover:bg-signal-prepare/10 transition disabled:opacity-50"
               >
-                Wake All Services
+                {isWakingAll ? "⏳ Waking..." : "Wake All Services"}
               </button>
             </div>
             <div className="space-y-2">

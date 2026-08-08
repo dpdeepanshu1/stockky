@@ -714,7 +714,7 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision (FIXED: robust handling) ──────────────────────────────
+# ── Stock decision (FIXED: robust handling for None) ──────────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
@@ -744,8 +744,36 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         )
         resp.raise_for_status()
         result = resp.json()
-        
-        # Handle non-dict response
+
+        # ✅ 关键修复：处理 result 为 None 的情况
+        if result is None:
+            result = {
+                "symbol": symbol_to_use,
+                "decision": "DO NOT BUY",
+                "confidence": "Low",
+                "combined_score": 0,
+                "technical_score": 50,
+                "fundamental_score": 50,
+                "news_score": None,
+                "prediction_score": None,
+                "event_risk": False,
+                "entry_range": None,
+                "target": None,
+                "stop_loss": None,
+                "holding_period": "N/A",
+                "close": None,
+                "support": None,
+                "resistance": None,
+                "reasons": {
+                    "technical": ["Insufficient data for newly listed stock"],
+                    "fundamental": ["Data temporarily unavailable"]
+                },
+                "valuation": "fair",
+                "sector": None,
+                "natural_language_summary": f"❌ {symbol_to_use} अभी न खरीदें. नए लिस्टेड स्टॉक के लिए डेटा उपलब्ध नहीं है. कुछ दिन बाद दोबारा चेक करें."
+            }
+
+        # 检查 result 是否为 dict
         if not isinstance(result, dict):
             result = {
                 "symbol": symbol_to_use,
@@ -764,22 +792,24 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                 "close": None,
                 "support": None,
                 "resistance": None,
-                "reasons": {"technical": ["Data unavailable"], "fundamental": ["Data unavailable"]},
+                "reasons": {
+                    "technical": ["Data unavailable"],
+                    "fundamental": ["Data unavailable"]
+                },
                 "valuation": "fair",
                 "sector": None,
                 "natural_language_summary": "Data unavailable"
             }
-        else:
-            # Add summary if missing
-            if "natural_language_summary" not in result:
-                result["natural_language_summary"] = _generate_summary(result)
-        
+
         if corrected_from:
             result["corrected_from"] = corrected_from
             result["symbol"] = symbol_to_use
-        
+
+        if "natural_language_summary" not in result:
+            result["natural_language_summary"] = _generate_summary(result)
+
         return result
-        
+
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             suggestions = difflib.get_close_matches(symbol_to_use, _get_all_known_symbols(), n=3, cutoff=0.5)

@@ -22,7 +22,7 @@ const SERVICE_LABELS: Record<string, string> = {
 const MAX_AUTO_ATTEMPTS = 6;
 const ESCAPE_HATCH_AFTER_ATTEMPTS = 3;
 
-function SystemCheck({ onReady }: { onReady: () => void }) {
+export default function SystemCheck({ onReady }: { onReady: () => void }) {
   const [stage, setStage] = useState<Stage>({ phase: "checking-gateway" });
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
   const cancelled = useRef(false);
@@ -30,6 +30,9 @@ function SystemCheck({ onReady }: { onReady: () => void }) {
 
   const [wakingServices, setWakingServices] = useState<Record<string, boolean>>({});
   const [wakeMessages, setWakeMessages] = useState<Record<string, string>>({});
+  const [isWakingAll, setIsWakingAll] = useState(false);
+  const [isRechecking, setIsRechecking] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   useEffect(() => {
     cancelled.current = false;
@@ -54,6 +57,7 @@ function SystemCheck({ onReady }: { onReady: () => void }) {
 
       if (health.required_ok) {
         setStage({ phase: "ready" });
+        setStatusMessage("✅ All services connected successfully!");
         setTimeout(() => {
           if (!cancelled.current) onReady();
         }, 700);
@@ -89,8 +93,10 @@ function SystemCheck({ onReady }: { onReady: () => void }) {
       await new Promise((resolve) => setTimeout(resolve, 3000));
       await runCheck(currentAttempt);
       setWakeMessages((prev) => ({ ...prev, [serviceName]: "🟢 Online" }));
+      setStatusMessage(`✅ ${serviceName} woke successfully!`);
     } catch {
       setWakeMessages((prev) => ({ ...prev, [serviceName]: "❌ Wake failed" }));
+      setStatusMessage(`❌ Failed to wake ${serviceName}`);
     } finally {
       setWakingServices((prev) => ({ ...prev, [serviceName]: false }));
       setTimeout(() => {
@@ -100,17 +106,51 @@ function SystemCheck({ onReady }: { onReady: () => void }) {
           return newMsg;
         });
       }, 5000);
+      setTimeout(() => setStatusMessage(null), 5000);
     }
   }
 
   async function wakeAllServices() {
+    if (isWakingAll) return;
+    setIsWakingAll(true);
+    setStatusMessage("⏳ Waking all services...");
+
     const services = stage.phase === "waking" ? stage.health?.services : {};
-    if (!services) return;
+    if (!services) {
+      setStatusMessage("❌ No services to wake");
+      setIsWakingAll(false);
+      return;
+    }
+
+    let successCount = 0;
+    let failCount = 0;
     for (const [name, s] of Object.entries(services)) {
       if (s.url && !s.ok) {
-        await handleWakeService(s.url, name);
+        try {
+          await wakeService(s.url);
+          successCount++;
+          setStatusMessage(`⏳ Woke ${name} (${successCount}/${Object.values(services).filter(s => s.url && !s.ok).length})`);
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        } catch {
+          failCount++;
+        }
       }
     }
+
+    setStatusMessage(`✅ Wake complete: ${successCount} services woke, ${failCount} failed`);
+    await runCheck(currentAttempt);
+    setIsWakingAll(false);
+    setTimeout(() => setStatusMessage(null), 5000);
+  }
+
+  async function handleRecheck() {
+    if (isRechecking) return;
+    setIsRechecking(true);
+    setStatusMessage("⏳ Rechecking services...");
+    await runCheck(currentAttempt);
+    setIsRechecking(false);
+    setStatusMessage("✅ Recheck complete");
+    setTimeout(() => setStatusMessage(null), 3000);
   }
 
   function saveGatewayUrl() {
@@ -169,6 +209,7 @@ function SystemCheck({ onReady }: { onReady: () => void }) {
     );
   }
 
+  // phase === "waking"
   const services = stage.health?.services || {};
   const entries = Object.entries(services);
   const showEscapeHatch = currentAttempt >= ESCAPE_HATCH_AFTER_ATTEMPTS;
@@ -182,6 +223,12 @@ function SystemCheck({ onReady }: { onReady: () => void }) {
         Everything runs on free-tier hosting, so a sleeping service can take up to a minute to
         wake on its first request. Use the buttons below to wake individual services.
       </p>
+
+      {statusMessage && (
+        <div className="mb-4 font-mono text-xs text-signal-prepare animate-pulse">
+          {statusMessage}
+        </div>
+      )}
 
       <div className="space-y-1.5 mb-6 w-full max-w-sm">
         {entries.length === 0 && (
@@ -202,15 +249,17 @@ function SystemCheck({ onReady }: { onReady: () => void }) {
       <div className="flex flex-wrap items-center gap-4">
         <button
           onClick={wakeAllServices}
-          className="font-mono text-xs text-paper bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-2 hover:bg-signal-prepare/30 transition"
+          disabled={isWakingAll}
+          className="font-mono text-xs text-paper bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-2 hover:bg-signal-prepare/30 transition disabled:opacity-50"
         >
-          Wake All Services
+          {isWakingAll ? "⏳ Waking..." : "Wake All Services"}
         </button>
         <button
-          onClick={() => runCheck(currentAttempt + 1)}
-          className="font-mono text-xs text-mist hover:text-paper border border-slate rounded-lg px-3 py-2 hover:border-mist/60 transition"
+          onClick={handleRecheck}
+          disabled={isRechecking}
+          className="font-mono text-xs text-mist hover:text-paper border border-slate rounded-lg px-3 py-2 hover:border-mist/60 transition disabled:opacity-50"
         >
-          Recheck now
+          {isRechecking ? "⏳ Rechecking..." : "Recheck now"}
         </button>
         {showEscapeHatch && (
           <button
@@ -289,6 +338,3 @@ function GateShell({ children }: { children: React.ReactNode }) {
     </div>
   );
 }
-
-// ✅ Single default export
-export default SystemCheck;
