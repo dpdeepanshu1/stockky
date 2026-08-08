@@ -404,6 +404,7 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
         },
         "valuation": "fair",
         "sector": None,
+        "fundamental_metrics": None,
     }
     merged = {**default, **raw}
     return merged
@@ -415,7 +416,14 @@ def _fetch_price_from_quote(symbol: str) -> Optional[float]:
         resp = httpx.get(f"{MARKET_DATA_URL}/quote/{symbol}", timeout=5)
         if resp.status_code == 200:
             data = resp.json()
-            return data.get("price")
+            price = data.get("price")
+            if price is not None:
+                logger.info(f"Price fallback for {symbol}: ₹{price}")
+                return price
+            else:
+                logger.warning(f"Quote endpoint returned no price for {symbol}")
+        else:
+            logger.warning(f"Quote endpoint returned {resp.status_code} for {symbol}")
     except Exception as e:
         logger.warning(f"Price fetch failed for {symbol}: {e}")
     return None
@@ -426,10 +434,30 @@ def _fetch_fundamental_metrics(symbol: str) -> Optional[dict]:
         resp = httpx.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            return data.get("metrics")
+            metrics = data.get("metrics")
+            if metrics:
+                logger.info(f"Fundamental metrics fallback for {symbol}")
+                return metrics
+            else:
+                logger.warning(f"Fundamental service returned no metrics for {symbol}")
+        else:
+            logger.warning(f"Fundamental service returned {resp.status_code} for {symbol}")
     except Exception as e:
         logger.warning(f"Fundamental fetch failed for {symbol}: {e}")
     return None
+
+def _fetch_quote_and_metrics(symbol: str):
+    """Fetch both price and metrics in one shot (used in scans)."""
+    price = None
+    metrics = None
+    
+    # Try price first
+    price = _fetch_price_from_quote(symbol)
+    
+    # Try metrics
+    metrics = _fetch_fundamental_metrics(symbol)
+    
+    return price, metrics
 
 # ── Hinglish summary ──────────────────────────────────────────────────────
 def _generate_summary(data) -> str:
@@ -531,7 +559,7 @@ async def run_scan_async(task_id: str, universe: List[str]):
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
-                # Fallback: price
+                # If close is missing or data_insufficient flag is present, fetch price
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -540,14 +568,12 @@ async def run_scan_async(task_id: str, universe: List[str]):
                             normalized["support"] = round(price * 0.95, 2)
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
-                        logger.info(f"Price fallback for {symbol}: ₹{price}")
 
-                # Fallback: fundamental metrics
+                # If fundamental_metrics is missing, fetch it
                 if not normalized.get("fundamental_metrics"):
                     metrics = _fetch_fundamental_metrics(symbol)
                     if metrics:
                         normalized["fundamental_metrics"] = metrics
-                        logger.info(f"Fundamental metrics fallback for {symbol}")
 
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
@@ -783,7 +809,7 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision (with both fallbacks) ──────────────────────────────────
+# ── Stock decision (with robust fallbacks) ────────────────────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
@@ -815,8 +841,9 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         raw = resp.json()
         result = _normalize_decision_response(raw, symbol_to_use)
 
-        # Fallback: price
+        # --- Fallback: Price ---
         if result.get("close") is None:
+            logger.info(f"Price missing for {symbol_to_use}, fetching from quote...")
             price = _fetch_price_from_quote(symbol_to_use)
             if price is not None:
                 result["close"] = price
@@ -824,14 +851,15 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                     result["support"] = round(price * 0.95, 2)
                 if result.get("resistance") is None:
                     result["resistance"] = round(price * 1.05, 2)
-                logger.info(f"Price fallback for {symbol_to_use}: ₹{price}")
+                logger.info(f"Price set to {price} for {symbol_to_use}")
 
-        # Fallback: fundamental metrics
+        # --- Fallback: Fundamental Metrics ---
         if not result.get("fundamental_metrics"):
+            logger.info(f"Fundamental metrics missing for {symbol_to_use}, fetching from fundamental service...")
             metrics = _fetch_fundamental_metrics(symbol_to_use)
             if metrics:
                 result["fundamental_metrics"] = metrics
-                logger.info(f"Fundamental metrics fallback for {symbol_to_use}")
+                logger.info(f"Fundamental metrics set for {symbol_to_use}")
 
         if corrected_from:
             result["corrected_from"] = corrected_from
