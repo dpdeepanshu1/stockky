@@ -573,7 +573,7 @@ async def run_scan_async(task_id: str, universe: List[str]):
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
-                # Fallbacks
+                # ---- Fallbacks ----
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -597,7 +597,7 @@ async def run_scan_async(task_id: str, universe: List[str]):
                             reasons["news"] = news["reasons"]
                             normalized["reasons"] = reasons
 
-                if normalized.get("event_risk") is False and normalized.get("reasons", {}).get("event") is None:
+                if normalized.get("event_risk") is False and not normalized.get("reasons", {}).get("event"):
                     events = _fetch_events(symbol)
                     if events and events.get("next_earnings_date"):
                         normalized["event_risk"] = True
@@ -871,9 +871,8 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         raw = resp.json()
         result = _normalize_decision_response(raw, symbol_to_use)
 
-        # --- Fallback: Price ---
+        # ---- Fallbacks ----
         if result.get("close") is None:
-            logger.info(f"Price missing for {symbol_to_use}, fetching from quote...")
             price = _fetch_price_from_quote(symbol_to_use)
             if price is not None:
                 result["close"] = price
@@ -882,16 +881,12 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                 if result.get("resistance") is None:
                     result["resistance"] = round(price * 1.05, 2)
 
-        # --- Fallback: Fundamental Metrics ---
         if not result.get("fundamental_metrics"):
-            logger.info(f"Fundamental metrics missing for {symbol_to_use}, fetching from fundamental service...")
             metrics = _fetch_fundamental_metrics(symbol_to_use)
             if metrics:
                 result["fundamental_metrics"] = metrics
 
-        # --- Fallback: News ---
         if result.get("news_score") is None:
-            logger.info(f"News missing for {symbol_to_use}, fetching from news service...")
             news = _fetch_news(symbol_to_use)
             if news:
                 result["news_score"] = news.get("news_score")
@@ -900,9 +895,7 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                     reasons["news"] = news["reasons"]
                     result["reasons"] = reasons
 
-        # --- Fallback: Events ---
         if result.get("event_risk") is False and not result.get("reasons", {}).get("event"):
-            logger.info(f"Events missing for {symbol_to_use}, fetching from event tracker...")
             events = _fetch_events(symbol_to_use)
             if events and events.get("next_earnings_date"):
                 result["event_risk"] = True
@@ -947,7 +940,7 @@ def run_scan(force_refresh: bool = False):
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
-                # Apply all fallbacks (same as in get_stock_decision)
+                # ---- Apply all fallbacks ----
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -1098,7 +1091,7 @@ def scan_watchlist():
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
-                # Apply all fallbacks
+                # ---- Apply fallbacks ----
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
