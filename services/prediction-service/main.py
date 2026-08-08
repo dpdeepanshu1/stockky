@@ -1,9 +1,7 @@
 """
 Prediction Service - GenAI Enhanced (512MB Optimized)
 --------------------
-Estimates probability of price movement using XGBoost.
-Uses a quantized TinyLlama GGUF model running via llama-cpp-python 
-to generate natural Hinglish summaries with zero OOM risk.
+Uses TinyLlama 1.1B GGUF via llama-cpp-python 0.1.78 (stable generic CPU build).
 """
 import os
 import logging
@@ -41,16 +39,23 @@ else:
 _llm = None
 try:
     logger.info("Loading GenAI model (TinyLlama)...")
-    # This looks in the cache. The Build Phase ensures it's already there!
+    
+    # Locate the cached model (downloaded during build)
     model_path = hf_hub_download(
         repo_id="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
         filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
     )
+    
+    # Verify file exists and is not empty
+    if not os.path.exists(model_path) or os.path.getsize(model_path) == 0:
+        raise FileNotFoundError(f"Model file missing or empty: {model_path}")
+    
+    # Load model with safe CPU parameters (n_threads=1 prevents threading issues on Render)
     _llm = Llama(
         model_path=model_path,
-        n_ctx=512,           # Low context to keep memory usage under 300MB
-        n_threads=None,      # Let Llama.cpp handle CPU threading automatically
-        verbose=False
+        n_ctx=512,
+        n_threads=1,          # <--- Force single-threaded to avoid AssertionError
+        verbose=True,         # <--- Enable verbose to see any internal errors
     )
     logger.info("GenAI model loaded successfully!")
 except Exception as e:
@@ -93,22 +98,20 @@ def _fetch_history(symbol: str) -> pd.DataFrame:
 
 def _generate_llm_note(feature_dict: dict, probability: float) -> str:
     if _llm is None:
-        return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days, based on current technical setup vs 5 years of historical patterns across a 25-stock NSE universe."
+        return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
     
     rsi = int(feature_dict.get('rsi', 50))
     adx = int(feature_dict.get('adx', 20))
     price_vs_200ema = "above" if feature_dict.get('price_vs_200ema', 0) > 0 else "below"
     
-    # Prompt optimized for the TinyLlama chat format
     prompt = f"<|system|>You are an expert stock market analyst. Explain in Hinglish.</s><|user|>RSI is {rsi}. ADX is {adx}. Price is {price_vs_200ema} 200 EMA. Probability {round(probability * 100)}%. Explain why stock may move.</s><|assistant|>"
     
     try:
-        # Generate text with 60 token limit, strictly limited to keep CPU usage low
         res = _llm(prompt, max_tokens=60, temperature=0.7, stop=["</s>", "<|"])
         return res['choices'][0]['text'].strip()
     except Exception as e:
         logger.warning(f"GenAI generation failed: {repr(e)}")
-        return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days, based on current technical setup."
+        return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
 
 @app.get("/predict/{symbol}")
 def predict(symbol: str):
@@ -118,7 +121,7 @@ def predict(symbol: str):
             "model_loaded": False,
             "probability": None,
             "prediction_score": None,
-            "note": "No trained model yet. Run 'docker compose run --rm prediction-service python train.py' to train one.",
+            "note": "No trained model yet.",
         }
 
     df = _fetch_history(symbol)
@@ -126,7 +129,7 @@ def predict(symbol: str):
 
     missing = [c for c in FEATURE_COLUMNS if c not in features]
     if missing:
-        raise HTTPException(status_code=422, detail=f"Could not compute all features (missing: {missing}), likely too little history")
+        raise HTTPException(status_code=422, detail=f"Missing features: {missing}")
 
     X = pd.DataFrame([features])[FEATURE_COLUMNS]
     probability = float(_model.predict_proba(X)[0, 1])
