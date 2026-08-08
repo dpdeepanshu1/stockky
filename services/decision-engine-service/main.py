@@ -42,7 +42,7 @@ async def global_exception_handler(request, exc):
 
 class Decision(str, Enum):
     BUY_NOW = "BUY NOW"
-    PREPARE_TO_BUY = "PREPARE_TO_BUY"
+    PREPARE_TO_BUY = "PREPARE TO BUY"
     HOLD = "HOLD"
     DO_NOT_BUY = "DO NOT BUY"
     SELL = "SELL"

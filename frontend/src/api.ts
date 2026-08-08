@@ -38,13 +38,13 @@ export interface Decision {
   news_score: number | null;
   prediction_score: number | null;
   event_risk: boolean;
-  entry_range: { low: number; high: number };
-  target: number;
-  stop_loss: number;
+  entry_range: { low: number | null; high: number | null } | null; // can be null
+  target: number | null;
+  stop_loss: number | null;
   holding_period: string;
-  close: number;
-  support: number;
-  resistance: number;
+  close: number | null; // can be null (for newly listed stocks)
+  support: number | null;
+  resistance: number | null;
   reasons: {
     technical: string[];
     fundamental: string[];
@@ -54,7 +54,7 @@ export interface Decision {
   };
   valuation: string;
   sector: string | null;
-  natural_language_summary: string;
+  natural_language_summary?: string;
   fundamental_metrics?: FundamentalMetrics;
 }
 
@@ -222,7 +222,6 @@ export const api = {
       30000
     ),
 
-  // NEW: Add a single symbol to watchlist
   addToWatchlist: (symbol: string) =>
     request<{ symbols: string[] }>(
       "/watchlist/add",
