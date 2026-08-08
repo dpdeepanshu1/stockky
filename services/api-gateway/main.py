@@ -30,8 +30,6 @@ logger = logging.getLogger("api-gateway")
 DECISION_URL = os.getenv("DECISION_URL", "https://decision-engine-service-0hg6.onrender.com")
 NOTIFICATION_URL = os.getenv("NOTIFICATION_URL", "https://notification-service-36py.onrender.com")
 NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")
-
-# Correct market data service URL
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
 TECHNICAL_URL = os.getenv("TECHNICAL_URL", "https://technical-analysis-service-zhnc.onrender.com")
 FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-service.onrender.com")
@@ -378,15 +376,11 @@ def _resolve_symbol(misspelled: str) -> Optional[str]:
 
 # ── Safe response normalization ──────────────────────────────────────────
 def _normalize_decision_response(raw, symbol: str) -> dict:
-    """
-    Ensure the response from decision engine is a valid dict with all required keys.
-    """
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
         raw = {}
 
-    # Defaults
     default = {
         "symbol": symbol,
         "decision": "DO NOT BUY",
@@ -411,11 +405,10 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
         "valuation": "fair",
         "sector": None,
     }
-
-    # Merge – raw overrides default for keys that exist
     merged = {**default, **raw}
     return merged
 
+# ── Fallback helpers ──────────────────────────────────────────────────────
 def _fetch_price_from_quote(symbol: str) -> Optional[float]:
     """Fetch current price from market data service quote endpoint."""
     try:
@@ -423,8 +416,19 @@ def _fetch_price_from_quote(symbol: str) -> Optional[float]:
         if resp.status_code == 200:
             data = resp.json()
             return data.get("price")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Price fetch failed for {symbol}: {e}")
+    return None
+
+def _fetch_fundamental_metrics(symbol: str) -> Optional[dict]:
+    """Fetch fundamental metrics directly from fundamental analysis service."""
+    try:
+        resp = httpx.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("metrics")
+    except Exception as e:
+        logger.warning(f"Fundamental fetch failed for {symbol}: {e}")
     return None
 
 # ── Hinglish summary ──────────────────────────────────────────────────────
@@ -526,16 +530,25 @@ async def run_scan_async(task_id: str, universe: List[str]):
                 resp.raise_for_status()
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
-                # If close is None, try to fetch from quote
+
+                # Fallback: price
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
                         normalized["close"] = price
-                        # Also try to set support/resistance approx if missing
                         if normalized.get("support") is None:
                             normalized["support"] = round(price * 0.95, 2)
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
+                        logger.info(f"Price fallback for {symbol}: ₹{price}")
+
+                # Fallback: fundamental metrics
+                if not normalized.get("fundamental_metrics"):
+                    metrics = _fetch_fundamental_metrics(symbol)
+                    if metrics:
+                        normalized["fundamental_metrics"] = metrics
+                        logger.info(f"Fundamental metrics fallback for {symbol}")
+
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
             except httpx.HTTPError as e:
@@ -770,7 +783,7 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision (with price fallback) ──────────────────────────────────
+# ── Stock decision (with both fallbacks) ──────────────────────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
@@ -802,16 +815,23 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         raw = resp.json()
         result = _normalize_decision_response(raw, symbol_to_use)
 
-        # If close is None, try to fetch price from quote endpoint
+        # Fallback: price
         if result.get("close") is None:
             price = _fetch_price_from_quote(symbol_to_use)
             if price is not None:
                 result["close"] = price
-                # Set approximate support/resistance if missing
                 if result.get("support") is None:
                     result["support"] = round(price * 0.95, 2)
                 if result.get("resistance") is None:
                     result["resistance"] = round(price * 1.05, 2)
+                logger.info(f"Price fallback for {symbol_to_use}: ₹{price}")
+
+        # Fallback: fundamental metrics
+        if not result.get("fundamental_metrics"):
+            metrics = _fetch_fundamental_metrics(symbol_to_use)
+            if metrics:
+                result["fundamental_metrics"] = metrics
+                logger.info(f"Fundamental metrics fallback for {symbol_to_use}")
 
         if corrected_from:
             result["corrected_from"] = corrected_from
@@ -849,6 +869,7 @@ def run_scan(force_refresh: bool = False):
                 resp.raise_for_status()
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
+
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -857,6 +878,12 @@ def run_scan(force_refresh: bool = False):
                             normalized["support"] = round(price * 0.95, 2)
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
+
+                if not normalized.get("fundamental_metrics"):
+                    metrics = _fetch_fundamental_metrics(symbol)
+                    if metrics:
+                        normalized["fundamental_metrics"] = metrics
+
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
             except httpx.HTTPError as e:
@@ -975,6 +1002,7 @@ def scan_watchlist():
                 resp.raise_for_status()
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
+
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -983,6 +1011,12 @@ def scan_watchlist():
                             normalized["support"] = round(price * 0.95, 2)
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
+
+                if not normalized.get("fundamental_metrics"):
+                    metrics = _fetch_fundamental_metrics(symbol)
+                    if metrics:
+                        normalized["fundamental_metrics"] = metrics
+
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
             except httpx.HTTPError as e:

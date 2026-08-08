@@ -76,9 +76,7 @@ def _with_retry(func, max_retries=3, base_delay=2):
         except Exception as e:
             if attempt == max_retries - 1:
                 raise
-            # Full jitter: avoids every concurrent request retrying in
-            # lockstep, which itself looks like a burst to Yahoo's rate
-            # limiter and makes the block worse, not better.
+            # Full jitter: avoids every concurrent request retrying in lockstep
             wait = random.uniform(0, base_delay * (2 ** attempt))
             logging.warning(f"Retry {attempt+1}/{max_retries} after {wait:.1f}s: {e}")
             time.sleep(wait)
@@ -130,12 +128,7 @@ def _cache_set(key: str, value: dict, ttl: int = CACHE_TTL_SECONDS):
         return
     cache.setex(key, ttl, json.dumps(value, default=str))
 
-# Separate from the normal short-TTL cache: this one never expires on its
-# own (30-day rolling TTL, refreshed every time we get a genuinely good
-# response). Fundamentals change slowly (quarterly, really), so once we've
-# successfully fetched a symbol, there's no good reason a temporary Yahoo
-# rate-limit block should make that data disappear for users — we'd rather
-# serve data that's a few days stale than an empty "no data" response.
+# Separate fallback cache (30-day rolling TTL)
 FALLBACK_TTL_SECONDS = 30 * 24 * 60 * 60
 
 def _fallback_get(key: str):
@@ -188,6 +181,7 @@ async def root():
 def health():
     return {"status": "ok", "service": "market-data-service", "cache": bool(cache)}
 
+# ✅ /quote endpoint – returns latest price and other quote data
 @app.get("/quote/{symbol}", response_model=QuoteResponse)
 def get_quote(symbol: str):
     sym = normalize_symbol(symbol)
@@ -458,9 +452,6 @@ def get_fundamentals_raw(symbol: str):
 
         logger.info(f"Fundamentals for {sym}: PE={pe_ratio}, ROE={roe}, Revenue growth={revenue_growth}")
 
-        # Fundamentals barely move day to day — cache the "fast path" for a
-        # full day, not 5 minutes, to keep us well clear of Yahoo's rate
-        # limiter during normal usage.
         _cache_set(cache_key, result, ttl=86400)
 
         meaningful_fields = [
@@ -468,8 +459,6 @@ def get_fundamentals_raw(symbol: str):
             free_cashflow, profit_margins, pe_ratio,
         ]
         if any(v is not None for v in meaningful_fields):
-            # Only refresh the fallback when we actually got real numbers —
-            # never overwrite good fallback data with an empty response.
             _fallback_set(cache_key, result)
         else:
             stale = _fallback_get(cache_key)
@@ -477,7 +466,7 @@ def get_fundamentals_raw(symbol: str):
                 logger.info("Live fetch for %s came back empty; serving last-known-good fallback", sym)
                 stale = dict(stale)
                 stale["stale"] = True
-                _cache_set(cache_key, stale, ttl=1800)  # short TTL: keep retrying the live path soon
+                _cache_set(cache_key, stale, ttl=1800)
                 return stale
 
         return result

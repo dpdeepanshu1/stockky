@@ -46,7 +46,6 @@ def analyze(symbol: str):
     f = {}
     fallback_used = False
     try:
-        # 60s timeout to allow market-data-service to retry against Yahoo
         resp = httpx.get(f"{MARKET_DATA_URL}/fundamentals/{symbol}", timeout=60)
         resp.raise_for_status()
         f = resp.json()
@@ -84,6 +83,7 @@ def analyze(symbol: str):
     pe = f.get("pe_ratio")
     forward_pe = f.get("forward_pe")
 
+    # ✅ Build metrics dict (always include, even if all values are None)
     metrics = {
         "revenue_growth": rev_growth,
         "earnings_growth": earnings_growth,
@@ -188,6 +188,7 @@ def analyze(symbol: str):
 
     score = max(0, min(100, round(score)))
 
+    # ✅ IMPORTANT: Return `metrics` in the response
     return {
         "symbol": symbol.upper(),
         "fundamental_score": score,
@@ -195,7 +196,7 @@ def analyze(symbol: str):
         "sector": f.get("sector"),
         "industry": f.get("industry"),
         "reasons": reasons,
-        "metrics": metrics,
+        "metrics": metrics,        # <-- Key field for API gateway
         "raw": f,
         "fallback_used": fallback_used,
     }
