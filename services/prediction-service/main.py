@@ -87,7 +87,7 @@ def _generate_llm_note(feature_dict: dict, probability: float) -> str:
                 {"role": "user", "content": user_prompt}
             ],
             "temperature": 0.7,
-            "max_tokens": 70
+            "max_tokens": 120
         }
         resp = httpx.post(
             "https://api.groq.com/openai/v1/chat/completions",
