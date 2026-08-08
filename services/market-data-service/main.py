@@ -186,6 +186,65 @@ async def root():
 def health():
     return {"status": "ok", "service": "market-data-service", "cache": bool(cache)}
 
+# --- NEW: Yahoo Raw API Fallback ---
+def _fetch_price_from_yahoo_raw(symbol: str) -> Optional[float]:
+    try:
+        # Try with the exact symbol (e.g. MVELECTRO.NS), then without suffix
+        for sym in [symbol, symbol.replace(".NS", "")]:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+            resp = httpx.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                chart = data.get("chart", {})
+                result = chart.get("result", [])
+                if result and "meta" in result[0]:
+                    price = result[0]["meta"].get("regularMarketPrice")
+                    if price is not None:
+                        logger.info(f"Yahoo Raw API fallback found price for {sym}: {price}")
+                        return price
+    except Exception as e:
+        logger.warning(f"Yahoo Raw API fallback failed: {e}")
+    return None
+
+# --- NEW: NSE India Official API Fallback ---
+_nse_headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
+    "DNT": "1",
+}
+
+def _fetch_nse_quote(symbol: str) -> Optional[dict]:
+    try:
+        client = httpx.Client(headers=_nse_headers, timeout=10)
+        client.get("https://www.nseindia.com") # Fetch cookies
+        clean_sym = symbol.replace(".NS", "").replace(".BO", "")
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={clean_sym}"
+        resp = client.get(url)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and "priceInfo" in data:
+                return data
+    except Exception as e:
+        logger.warning(f"NSE Quote fetch failed: {e}")
+    return None
+
+def _fetch_nse_fundamentals(symbol: str) -> Optional[dict]:
+    try:
+        client = httpx.Client(headers=_nse_headers, timeout=10)
+        client.get("https://www.nseindia.com")
+        clean_sym = symbol.replace(".NS", "").replace(".BO", "")
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={clean_sym}&section=secinfo"
+        resp = client.get(url)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and "secInfo" in data:
+                return data
+    except Exception as e:
+        logger.warning(f"NSE Fundamentals fetch failed: {e}")
+    return None
+
 @app.get("/quote/{symbol}", response_model=QuoteResponse)
 def get_quote(symbol: str):
     sym = normalize_symbol(symbol)
@@ -221,6 +280,18 @@ def get_quote(symbol: str):
                                 break
                 except Exception as e:
                     logger.warning(f"Alpha Vantage fallback for {alpha_sym} failed: {e}")
+
+        # Try Yahoo Raw API if Alpha Vantage failed
+        if price is None:
+            price = _fetch_price_from_yahoo_raw(sym)
+
+        # NEW: Try NSE Official API if Yahoo Raw failed
+        if price is None:
+            nse_data = _fetch_nse_quote(sym)
+            if nse_data:
+                price = _safe(nse_data.get("priceInfo", {}).get("lastPrice"))
+                if price is not None:
+                    logger.info(f"NSE fallback found price for {sym}: {price}")
 
         result = {
             "symbol": sym,
@@ -313,7 +384,9 @@ def get_fundamentals_raw(symbol: str):
     if cached:
         return cached
 
+    result = {}
     try:
+        # UPDATED: Try to fetch from yfinance first
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
 
@@ -511,28 +584,58 @@ def get_fundamentals_raw(symbol: str):
 
         logger.info(f"Fundamentals for {sym}: PE={pe_ratio}, ROE={roe}, Revenue growth={revenue_growth}")
 
-        # Store in fallback cache if we got any valid data
-        if any(v is not None for v in [pe_ratio, sector, market_cap, revenue_growth, roe]):
-            _fallback_set(cache_key, result)
+    except Exception as e:
+        # UPDATED: If yfinance fails outright, try NSE India fundamentals fallback
+        logger.warning(f"YFinance failed for {sym}, falling back to NSE India: {e}")
+        nse_data = _fetch_nse_fundamentals(sym)
+        if nse_data:
+            sec_info = nse_data.get("secInfo", {})
+            result = {
+                "symbol": sym,
+                "pe_ratio": _safe(sec_info.get("pe")),
+                "forward_pe": None,
+                "market_cap": _safe(sec_info.get("marketCap")),
+                "dividend_yield": _safe(sec_info.get("dividendYield")),
+                "year_change_pct": None,
+                "year_high": None,
+                "year_low": None,
+                "fifty_day_average": None,
+                "two_hundred_day_average": None,
+                "range_position_pct": None,
+                "revenue_growth": None,
+                "earnings_growth": None,
+                "eps": None,
+                "roe": _safe(sec_info.get("roe")),
+                "debt_to_equity": _safe(sec_info.get("debtToEquity")),
+                "free_cashflow": None,
+                "profit_margins": None,
+                "held_percent_insiders": None,
+                "held_percent_institutions": None,
+                "price_to_book": None,
+                "sector": sec_info.get("sector"),
+                "industry": sec_info.get("industry"),
+            }
+            logger.info(f"NSE India fallback fundamentals found for {sym}")
 
-        # Cache for 1 day (fundamentals change slowly)
+    # Store in fallback cache if we got any valid data
+    if result and any(v is not None for v in [result.get("pe_ratio"), result.get("sector"), result.get("market_cap"), result.get("revenue_growth"), result.get("roe")]):
+        _fallback_set(cache_key, result)
+
+    # Cache for 1 day (fundamentals change slowly)
+    if result:
         _cache_set(cache_key, result, ttl=86400)
-
         return result
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Failed to fetch fundamentals for %s", sym)
-        # Try to serve from fallback cache
-        stale = _fallback_get(cache_key)
-        if stale:
-            logger.info(f"Serving fallback fundamentals for {sym} (stale data)")
-            stale = dict(stale)
-            stale["stale"] = True
-            _cache_set(cache_key, stale, ttl=1800)
-            return stale
-        raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
+    # If we still have no data, try the stale fallback
+    stale = _fallback_get(cache_key)
+    if stale:
+        logger.info(f"Serving fallback fundamentals for {sym} (stale data)")
+        stale = dict(stale)
+        stale["stale"] = True
+        _cache_set(cache_key, stale, ttl=1800)
+        return stale
+        
+    raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
 
 if __name__ == "__main__":
     import uvicorn

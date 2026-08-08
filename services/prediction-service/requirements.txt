@@ -10,3 +10,4 @@ joblib==1.4.2
 yfinance==1.5.2
 pydantic==2.11.5
 llama-cpp-python==0.2.90
+huggingface-hub==0.24.0

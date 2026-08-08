@@ -51,7 +51,6 @@ def analyze(symbol: str):
         f = resp.json()
         if not f or not isinstance(f, dict):
             f = {}
-            fallback_used = True
     except httpx.TimeoutException:
         logger.warning(f"Market data service timed out for {symbol}")
         fallback_used = True
@@ -67,21 +66,6 @@ def analyze(symbol: str):
 
     if not f or not isinstance(f, dict):
         f = {}
-        fallback_used = True
-
-    # UPDATED: Only mark fallback_used if absolutely no metrics were returned.
-    # If a partial dict with e.g., pe_ratio or sector was returned, treat it as live data.
-    primary_fields = [
-        f.get("revenue_growth"), f.get("earnings_growth"), f.get("roe"), 
-        f.get("debt_to_equity"), f.get("free_cashflow"), f.get("profit_margins"), 
-        f.get("pe_ratio")
-    ]
-    if fallback_used or not any(v is not None for v in primary_fields):
-        if not f.get("sector") and not f.get("pe_ratio"):
-            fallback_used = True
-
-    score = 50
-    reasons = []
 
     # Extract metrics
     rev_growth = f.get("revenue_growth")
@@ -94,7 +78,6 @@ def analyze(symbol: str):
     pe = f.get("pe_ratio")
     forward_pe = f.get("forward_pe")
 
-    # ✅ MUST return these metrics
     metrics = {
         "revenue_growth": rev_growth,
         "earnings_growth": earnings_growth,
@@ -106,6 +89,21 @@ def analyze(symbol: str):
         "pe_ratio": pe,
         "forward_pe": forward_pe,
     }
+
+    # --- FIXED: Correct Fallback Logic ---
+    # If we have a P/E, Sector, or Market Cap, then data is NOT a fallback!
+    has_any_data = False
+    if any(v is not None for v in [pe, f.get("sector"), f.get("market_cap")]):
+        has_any_data = True
+        
+    # Only force fallback mode if we have ZERO useful data.
+    if not has_any_data and not any(v is not None for v in [rev_growth, earnings_growth, roe, d2e, fcf, margins]):
+        fallback_used = True
+    else:
+        fallback_used = False
+
+    score = 50
+    reasons = []
 
     # Scoring logic (same as before)
     if rev_growth is not None:
