@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { api, getApiUrl, setApiUrl, Decision, ScanResult, wakeService } from "./api";
 import Pipeline from "./components/Pipeline";
 import DecisionCard from "./components/DecisionCard";
@@ -34,9 +34,11 @@ export default function App() {
   const [scanTaskId, setScanTaskId] = useState<string | null>(null);
   const [pollInterval, setPollInterval] = useState<number | null>(null);
 
-  // Retry and status states
+  // Retry, Status and Last Request tracking
   const [isRetrying, setIsRetrying] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const lastRequestType = useRef<"stock" | "scan" | "watchlist_scan" | null>(null);
+  const lastSymbol = useRef<string | null>(null);
 
   useEffect(() => {
     checkBackend();
@@ -77,6 +79,8 @@ export default function App() {
   async function handleSearch(symbol: string) {
     if (!symbol.trim()) return;
     setTab("dashboard");
+    lastRequestType.current = "stock";
+    lastSymbol.current = symbol.trim();
     setView({ mode: "loading", label: `Analysing ${symbol.toUpperCase()}...` });
     if (pollInterval) clearInterval(pollInterval);
     setScanTaskId(null);
@@ -89,9 +93,9 @@ export default function App() {
     }
   }
 
-  // Full market scan (async)
   async function handleScan() {
     setView({ mode: "loading", label: "Starting market scan..." });
+    lastRequestType.current = "scan";
     setScanTaskId(null);
     if (pollInterval) clearInterval(pollInterval);
     try {
@@ -111,9 +115,9 @@ export default function App() {
     }
   }
 
-  // Scan only watchlist
   async function handleScanWatchlist() {
     setView({ mode: "loading", label: "Scanning watchlist..." });
+    lastRequestType.current = "watchlist_scan";
     setScanTaskId(null);
     if (pollInterval) clearInterval(pollInterval);
     try {
@@ -154,27 +158,35 @@ export default function App() {
     }
   }
 
-  // Retry handler with loading state
+  // Enhanced Retry handler with wake-up logic
   const handleRetry = async () => {
     if (isRetrying) return;
     setIsRetrying(true);
-    setStatusMessage("⏳ Retrying...");
+    setStatusMessage("⏳ Restarting services and retrying...");
 
     try {
-      if (scanTaskId) {
-        const interval = window.setInterval(() => pollScanStatus(scanTaskId), 1000);
-        setPollInterval(interval);
-        await pollScanStatus(scanTaskId);
-        setStatusMessage("✅ Resumed scan");
+      // Step 1: Wake backend if it's down
+      if (backendUp === "down") {
+        await handleWakeBackend();
+        await new Promise(r => setTimeout(r, 3000)); // Give it time to spin up
+      }
+      
+      // Step 2: Retry the last request
+      if (lastRequestType.current === 'stock' && lastSymbol.current) {
+        await handleSearch(lastSymbol.current);
+      } else if (lastRequestType.current === 'scan') {
+        await handleScan();
+      } else if (lastRequestType.current === 'watchlist_scan') {
+        await handleScanWatchlist();
       } else {
         setView({ mode: "idle" });
-        setStatusMessage("✅ Reset view");
       }
+      setStatusMessage("✅ Retry successful");
     } catch (e) {
-      setStatusMessage("❌ Retry failed");
+      setStatusMessage("❌ Retry failed: " + (e as Error).message);
     } finally {
       setIsRetrying(false);
-      setTimeout(() => setStatusMessage(null), 3000);
+      setTimeout(() => setStatusMessage(null), 4000);
     }
   };
 
@@ -192,10 +204,12 @@ export default function App() {
       setTimeout(() => setStatusMessage(null), 3000);
     } catch (e) {
       console.error("Failed to add to watchlist", e);
+      setStatusMessage(`❌ Failed to add ${symbol} to watchlist`);
+      setTimeout(() => setStatusMessage(null), 3000);
     }
   }
 
-  // ── New handlers for manual Telegram notifications ──────────────────────
+  // Telegram handlers
   async function handleSendTopPicks() {
     if (view.mode !== "scan") return;
     const recs = view.data.recommendations || [];
@@ -244,7 +258,14 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-ink text-paper">
+    <div className="min-h-screen bg-ink text-paper relative">
+      {/* Floating Global Toast Notification */}
+      {statusMessage && (
+        <div className="fixed top-20 right-4 z-50 bg-graphite border border-signal-buy/40 rounded-xl px-5 py-3 shadow-2xl animate-fadeIn flex items-center gap-2">
+          <p className="font-mono text-sm text-paper">{statusMessage}</p>
+        </div>
+      )}
+
       {/* Nav */}
       <header className="sticky top-0 z-40 border-b border-slate/60 backdrop-blur-sm bg-ink/90">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between gap-3 flex-wrap">
@@ -459,11 +480,6 @@ export default function App() {
 
               {view.mode === "error" && (
                 <div className="rounded-xl border border-signal-sell/40 bg-signal-sell/5 p-6">
-                  {statusMessage && (
-                    <div className="mb-4 font-mono text-xs text-signal-prepare animate-pulse">
-                      {statusMessage}
-                    </div>
-                  )}
                   <p className="font-mono text-xs text-signal-sell/70 uppercase tracking-widest mb-1">
                     Error
                   </p>
@@ -480,7 +496,7 @@ export default function App() {
                       disabled={isRetrying}
                       className="font-mono text-xs text-paper bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-1.5 hover:bg-signal-prepare/30 transition disabled:opacity-50"
                     >
-                      {isRetrying ? "⏳ Retrying..." : (scanTaskId ? "Resume Scan" : "Try again")}
+                      {isRetrying ? "⏳ Restarting..." : (scanTaskId ? "Resume Scan" : "Try again")}
                     </button>
                     <button
                       onClick={() => setShowSettings(true)}
@@ -497,6 +513,7 @@ export default function App() {
                   data={view.data}
                   onBack={() => setView({ mode: "idle" })}
                   onSearchRelated={handleSearch}
+                  onAddToWatchlist={handleAddToWatchlist}
                 />
               )}
 

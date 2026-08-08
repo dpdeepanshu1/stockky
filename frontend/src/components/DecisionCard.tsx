@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Decision } from "../api";
 import { decisionStyle } from "../decisionStyle";
 
@@ -5,11 +6,13 @@ interface Props {
   data: Decision;
   onBack: () => void;
   onSearchRelated: (symbol: string) => void;
+  onAddToWatchlist: (symbol: string) => void; // NEW Prop
 }
 
-export default function DecisionCard({ data, onBack }: Props) {
+export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWatchlist }: Props) {
   const style = decisionStyle[data.decision] ?? decisionStyle["DO NOT BUY"];
   const isBullish = data.decision === "BUY NOW" || data.decision === "PREPARE TO BUY";
+  const [isAddingWatchlist, setIsAddingWatchlist] = useState(false);
 
   // Build score breakdown including news and prediction if available
   const scores = [
@@ -24,6 +27,16 @@ export default function DecisionCard({ data, onBack }: Props) {
   const hasPrice = data.close != null;
   const hasNews = data.reasons.news && data.reasons.news.length > 0;
   const hasEvent = data.reasons.event && data.reasons.event.length > 0;
+
+  const handleAddToWatchlist = async () => {
+    if (isAddingWatchlist) return;
+    setIsAddingWatchlist(true);
+    try {
+      await onAddToWatchlist(data.symbol);
+    } finally {
+      setIsAddingWatchlist(false);
+    }
+  };
 
   return (
     <div className="space-y-4">
@@ -50,7 +63,6 @@ export default function DecisionCard({ data, onBack }: Props) {
           </div>
 
           <div className="text-right font-mono">
-            {/* UPDATED: Show "Awaiting Data" instead of "N/A" for insufficient stocks */}
             <div className="text-4xl text-paper">
               {hasPrice ? `₹${data.close!.toLocaleString("en-IN")}` : data.data_insufficient ? "Awaiting Data" : "N/A"}
             </div>
@@ -102,6 +114,28 @@ export default function DecisionCard({ data, onBack }: Props) {
             </div>
           </div>
         )}
+        
+        {/* Watchlist Button in Header */}
+        <div className="mt-4 flex justify-end">
+          <button
+            onClick={handleAddToWatchlist}
+            disabled={isAddingWatchlist}
+            className={`text-[10px] font-mono transition border px-3 py-1 rounded flex items-center gap-1 ${
+              isAddingWatchlist 
+                ? "bg-signal-buy/20 border-signal-buy text-signal-buy" 
+                : "text-signal-prepare hover:text-paper border-signal-prepare/30"
+            }`}
+          >
+            {isAddingWatchlist ? (
+              <>
+                <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-signal-buy animate-spin"></span>
+                Adding...
+              </>
+            ) : (
+              "+ Watchlist"
+            )}
+          </button>
+        </div>
       </div>
 
       {/* Price levels + Score breakdown */}

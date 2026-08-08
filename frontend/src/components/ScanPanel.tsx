@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { ScanResult, Decision } from "../api";
 import { decisionStyle } from "../decisionStyle";
 
@@ -6,12 +7,43 @@ interface Props {
   onSelect: (symbol: string) => void;
   onBack: () => void;
   onAddToWatchlist: (symbol: string) => void;
-  onSendTopPicks: () => void;      // NEW
-  onSendAllActionable: () => void; // NEW
+  onSendTopPicks: () => Promise<void>;      
+  onSendAllActionable: () => Promise<void>; 
 }
 
 export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, onSendTopPicks, onSendAllActionable }: Props) {
   const allSorted = [...result.all_results].sort((a, b) => b.combined_score - a.combined_score);
+  
+  // Local loading states for animations
+  const [isSendingTelegram, setIsSendingTelegram] = useState<"top5" | "all" | null>(null);
+  const [addingWatchlist, setAddingWatchlist] = useState<string | null>(null);
+
+  const handleSendTopPicks = async () => {
+    setIsSendingTelegram("top5");
+    try {
+      await onSendTopPicks();
+    } finally {
+      setIsSendingTelegram(null);
+    }
+  };
+
+  const handleSendAllActionable = async () => {
+    setIsSendingTelegram("all");
+    try {
+      await onSendAllActionable();
+    } finally {
+      setIsSendingTelegram(null);
+    }
+  };
+
+  const handleAddToWatchlist = async (symbol: string) => {
+    setAddingWatchlist(symbol);
+    try {
+      await onAddToWatchlist(symbol);
+    } finally {
+      setAddingWatchlist(null);
+    }
+  };
 
   return (
     <div className="space-y-6 animate-fadeIn">
@@ -35,16 +67,32 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, 
       {/* Action buttons */}
       <div className="flex flex-wrap gap-3">
         <button
-          onClick={onSendTopPicks}
-          className="font-mono text-xs bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-2 hover:bg-signal-prepare/30 transition"
+          onClick={handleSendTopPicks}
+          disabled={!!isSendingTelegram}
+          className={`font-mono text-xs bg-signal-prepare/20 border border-signal-prepare/40 rounded-lg px-4 py-2 transition hover:bg-signal-prepare/30 disabled:opacity-50 flex items-center gap-2`}
         >
-          📤 Send Top 5 Picks
+          {isSendingTelegram === "top5" ? (
+            <>
+              <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-signal-prepare animate-spin"></span>
+              Sending Top 5...
+            </>
+          ) : (
+            "📤 Send Top 5 Picks"
+          )}
         </button>
         <button
-          onClick={onSendAllActionable}
-          className="font-mono text-xs bg-signal-buy/20 border border-signal-buy/40 rounded-lg px-4 py-2 hover:bg-signal-buy/30 transition"
+          onClick={handleSendAllActionable}
+          disabled={!!isSendingTelegram}
+          className={`font-mono text-xs bg-signal-buy/20 border border-signal-buy/40 rounded-lg px-4 py-2 transition hover:bg-signal-buy/30 disabled:opacity-50 flex items-center gap-2`}
         >
-          📤 Send All Actionable
+          {isSendingTelegram === "all" ? (
+            <>
+              <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-signal-buy animate-spin"></span>
+              Sending All...
+            </>
+          ) : (
+            "📤 Send All Actionable"
+          )}
         </button>
       </div>
 
@@ -82,7 +130,8 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, 
                 rank={i + 1}
                 data={r}
                 onSelect={onSelect}
-                onAddToWatchlist={onAddToWatchlist}
+                onAddToWatchlist={handleAddToWatchlist}
+                addingWatchlist={addingWatchlist}
               />
             ))}
           </div>
@@ -95,7 +144,13 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, 
           <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">Watchlist Candidates</div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {result.watchlist_candidates.slice(0, 6).map((d) => (
-              <CandidateCard key={d.symbol} data={d} onSelect={onSelect} onAddToWatchlist={onAddToWatchlist} />
+              <CandidateCard 
+                key={d.symbol} 
+                data={d} 
+                onSelect={onSelect} 
+                onAddToWatchlist={handleAddToWatchlist}
+                addingWatchlist={addingWatchlist}
+              />
             ))}
           </div>
         </div>
@@ -165,14 +220,17 @@ function TopPick({
   data,
   onSelect,
   onAddToWatchlist,
+  addingWatchlist,
 }: {
   rank: number;
   data: Decision;
   onSelect: (s: string) => void;
   onAddToWatchlist: (s: string) => void;
+  addingWatchlist: string | null;
 }) {
   const style = decisionStyle[data.decision];
   const upside = data.close != null && data.target != null ? (((data.target - data.close) / data.close) * 100).toFixed(1) : "N/A";
+  const isAdding = addingWatchlist === data.symbol;
 
   return (
     <button
@@ -195,9 +253,21 @@ function TopPick({
         </span>
         <button
           onClick={(e) => { e.stopPropagation(); onAddToWatchlist(data.symbol); }}
-          className="text-[10px] font-mono text-signal-prepare hover:text-paper transition border border-signal-prepare/30 px-2 py-0.5 rounded"
+          disabled={isAdding}
+          className={`text-[10px] font-mono transition border px-2 py-0.5 rounded flex items-center gap-1 ${
+            isAdding 
+              ? "bg-signal-buy/20 border-signal-buy text-signal-buy" 
+              : "text-signal-prepare hover:text-paper border-signal-prepare/30"
+          }`}
         >
-          + Watchlist
+          {isAdding ? (
+            <>
+              <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-signal-buy animate-spin"></span>
+              Adding...
+            </>
+          ) : (
+            "+ Watchlist"
+          )}
         </button>
       </div>
     </button>
@@ -208,12 +278,16 @@ function CandidateCard({
   data,
   onSelect,
   onAddToWatchlist,
+  addingWatchlist,
 }: {
   data: Decision;
   onSelect: (s: string) => void;
   onAddToWatchlist: (s: string) => void;
+  addingWatchlist: string | null;
 }) {
   const style = decisionStyle[data.decision];
+  const isAdding = addingWatchlist === data.symbol;
+
   return (
     <div
       onClick={() => onSelect(data.symbol)}
@@ -231,9 +305,21 @@ function CandidateCard({
       </div>
       <button
         onClick={(e) => { e.stopPropagation(); onAddToWatchlist(data.symbol); }}
-        className="mt-2 text-[10px] font-mono text-signal-prepare hover:text-paper transition border border-signal-prepare/30 px-2 py-0.5 rounded"
+        disabled={isAdding}
+        className={`mt-2 text-[10px] font-mono transition border px-2 py-0.5 rounded ${
+          isAdding 
+            ? "bg-signal-buy/20 border-signal-buy text-signal-buy" 
+            : "text-signal-prepare hover:text-paper border-signal-prepare/30"
+        }`}
       >
-        + Watchlist
+        {isAdding ? (
+          <span className="flex items-center gap-1">
+            <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-signal-buy animate-spin"></span>
+            Adding...
+          </span>
+        ) : (
+          "+ Watchlist"
+        )}
       </button>
     </div>
   );
