@@ -1,8 +1,7 @@
 """
-Prediction Service - API-Powered GenAI
+Prediction Service - Local GenAI (distilgpt2)
 --------------------
-Uses Hugging Face's free Inference API for Hinglish explanations.
-Reads HF_TOKEN from environment variables (no hardcoded secrets).
+Runs a lightweight transformer locally inside Render 512MB container.
 """
 import os
 import logging
@@ -10,8 +9,10 @@ import logging
 import httpx
 import joblib
 import pandas as pd
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from transformers import pipeline
 
 from features import latest_feature_vector, FEATURE_COLUMNS
 
@@ -21,10 +22,7 @@ logger = logging.getLogger("prediction-service")
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data-service:8001")
 MODEL_PATH = os.getenv("MODEL_PATH", "model.pkl")
 
-# Read HF token from environment
-HF_TOKEN = os.getenv("HF_TOKEN")
-
-app = FastAPI(title="Stockky Prediction Service", version="0.4.3-hf-env")
+app = FastAPI(title="Stockky Prediction Service", version="0.5.0-local")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _model = None
@@ -35,11 +33,29 @@ if os.path.exists(MODEL_PATH):
     except Exception as e:
         logger.error("Failed to load model: %s", e)
 else:
-    logger.warning("No trained model found at %s — serving fallback responses.", MODEL_PATH)
+    logger.warning("No trained model found — serving fallback responses.", MODEL_PATH)
+
+# --- Load local GenAI model (distilgpt2) ---
+_llm = None
+try:
+    logger.info("Loading local GenAI model (distilgpt2) with float16...")
+    # Use float16 to halve memory, no device_map (auto CPU)
+    _llm = pipeline(
+        "text-generation",
+        model="distilgpt2",
+        torch_dtype=torch.float16,
+        device="cpu",
+        max_new_tokens=70,
+        do_sample=True,
+        temperature=0.7,
+    )
+    logger.info("Local GenAI model loaded successfully!")
+except Exception as e:
+    logger.warning(f"Could not load local GenAI model: {repr(e)}. Falling back to templated strings.")
 
 @app.get("/")
 async def root():
-    return {"service": "Stockky Prediction Service", "version": "0.4.3", "status": "running"}
+    return {"service": "Stockky Prediction Service", "version": "0.5.0", "status": "running"}
 
 @app.get("/health")
 def health():
@@ -64,47 +80,24 @@ def _fetch_history(symbol: str) -> pd.DataFrame:
     return df
 
 def _generate_llm_note(feature_dict: dict, probability: float) -> str:
-    if not HF_TOKEN:
-        # Fallback: if no HF token, return basic estimate
+    if _llm is None:
         return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
     
     rsi = int(feature_dict.get('rsi', 50))
     adx = int(feature_dict.get('adx', 20))
     price_vs_200ema = "above" if feature_dict.get('price_vs_200ema', 0) > 0 else "below"
     
-    system_prompt = "You are a stock analyst. Give a brief, insightful Hinglish explanation."
-    user_prompt = f"RSI {rsi}, ADX {adx}, Price {price_vs_200ema} 200 EMA, Probability {round(probability * 100)}%. Explain why stock may move."
-    
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "inputs": f"{system_prompt}\n\nUser: {user_prompt}\nAssistant:",
-        "parameters": {
-            "max_new_tokens": 70,
-            "temperature": 0.7,
-            "return_full_text": False
-        }
-    }
+    prompt = (
+        f"Explain in Hinglish why this stock may move. "
+        f"RSI is {rsi}, ADX is {adx}, price is {price_vs_200ema} 200 EMA, "
+        f"probability is {round(probability * 100)}%. Explain in Hinglish."
+    )
     
     try:
-        resp = httpx.post(
-            "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2",
-            json=payload,
-            headers=headers,
-            timeout=30
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 0:
-                return data[0]['generated_text'].strip()
-            return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
-        else:
-            logger.warning(f"HF API returned error {resp.status_code}: {resp.text}")
-            return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
+        res = _llm(prompt)
+        return res[0]['generated_text'].replace(prompt, "").strip()
     except Exception as e:
-        logger.warning(f"HF generation failed: {repr(e)}")
+        logger.warning(f"Local GenAI generation failed: {repr(e)}")
         return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
 
 @app.get("/predict/{symbol}")
