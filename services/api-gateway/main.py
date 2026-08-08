@@ -416,6 +416,17 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
     merged = {**default, **raw}
     return merged
 
+def _fetch_price_from_quote(symbol: str) -> Optional[float]:
+    """Fetch current price from market data service quote endpoint."""
+    try:
+        resp = httpx.get(f"{MARKET_DATA_URL}/quote/{symbol}", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("price")
+    except Exception:
+        pass
+    return None
+
 # ── Hinglish summary ──────────────────────────────────────────────────────
 def _generate_summary(data) -> str:
     if not data or not isinstance(data, dict):
@@ -442,7 +453,7 @@ def _generate_summary(data) -> str:
             summary += f"फंडामेंटल: {fund[0]}. "
         summary += "जल्दी शामिल करें!"
     elif decision == "PREPARE TO BUY":
-        summary = f"⏳ {symbol} के लिए तैयारी करें, अभी इंतज़ार करें. "
+        summary = f"⏳ {symbol} के लिए, तैयारी करें, अभी इंतज़ार करें. "
         summary += f"एंट्री {entry.get('low')}-{entry.get('high')}, टारगेट {target}, स्टॉप {stop}. "
         summary += f"स्कोर {combined_score}. वॉल्यूम कन्फर्मेशन का इंतज़ार करें."
     elif decision == "HOLD":
@@ -515,6 +526,16 @@ async def run_scan_async(task_id: str, universe: List[str]):
                 resp.raise_for_status()
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
+                # If close is None, try to fetch from quote
+                if normalized.get("close") is None:
+                    price = _fetch_price_from_quote(symbol)
+                    if price is not None:
+                        normalized["close"] = price
+                        # Also try to set support/resistance approx if missing
+                        if normalized.get("support") is None:
+                            normalized["support"] = round(price * 0.95, 2)
+                        if normalized.get("resistance") is None:
+                            normalized["resistance"] = round(price * 1.05, 2)
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
             except httpx.HTTPError as e:
@@ -749,7 +770,7 @@ def remove_from_watchlist(symbol: str):
 def get_searched_symbols():
     return {"symbols": _load_searched()}
 
-# ── Stock decision (fully null‑safe) ─────────────────────────────────────
+# ── Stock decision (with price fallback) ──────────────────────────────────
 @app.get("/stock/{symbol}")
 def get_stock_decision(symbol: str, already_owned: bool = False):
     original = symbol.strip()
@@ -780,6 +801,18 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         resp.raise_for_status()
         raw = resp.json()
         result = _normalize_decision_response(raw, symbol_to_use)
+
+        # If close is None, try to fetch price from quote endpoint
+        if result.get("close") is None:
+            price = _fetch_price_from_quote(symbol_to_use)
+            if price is not None:
+                result["close"] = price
+                # Set approximate support/resistance if missing
+                if result.get("support") is None:
+                    result["support"] = round(price * 0.95, 2)
+                if result.get("resistance") is None:
+                    result["resistance"] = round(price * 1.05, 2)
+
         if corrected_from:
             result["corrected_from"] = corrected_from
             result["symbol"] = symbol_to_use
@@ -816,6 +849,14 @@ def run_scan(force_refresh: bool = False):
                 resp.raise_for_status()
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
+                if normalized.get("close") is None:
+                    price = _fetch_price_from_quote(symbol)
+                    if price is not None:
+                        normalized["close"] = price
+                        if normalized.get("support") is None:
+                            normalized["support"] = round(price * 0.95, 2)
+                        if normalized.get("resistance") is None:
+                            normalized["resistance"] = round(price * 1.05, 2)
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
             except httpx.HTTPError as e:
@@ -934,6 +975,14 @@ def scan_watchlist():
                 resp.raise_for_status()
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
+                if normalized.get("close") is None:
+                    price = _fetch_price_from_quote(symbol)
+                    if price is not None:
+                        normalized["close"] = price
+                        if normalized.get("support") is None:
+                            normalized["support"] = round(price * 0.95, 2)
+                        if normalized.get("resistance") is None:
+                            normalized["resistance"] = round(price * 1.05, 2)
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
             except httpx.HTTPError as e:

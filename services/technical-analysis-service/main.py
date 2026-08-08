@@ -41,8 +41,20 @@ def _safe(val, decimals=2):
         return None
 
 
-def _fetch_history(symbol: str, min_candles: int = 5):
-    """Fetch OHLCV candles from market-data-service. Returns None if less than min_candles."""
+def _fetch_quote_price(symbol: str) -> float | None:
+    """Fetch current price from market-data service quote endpoint."""
+    try:
+        resp = httpx.get(f"{MARKET_DATA_URL}/quote/{symbol}", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("price")
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_history(symbol: str):
+    """Fetch OHLCV candles from market-data-service. Returns DataFrame or None if insufficient data."""
     try:
         resp = httpx.get(
             f"{MARKET_DATA_URL}/history/{symbol}",
@@ -55,7 +67,7 @@ def _fetch_history(symbol: str, min_candles: int = 5):
         raise HTTPException(status_code=502, detail=f"Market data service unreachable: {e}")
 
     candles = data.get("candles", [])
-    if len(candles) < min_candles:
+    if len(candles) < 5:
         return None
 
     df = pd.DataFrame(candles)
@@ -133,7 +145,7 @@ def _bollinger(close: pd.Series, period: int = 20):
 
 
 def _support_resistance(df: pd.DataFrame, window: int = 20):
-    recent = df.tail(min(window, len(df)))
+    recent = df.tail(window)
     return float(recent["Low"].min()), float(recent["High"].max())
 
 
@@ -152,38 +164,44 @@ def root():
 @app.get("/analyze/{symbol}")
 def analyze(symbol: str):
     sym = normalize_symbol(symbol)
-    df = _fetch_history(sym, min_candles=5)
+    df = _fetch_history(sym)
 
     # ── Handle insufficient data (newly listed stocks) ──
     if df is None or len(df) < 5:
-        # Try to get at least the current price from quote endpoint
-        price = None
-        try:
-            resp = httpx.get(f"{MARKET_DATA_URL}/quote/{symbol}", timeout=10)
-            if resp.status_code == 200:
-                quote = resp.json()
-                price = quote.get("price")
-        except:
-            pass
-
-        reasons = [
-            f"Insufficient price history for {sym} (newly listed stock). "
-            "Please check back in 2-3 days after Yahoo Finance updates its database."
-        ]
+        # Try to get current price from quote endpoint
+        price = _fetch_quote_price(sym)
         if price:
-            reasons.append(f"Current price: ₹{price:.2f}")
-
-        return {
-            "symbol": sym,
-            "technical_score": 50,
-            "trend_strength": "unknown",
-            "volume_surge": False,
-            "close": price,
-            "support": None,
-            "resistance": None,
-            "data_insufficient": True,
-            "reasons": reasons,
-        }
+            # Even with only price, we can still return something
+            return {
+                "symbol": sym,
+                "technical_score": 50,
+                "trend_strength": "unknown",
+                "volume_surge": False,
+                "close": price,
+                "support": None,
+                "resistance": None,
+                "data_insufficient": True,
+                "reasons": [
+                    f"Insufficient price history for {sym} (newly listed stock). "
+                    f"Current price: ₹{price:.2f}. Please check back in 2-3 days for full analysis."
+                ],
+            }
+        else:
+            # No price even from quote
+            return {
+                "symbol": sym,
+                "technical_score": 50,
+                "trend_strength": "unknown",
+                "volume_surge": False,
+                "close": None,
+                "support": None,
+                "resistance": None,
+                "data_insufficient": True,
+                "reasons": [
+                    f"Insufficient price data for {sym} (newly listed stock). "
+                    "Please check back in 2-3 days after Yahoo Finance updates its database."
+                ],
+            }
     # ──────────────────────────────────────────────────────
 
     close  = df["Close"]
