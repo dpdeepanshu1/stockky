@@ -2,7 +2,6 @@
 Prediction Service - API-Powered GenAI
 --------------------
 Uses Groq's free Llama3 API for Hinglish explanations.
-Eliminates local model compilation and memory issues on Render.
 """
 import os
 import logging
@@ -21,10 +20,18 @@ logger = logging.getLogger("prediction-service")
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data-service:8001")
 MODEL_PATH = os.getenv("MODEL_PATH", "model.pkl")
 
-# Get your free API key from console.groq.com
+# Safe read of environment variable, stripping hidden whitespace/newlines
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-app = FastAPI(title="Stockky Prediction Service", version="0.4.0-groq")
+# --- DIAGNOSTIC BLOCK (TO BE REMOVED AFTER FIX) ---
+if GROQ_API_KEY:
+    logger.info(f"GROQ_API_KEY loaded successfully. Prefix: {GROQ_API_KEY[:8]}...")
+    GROQ_API_KEY = GROQ_API_KEY.strip() # Fixes hidden whitespace issues on Render
+else:
+    logger.warning("GROQ_API_KEY is MISSING or EMPTY in the environment!")
+# ----------------------------------------------------
+
+app = FastAPI(title="Stockky Prediction Service", version="0.4.1-groq-fixed")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _model = None
@@ -35,15 +42,15 @@ if os.path.exists(MODEL_PATH):
     except Exception as e:
         logger.error("Failed to load model: %s", e)
 else:
-    logger.warning("No trained model found at %s — run train.py first. Serving fallback responses.", MODEL_PATH)
+    logger.warning("No trained model found at %s — serving fallback responses.", MODEL_PATH)
 
 @app.get("/")
 async def root():
-    return {"service": "Stockky Prediction Service", "version": "0.4.0-groq", "status": "running", "groq_configured": bool(GROQ_API_KEY)}
+    return {"service": "Stockky Prediction Service", "version": "0.4.1", "status": "running"}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "prediction-service", "groq_configured": bool(GROQ_API_KEY)}
+    return {"status": "ok", "service": "prediction-service"}
 
 def _fetch_history(symbol: str) -> pd.DataFrame:
     try:
@@ -76,24 +83,24 @@ def _generate_llm_note(feature_dict: dict, probability: float) -> str:
     
     try:
         headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Authorization": f"Bearer {GROQ_API_KEY.strip()}", # <-- 2nd safety strip
             "Content-Type": "application/json"
         }
         payload = {
-            "model": "llama-3.1-8b-instant", # <--- CHANGED HERE: llama3-8b-8192 is deprecated
+            "model": "llama-3.1-8b-instant", 
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
             "temperature": 0.7,
-            "max_tokens": 60
+            "max_tokens": 70 # Slightly bumped tokens for better contextual sentences
         }
-        resp = httpx.post("https://api.groq.com/openai/v1/chat/completions", json=payload, timeout=30) # Increased timeout to 30s
+        resp = httpx.post("https://api.groq.com/openai/v1/chat/completions", json=payload, timeout=30)
         if resp.status_code == 200:
             data = resp.json()
             return data['choices'][0]['message']['content'].strip()
         else:
-            logger.warning(f"Groq API error: {resp.status_code}")
+            logger.warning(f"Groq API returned error {resp.status_code}")
             return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
     except Exception as e:
         logger.warning(f"Groq generation failed: {repr(e)}")
