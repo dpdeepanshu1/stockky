@@ -12,6 +12,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from llama_cpp import Llama
+from huggingface_hub import hf_hub_download
 
 from features import latest_feature_vector, FEATURE_COLUMNS
 
@@ -39,10 +40,15 @@ _llm = None
 try:
     logger.info("Loading GenAI model (TinyLlama)...")
     
-    # from_pretrained automatically locates the cached model from the build step
-    _llm = Llama.from_pretrained(
+    # Use hf_hub_download to locate the cached model (downloaded during build)
+    model_path = hf_hub_download(
         repo_id="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
-        filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+    )
+    
+    # Load the model with safe CPU parameters
+    _llm = Llama(
+        model_path=model_path,
         n_ctx=512,
         n_threads=1,          # Prevents threading issues on Render
         verbose=False
