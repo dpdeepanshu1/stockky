@@ -1,7 +1,7 @@
 """
 Prediction Service - GenAI Enhanced (512MB Optimized)
 --------------------
-Uses TinyLlama 1.1B GGML (Q4_0) via llama-cpp-python 0.1.78 (stable generic CPU build).
+Uses TinyLlama 1.1B GGML (Q4_0) via llama-cpp-python 0.1.78.
 """
 import os
 import logging
@@ -12,7 +12,6 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from llama_cpp import Llama
-from huggingface_hub import hf_hub_download
 
 from features import latest_feature_vector, FEATURE_COLUMNS
 
@@ -40,17 +39,12 @@ _llm = None
 try:
     logger.info("Loading GenAI model (TinyLlama)...")
     
-    # Locate the cached model (downloaded during build)
-    model_path = hf_hub_download(
-        repo_id="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGML",
-        filename="tinyllama-1.1b-chat-v1.0.Q4_0.bin"
-    )
+    # Path to the cached model (downloaded during build)
+    model_path = "/opt/render/.cache/huggingface/hub/tinyllama-1.1b-chat-v1.0.Q4_0.bin"
     
-    # Verify the file exists and is not empty
     if not os.path.exists(model_path) or os.path.getsize(model_path) == 0:
         raise FileNotFoundError(f"Model file missing or empty: {model_path}")
     
-    # Load the model with safe CPU parameters (n_threads=1 prevents threading issues on Render)
     _llm = Llama(
         model_path=model_path,
         n_ctx=512,
