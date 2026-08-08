@@ -14,9 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fundamental-analysis-service")
 
-# ✅ CORRECT: Use the actual market data service URL from your deployment
 # The service is named "stockky-market-data" on Render.
-# Default uses the live Render URL.
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
 
 app = FastAPI(title="Stockky Fundamental Analysis Service", version="0.1.0")
@@ -45,24 +43,38 @@ def _pct(x):
 
 @app.get("/analyze/{symbol}")
 def analyze(symbol: str):
+    f = {}
+    fallback_used = False
     try:
-        # 60s, not 15s: market-data-service now retries against Yahoo's
-        # rate limiter with real patience (see its _with_retry usage) —
-        # a short timeout here would cut that off before it can help.
+        # 60s timeout to allow market-data-service to retry against Yahoo
         resp = httpx.get(f"{MARKET_DATA_URL}/fundamentals/{symbol}", timeout=60)
         resp.raise_for_status()
         f = resp.json()
-    except httpx.HTTPError as e:
+        if not f:
+            f = {}
+    except httpx.TimeoutException:
+        logger.warning(f"Market data service timed out for {symbol}")
+        fallback_used = True
+    except httpx.HTTPStatusError as e:
         logger.error(f"Market data service error for {symbol}: {e}")
-        raise HTTPException(status_code=502, detail=f"Market data service unreachable: {e}")
+        # If we get a 502/504 from market-data, treat as unavailable
+        if e.response.status_code >= 500:
+            fallback_used = True
+        else:
+            raise HTTPException(status_code=e.response.status_code, detail=f"Market data service error: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        fallback_used = True
 
+    # If we have no data, create a minimal fallback object
     if not f:
         f = {}
+        fallback_used = True
 
     score = 50
     reasons = []
 
-    # Extract metrics – these keys must match what the market-data service returns
+    # Extract metrics (use .get with fallback None)
     rev_growth = f.get("revenue_growth")
     earnings_growth = f.get("earnings_growth")
     roe = f.get("roe")
@@ -85,7 +97,7 @@ def analyze(symbol: str):
         "forward_pe": forward_pe,
     }
 
-    # Scoring and reasons
+    # Scoring and reasons (same as before)
     if rev_growth is not None:
         if rev_growth > 15:
             score += 12
@@ -166,6 +178,10 @@ def analyze(symbol: str):
             score += 4
             reasons.append("Forward P/E lower than trailing P/E — earnings expected to grow into valuation")
 
+    # If we're using fallback, add a note
+    if fallback_used:
+        reasons.append("Live data temporarily unavailable — score is based on last known or default values")
+
     if not reasons:
         reasons.append("Fundamental data partially available; score is based on available metrics")
 
@@ -183,6 +199,7 @@ def analyze(symbol: str):
         "reasons": reasons,
         "metrics": metrics,
         "raw": f,
+        "fallback_used": fallback_used,
     }
 
 if __name__ == "__main__":

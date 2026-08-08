@@ -3,6 +3,7 @@ Decision Engine Service
 -------------------------
 Combines Technical + Fundamental + News + Prediction scores.
 Now includes fundamental metrics in the response, and global error handler.
+Gracefully degrades if fundamental analysis fails.
 """
 import os
 import asyncio
@@ -71,6 +72,7 @@ async def _fetch_required(client: httpx.AsyncClient, url: str, label: str) -> di
         resp.raise_for_status()
         return resp.json()
     except httpx.HTTPError as e:
+        # For required services, we still raise, but we can add a retry or fallback later.
         raise HTTPException(status_code=502, detail=f"{label} unavailable: {e}")
 
 async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
@@ -125,17 +127,36 @@ def _decide(technical_score: int, fundamental_score: int, news_score: int | None
 async def decide(symbol: str, already_owned: bool = False):
     try:
         async with httpx.AsyncClient(timeout=70) as client:
+            # Technical is required
             technical_task = _fetch_required(client, f"{TECHNICAL_URL}/analyze/{symbol}", "Technical analysis")
-            fundamental_task = _fetch_required(client, f"{FUNDAMENTAL_URL}/analyze/{symbol}", "Fundamental analysis")
+            
+            # Fundamental: we'll catch any exception and use a default
+            try:
+                fundamental_resp = await client.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=70)
+                fundamental_resp.raise_for_status()
+                fundamental = fundamental_resp.json()
+            except Exception as e:
+                logger.warning(f"Fundamental analysis failed for {symbol}, using default: {e}")
+                fundamental = {
+                    "fundamental_score": 50,
+                    "valuation": "fair",
+                    "sector": None,
+                    "reasons": ["Fundamental data temporarily unavailable"],
+                    "metrics": {},
+                    "fallback_used": True
+                }
+
+            # Optional services
             news_task = _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
             prediction_task = _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
             events_task = _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
-            technical, fundamental, news, prediction, events = await asyncio.gather(
-                technical_task, fundamental_task, news_task, prediction_task, events_task
+            
+            technical, news, prediction, events = await asyncio.gather(
+                technical_task, news_task, prediction_task, events_task
             )
 
         technical_score = technical["technical_score"]
-        fundamental_score = fundamental["fundamental_score"]
+        fundamental_score = fundamental.get("fundamental_score", 50)
         news_score = news["news_score"] if news else None
         prediction_score = prediction["prediction_score"] if prediction and prediction.get("model_loaded") else None
         fundamental_metrics = fundamental.get("metrics")
@@ -174,7 +195,7 @@ async def decide(symbol: str, already_owned: bool = False):
 
         reasons = {
             "technical": technical["reasons"],
-            "fundamental": fundamental["reasons"],
+            "fundamental": fundamental.get("reasons", ["No fundamental data"]),
         }
         if news:
             reasons["news"] = news["reasons"]
@@ -201,8 +222,8 @@ async def decide(symbol: str, already_owned: bool = False):
             "support": support,
             "resistance": resistance,
             "reasons": reasons,
-            "valuation": fundamental["valuation"],
-            "sector": fundamental["sector"],
+            "valuation": fundamental.get("valuation", "fair"),
+            "sector": fundamental.get("sector"),
         }
 
         if fundamental_metrics:
