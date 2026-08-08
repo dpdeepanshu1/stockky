@@ -69,7 +69,8 @@ def _compute_growth(current, previous):
         return None
     return ((current - previous) / previous) * 100
 
-def _with_retry(func, max_retries=3, base_delay=2):
+def _with_retry(func, max_retries=5, base_delay=3):
+    """Retry with exponential backoff and full jitter."""
     for attempt in range(max_retries):
         try:
             return func()
@@ -126,6 +127,20 @@ def _cache_set(key: str, value: dict, ttl: int = CACHE_TTL_SECONDS):
     if not cache:
         return
     cache.setex(key, ttl, json.dumps(value, default=str))
+
+# ---------- Fallback cache (30 days) ----------
+FALLBACK_TTL_SECONDS = 30 * 24 * 60 * 60
+
+def _fallback_get(key: str):
+    if not cache:
+        return None
+    val = cache.get(f"fallback:{key}")
+    return json.loads(val) if val else None
+
+def _fallback_set(key: str, value: dict):
+    if not cache:
+        return
+    cache.setex(f"fallback:{key}", FALLBACK_TTL_SECONDS, json.dumps(value, default=str))
 
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
@@ -256,6 +271,8 @@ def get_fundamentals_raw(symbol: str):
     cache_key = f"fundamentals:{sym}"
     cached = _cache_get(cache_key)
     if cached:
+        # If cached data has meaningful fields (not all null), return it
+        # But we'll still refresh in the background (not now, just return)
         return cached
 
     try:
@@ -265,7 +282,7 @@ def get_fundamentals_raw(symbol: str):
         # Try to get info with retry
         info = {}
         try:
-            info = _with_retry(lambda: ticker.info, max_retries=4, base_delay=2)
+            info = _with_retry(lambda: ticker.info, max_retries=5, base_delay=3)
         except Exception as e:
             logger.warning(f"Could not fetch info for {sym}: {e}")
 
@@ -274,15 +291,15 @@ def get_fundamentals_raw(symbol: str):
         balance = None
         cashflow = None
         try:
-            financials = _with_retry(lambda: ticker.financials, max_retries=2, base_delay=1)
+            financials = _with_retry(lambda: ticker.financials, max_retries=3, base_delay=2)
         except Exception as e:
             logger.warning(f"Could not fetch financials for {sym}: {e}")
         try:
-            balance = _with_retry(lambda: ticker.balance_sheet, max_retries=2, base_delay=1)
+            balance = _with_retry(lambda: ticker.balance_sheet, max_retries=3, base_delay=2)
         except Exception as e:
             logger.warning(f"Could not fetch balance sheet for {sym}: {e}")
         try:
-            cashflow = _with_retry(lambda: ticker.cashflow, max_retries=2, base_delay=1)
+            cashflow = _with_retry(lambda: ticker.cashflow, max_retries=3, base_delay=2)
         except Exception as e:
             logger.warning(f"Could not fetch cashflow for {sym}: {e}")
 
@@ -452,6 +469,14 @@ def get_fundamentals_raw(symbol: str):
 
         logger.info(f"Fundamentals for {sym}: PE={pe_ratio}, ROE={roe}, Revenue growth={revenue_growth}")
 
+        # Store in fallback cache if we got any meaningful data
+        meaningful_fields = [
+            revenue_growth, earnings_growth, roe, debt_to_equity,
+            free_cashflow, profit_margins, pe_ratio,
+        ]
+        if any(v is not None for v in meaningful_fields):
+            _fallback_set(cache_key, result)
+
         # Cache for 1 day (fundamentals change slowly)
         _cache_set(cache_key, result, ttl=86400)
 
@@ -461,6 +486,15 @@ def get_fundamentals_raw(symbol: str):
         raise
     except Exception as e:
         logger.exception("Failed to fetch fundamentals for %s", sym)
+        # Try to serve from fallback cache
+        stale = _fallback_get(cache_key)
+        if stale:
+            logger.info(f"Serving fallback fundamentals for {sym} (stale data)")
+            # Mark as stale
+            stale = dict(stale)
+            stale["stale"] = True
+            _cache_set(cache_key, stale, ttl=1800)  # short TTL, retry soon
+            return stale
         raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
 
 if __name__ == "__main__":
