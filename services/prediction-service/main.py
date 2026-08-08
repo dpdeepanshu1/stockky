@@ -1,3 +1,9 @@
+"""
+Prediction Service - API-Powered GenAI
+--------------------
+Uses Groq's free Llama3 API for Hinglish explanations.
+Eliminates local model compilation and memory issues on Render.
+"""
 import os
 import logging
 
@@ -6,7 +12,6 @@ import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from llama_cpp import Llama
 
 from features import latest_feature_vector, FEATURE_COLUMNS
 
@@ -16,7 +21,10 @@ logger = logging.getLogger("prediction-service")
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data-service:8001")
 MODEL_PATH = os.getenv("MODEL_PATH", "model.pkl")
 
-app = FastAPI(title="Stockky Prediction Service", version="0.3.0-llama")
+# Get your free API key from console.groq.com
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+app = FastAPI(title="Stockky Prediction Service", version="0.4.0-groq")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _model = None
@@ -29,38 +37,13 @@ if os.path.exists(MODEL_PATH):
 else:
     logger.warning("No trained model found at %s — run train.py first. Serving fallback responses.", MODEL_PATH)
 
-_llm = None
-try:
-    logger.info("Loading GenAI model (TinyLlama)...")
-    
-    model_path = "/opt/render/.cache/huggingface/hub/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
-    
-    if not os.path.exists(model_path) or os.path.getsize(model_path) == 0:
-        raise FileNotFoundError(f"Model file missing or empty: {model_path}")
-    
-    _llm = Llama(
-        model_path=model_path,
-        n_ctx=512,
-        n_threads=1,
-        verbose=False
-    )
-    logger.info("GenAI model loaded successfully!")
-except Exception as e:
-    logger.warning(f"Could not load GenAI model: {repr(e)}. Falling back to templated strings.")
-
 @app.get("/")
 async def root():
-    return {
-        "service": "Stockky Prediction Service",
-        "version": "0.3.0-llama",
-        "status": "running",
-        "model_loaded": _model is not None,
-        "genai_loaded": _llm is not None,
-    }
+    return {"service": "Stockky Prediction Service", "version": "0.4.0-groq", "status": "running", "groq_configured": bool(GROQ_API_KEY)}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "prediction-service", "model_loaded": _model is not None, "genai_loaded": _llm is not None}
+    return {"status": "ok", "service": "prediction-service", "groq_configured": bool(GROQ_API_KEY)}
 
 def _fetch_history(symbol: str) -> pd.DataFrame:
     try:
@@ -81,20 +64,39 @@ def _fetch_history(symbol: str) -> pd.DataFrame:
     return df
 
 def _generate_llm_note(feature_dict: dict, probability: float) -> str:
-    if _llm is None:
+    if not GROQ_API_KEY:
         return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
     
     rsi = int(feature_dict.get('rsi', 50))
     adx = int(feature_dict.get('adx', 20))
     price_vs_200ema = "above" if feature_dict.get('price_vs_200ema', 0) > 0 else "below"
     
-    prompt = f"<|system|>You are an expert stock market analyst. Explain in Hinglish.</s><|user|>RSI is {rsi}. ADX is {adx}. Price is {price_vs_200ema} 200 EMA. Probability {round(probability * 100)}%. Explain why stock may move.</s><|assistant|>"
+    system_prompt = "You are an expert stock market analyst. Provide a brief, insightful Hinglish explanation based on the technical indicators provided."
+    user_prompt = f"RSI is {rsi}. ADX is {adx}. Price is {price_vs_200ema} 200 EMA. Probability is {round(probability * 100)}%. Explain why the stock may move."
     
     try:
-        res = _llm(prompt, max_tokens=60, temperature=0.7, stop=["</s>", "<|"])
-        return res['choices'][0]['text'].strip()
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 60
+        }
+        resp = httpx.post("https://api.groq.com/openai/v1/chat/completions", json=payload, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data['choices'][0]['message']['content'].strip()
+        else:
+            logger.warning(f"Groq API error: {resp.status_code}")
+            return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
     except Exception as e:
-        logger.warning(f"GenAI generation failed: {repr(e)}")
+        logger.warning(f"Groq generation failed: {repr(e)}")
         return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
 
 @app.get("/predict/{symbol}")
