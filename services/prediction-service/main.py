@@ -1,7 +1,8 @@
 """
 Prediction Service - API-Powered GenAI
 --------------------
-Uses Groq's free Llama3 API for Hinglish explanations.
+Uses Hugging Face's free Inference API for Hinglish explanations.
+Reads HF_TOKEN from environment variables (no hardcoded secrets).
 """
 import os
 import logging
@@ -20,18 +21,10 @@ logger = logging.getLogger("prediction-service")
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data-service:8001")
 MODEL_PATH = os.getenv("MODEL_PATH", "model.pkl")
 
-# Safe read of environment variable, stripping hidden whitespace/newlines
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Read HF token from environment
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-# --- DIAGNOSTIC BLOCK (TO BE REMOVED AFTER FIX) ---
-if GROQ_API_KEY:
-    logger.info(f"GROQ_API_KEY loaded successfully. Prefix: {GROQ_API_KEY[:8]}...")
-    GROQ_API_KEY = GROQ_API_KEY.strip() # Fixes hidden whitespace issues on Render
-else:
-    logger.warning("GROQ_API_KEY is MISSING or EMPTY in the environment!")
-# ----------------------------------------------------
-
-app = FastAPI(title="Stockky Prediction Service", version="0.4.1-groq-fixed")
+app = FastAPI(title="Stockky Prediction Service", version="0.4.3-hf-env")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _model = None
@@ -46,7 +39,7 @@ else:
 
 @app.get("/")
 async def root():
-    return {"service": "Stockky Prediction Service", "version": "0.4.1", "status": "running"}
+    return {"service": "Stockky Prediction Service", "version": "0.4.3", "status": "running"}
 
 @app.get("/health")
 def health():
@@ -71,39 +64,47 @@ def _fetch_history(symbol: str) -> pd.DataFrame:
     return df
 
 def _generate_llm_note(feature_dict: dict, probability: float) -> str:
-    if not GROQ_API_KEY:
+    if not HF_TOKEN:
+        # Fallback: if no HF token, return basic estimate
         return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
     
     rsi = int(feature_dict.get('rsi', 50))
     adx = int(feature_dict.get('adx', 20))
     price_vs_200ema = "above" if feature_dict.get('price_vs_200ema', 0) > 0 else "below"
     
-    system_prompt = "You are an expert stock market analyst. Provide a brief, insightful Hinglish explanation based on the technical indicators provided."
-    user_prompt = f"RSI is {rsi}. ADX is {adx}. Price is {price_vs_200ema} 200 EMA. Probability is {round(probability * 100)}%. Explain why the stock may move."
+    system_prompt = "You are a stock analyst. Give a brief, insightful Hinglish explanation."
+    user_prompt = f"RSI {rsi}, ADX {adx}, Price {price_vs_200ema} 200 EMA, Probability {round(probability * 100)}%. Explain why stock may move."
+    
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "inputs": f"{system_prompt}\n\nUser: {user_prompt}\nAssistant:",
+        "parameters": {
+            "max_new_tokens": 70,
+            "temperature": 0.7,
+            "return_full_text": False
+        }
+    }
     
     try:
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY.strip()}", # <-- 2nd safety strip
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "llama-3.1-8b-instant", 
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.7,
-            "max_tokens": 70 # Slightly bumped tokens for better contextual sentences
-        }
-        resp = httpx.post("https://api.groq.com/openai/v1/chat/completions", json=payload, timeout=30)
+        resp = httpx.post(
+            "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2",
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
         if resp.status_code == 200:
             data = resp.json()
-            return data['choices'][0]['message']['content'].strip()
+            if isinstance(data, list) and len(data) > 0:
+                return data[0]['generated_text'].strip()
+            return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
         else:
-            logger.warning(f"Groq API returned error {resp.status_code}")
+            logger.warning(f"HF API returned error {resp.status_code}: {resp.text}")
             return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
     except Exception as e:
-        logger.warning(f"Groq generation failed: {repr(e)}")
+        logger.warning(f"HF generation failed: {repr(e)}")
         return f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
 
 @app.get("/predict/{symbol}")
