@@ -1,7 +1,7 @@
 """
 Prediction Service - GenAI Enhanced (512MB Optimized)
 --------------------
-Uses TinyLlama 1.1B GGUF via llama-cpp-python 0.1.78.
+Uses TinyLlama 1.1B GGUF (Q4_0) via llama-cpp-python 0.1.78.
 """
 import os
 import logging
@@ -35,7 +35,7 @@ if os.path.exists(MODEL_PATH):
 else:
     logger.warning("No trained model found at %s — run train.py first. Serving fallback responses.", MODEL_PATH)
 
-# --- Load Lightweight GenAI Model (TinyLlama 1.1B GGUF, ~220MB RAM) ---
+# --- Load Lightweight GenAI Model (TinyLlama 1.1B Q4_0, ~220MB RAM) ---
 _llm = None
 try:
     logger.info("Loading GenAI model (TinyLlama)...")
@@ -43,7 +43,7 @@ try:
     # Locate the cached model (downloaded during build)
     model_path = hf_hub_download(
         repo_id="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
-        filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+        filename="tinyllama-1.1b-chat-v1.0.Q4_0.gguf"  # <--- Q4_0 filename
     )
     
     # Verify the file exists and is not empty
