@@ -69,6 +69,16 @@ def analyze(symbol: str):
         f = {}
         fallback_used = True
 
+    # UPDATED: Check if we actually got meaningful data. If all primary metrics are None, treat as fallback!
+    primary_fields = [
+        f.get("revenue_growth"), f.get("earnings_growth"), f.get("roe"), 
+        f.get("debt_to_equity"), f.get("free_cashflow"), f.get("profit_margins"), 
+        f.get("pe_ratio")
+    ]
+    if not any(v is not None for v in primary_fields):
+        f = {}
+        fallback_used = True
+
     score = 50
     reasons = []
 
@@ -188,7 +198,6 @@ def analyze(symbol: str):
 
     score = max(0, min(100, round(score)))
 
-    # ✅ Return includes "metrics" – critical!
     return {
         "symbol": symbol.upper(),
         "fundamental_score": score,

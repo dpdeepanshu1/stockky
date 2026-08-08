@@ -406,14 +406,13 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
         "sector": None,
         "data_insufficient": False,
         "fundamental_metrics": None,
-        "fundamental_fallback": False, # UPDATED: Added to guarantee this field exists
+        "fundamental_fallback": False,
     }
     merged = {**default, **raw}
     return merged
 
 # ── Fallback helpers ──────────────────────────────────────────────────────
 def _fetch_price_from_quote(symbol: str) -> Optional[float]:
-    """Fetch current price from market data service quote endpoint."""
     try:
         resp = httpx.get(f"{MARKET_DATA_URL}/quote/{symbol}", timeout=5)
         if resp.status_code == 200:
@@ -430,26 +429,29 @@ def _fetch_price_from_quote(symbol: str) -> Optional[float]:
         logger.warning(f"Price fetch failed for {symbol}: {e}")
     return None
 
-def _fetch_fundamental_metrics(symbol: str) -> Optional[dict]:
-    """Fetch fundamental metrics directly from fundamental analysis service."""
+# UPDATED: Returns a tuple of (metrics dict, fallback_used bool)
+def _fetch_fundamental_metrics(symbol: str) -> tuple[Optional[dict], bool]:
     try:
         resp = httpx.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             metrics = data.get("metrics")
-            if metrics:
-                logger.info(f"Fundamental metrics fallback for {symbol}")
-                return metrics
-            else:
-                logger.warning(f"Fundamental service returned no metrics for {symbol}")
-        else:
-            logger.warning(f"Fundamental service returned {resp.status_code} for {symbol}")
+            fallback_used = data.get("fallback_used", False)
+            logger.info(f"Fundamental fallback for {symbol}: {fallback_used}")
+            return metrics, fallback_used
     except Exception as e:
         logger.warning(f"Fundamental fetch failed for {symbol}: {e}")
-    return None
+    return None, True
+
+def _merge_fundamentals(normalized: dict, symbol: str):
+    if not normalized.get("fundamental_metrics") or not any(normalized.get("fundamental_metrics", {}).values()):
+        metrics, fallback_used = _fetch_fundamental_metrics(symbol)
+        if metrics is not None:
+            normalized["fundamental_metrics"] = metrics
+            if fallback_used:
+                normalized["fundamental_fallback"] = True
 
 def _fetch_news(symbol: str) -> Optional[dict]:
-    """Fetch news from news intelligence service."""
     try:
         resp = httpx.get(f"{NEWS_URL}/analyze/{symbol}", timeout=5)
         if resp.status_code == 200:
@@ -462,7 +464,6 @@ def _fetch_news(symbol: str) -> Optional[dict]:
     return None
 
 def _fetch_events(symbol: str) -> Optional[dict]:
-    """Fetch events from event tracker service."""
     try:
         resp = httpx.get(f"{EVENT_URL}/events/{symbol}", timeout=5)
         if resp.status_code == 200:
@@ -475,7 +476,6 @@ def _fetch_events(symbol: str) -> Optional[dict]:
     return None
 
 def _wake_notification_service() -> bool:
-    """Ping notification service to wake it up."""
     try:
         resp = httpx.get(f"{NOTIFICATION_URL}/health", timeout=5)
         return resp.status_code == 200
@@ -556,7 +556,6 @@ def _send_scan_notification(recommendations: list, verdict: str, scanned: int, u
         message = "\n".join(lines)
 
     try:
-        # Wake notification service first
         _wake_notification_service()
         resp = httpx.post(f"{NOTIFICATION_URL}/notify", json={
             "title": "Market Scan Complete",
@@ -595,7 +594,6 @@ async def run_scan_async(task_id: str, universe: List[str]):
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
-                # ---- Fallbacks ----
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -605,10 +603,8 @@ async def run_scan_async(task_id: str, universe: List[str]):
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                if not normalized.get("fundamental_metrics"):
-                    metrics = _fetch_fundamental_metrics(symbol)
-                    if metrics:
-                        normalized["fundamental_metrics"] = metrics
+                # UPDATED: Use the new merger that properly handles fallback flag
+                _merge_fundamentals(normalized, symbol)
 
                 if normalized.get("news_score") is None:
                     news = _fetch_news(symbol)
@@ -894,7 +890,6 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         raw = resp.json()
         result = _normalize_decision_response(raw, symbol_to_use)
 
-        # ---- Fallbacks ----
         if result.get("close") is None:
             price = _fetch_price_from_quote(symbol_to_use)
             if price is not None:
@@ -904,10 +899,8 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                 if result.get("resistance") is None:
                     result["resistance"] = round(price * 1.05, 2)
 
-        if not result.get("fundamental_metrics"):
-            metrics = _fetch_fundamental_metrics(symbol_to_use)
-            if metrics:
-                result["fundamental_metrics"] = metrics
+        # UPDATED: Use the new merger that properly handles fallback flag
+        _merge_fundamentals(result, symbol_to_use)
 
         if result.get("news_score") is None:
             news = _fetch_news(symbol_to_use)
@@ -963,7 +956,6 @@ def run_scan(force_refresh: bool = False):
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
-                # ---- Apply all fallbacks ----
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -973,10 +965,8 @@ def run_scan(force_refresh: bool = False):
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                if not normalized.get("fundamental_metrics"):
-                    metrics = _fetch_fundamental_metrics(symbol)
-                    if metrics:
-                        normalized["fundamental_metrics"] = metrics
+                # UPDATED: Use the new merger that properly handles fallback flag
+                _merge_fundamentals(normalized, symbol)
 
                 if normalized.get("news_score") is None:
                     news = _fetch_news(symbol)
@@ -1114,7 +1104,6 @@ def scan_watchlist():
                 raw = resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
-                # ---- Apply fallbacks ----
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -1124,10 +1113,8 @@ def scan_watchlist():
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                if not normalized.get("fundamental_metrics"):
-                    metrics = _fetch_fundamental_metrics(symbol)
-                    if metrics:
-                        normalized["fundamental_metrics"] = metrics
+                # UPDATED: Use the new merger that properly handles fallback flag
+                _merge_fundamentals(normalized, symbol)
 
                 if normalized.get("news_score") is None:
                     news = _fetch_news(symbol)
@@ -1310,18 +1297,12 @@ def test_notification_channels():
 # ── Manual Telegram notification endpoint ──────────────────────────────────
 @app.post("/notifications/send-picks")
 def send_picks_to_telegram(payload: dict):
-    """
-    Manual trigger: send top picks or all actionable stocks to Telegram.
-    Payload: { "type": "top5" | "all_actionable", "recommendations": [...] }
-    """
     recs = payload.get("recommendations", [])
     if not recs:
         raise HTTPException(status_code=400, detail="No recommendations provided")
 
-    # Wake notification service
     _wake_notification_service()
 
-    # Build message
     msg_type = payload.get("type", "top5")
     if msg_type == "top5":
         title = "📊 *Top 5 Picks from Market Scan*"
@@ -1359,7 +1340,6 @@ def send_picks_to_telegram(payload: dict):
 
     message = "\n".join(lines)
 
-    # Send via notification service
     try:
         resp = httpx.post(
             f"{NOTIFICATION_URL}/notify",

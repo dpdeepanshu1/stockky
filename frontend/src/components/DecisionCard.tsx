@@ -50,8 +50,9 @@ export default function DecisionCard({ data, onBack }: Props) {
           </div>
 
           <div className="text-right font-mono">
+            {/* UPDATED: Show "Awaiting Data" instead of "N/A" for insufficient stocks */}
             <div className="text-4xl text-paper">
-              {hasPrice ? `₹${data.close!.toLocaleString("en-IN")}` : "N/A"}
+              {hasPrice ? `₹${data.close!.toLocaleString("en-IN")}` : data.data_insufficient ? "Awaiting Data" : "N/A"}
             </div>
             <div className="text-xs text-mist/60 mt-1">
               Combined {data.combined_score}/100
@@ -110,7 +111,6 @@ export default function DecisionCard({ data, onBack }: Props) {
           {hasPrice && data.support != null && data.resistance != null ? (
             <PriceLevelBar close={data.close!} support={data.support} resistance={data.resistance} />
           ) : (
-            // UPDATED: Show explicit new stock message if data_insufficient is true
             <p className="text-sm text-mist/60 italic">
               {data.data_insufficient 
                 ? `Insufficient price data for ${data.symbol} (newly listed stock). Please check back in 2-3 days after Yahoo Finance updates its database.` 
@@ -134,7 +134,6 @@ export default function DecisionCard({ data, onBack }: Props) {
           <h3 className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">
             📊 Fundamental Metrics
           </h3>
-          {/* UPDATED: Render specific fallback message when fundamental_fallback is true */}
           {data.fundamental_fallback ? (
             <p className="text-sm text-mist/60 italic">
               Live data temporarily unavailable — score is based on last known or default values.
