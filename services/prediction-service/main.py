@@ -1,8 +1,3 @@
-"""
-Prediction Service - GenAI Enhanced (512MB Optimized)
---------------------
-Uses TinyLlama 1.1B GGML (Q4_0) via llama-cpp-python 0.1.78.
-"""
 import os
 import logging
 
@@ -34,13 +29,11 @@ if os.path.exists(MODEL_PATH):
 else:
     logger.warning("No trained model found at %s — run train.py first. Serving fallback responses.", MODEL_PATH)
 
-# --- Load Lightweight GenAI Model (TinyLlama 1.1B Q4_0 GGML, ~220MB RAM) ---
 _llm = None
 try:
     logger.info("Loading GenAI model (TinyLlama)...")
     
-    # Path to the cached model (downloaded during build)
-    model_path = "/opt/render/.cache/huggingface/hub/tinyllama-1.1b-chat-v1.0.Q4_0.bin"
+    model_path = "/opt/render/.cache/huggingface/hub/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
     
     if not os.path.exists(model_path) or os.path.getsize(model_path) == 0:
         raise FileNotFoundError(f"Model file missing or empty: {model_path}")
@@ -55,7 +48,6 @@ try:
 except Exception as e:
     logger.warning(f"Could not load GenAI model: {repr(e)}. Falling back to templated strings.")
 
-
 @app.get("/")
 async def root():
     return {
@@ -66,11 +58,9 @@ async def root():
         "genai_loaded": _llm is not None,
     }
 
-
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "prediction-service", "model_loaded": _model is not None, "genai_loaded": _llm is not None}
-
 
 def _fetch_history(symbol: str) -> pd.DataFrame:
     try:
@@ -110,34 +100,17 @@ def _generate_llm_note(feature_dict: dict, probability: float) -> str:
 @app.get("/predict/{symbol}")
 def predict(symbol: str):
     if _model is None:
-        return {
-            "symbol": symbol.upper(),
-            "model_loaded": False,
-            "probability": None,
-            "prediction_score": None,
-            "note": "No trained model yet.",
-        }
-
+        return {"symbol": symbol.upper(), "model_loaded": False, "probability": None, "prediction_score": None, "note": "No trained model yet."}
     df = _fetch_history(symbol)
     features = latest_feature_vector(df)
-
     missing = [c for c in FEATURE_COLUMNS if c not in features]
     if missing:
         raise HTTPException(status_code=422, detail=f"Missing features: {missing}")
-
     X = pd.DataFrame([features])[FEATURE_COLUMNS]
     probability = float(_model.predict_proba(X)[0, 1])
     prediction_score = round(probability * 100)
     llm_note = _generate_llm_note(features, probability)
-
-    return {
-        "symbol": symbol.upper(),
-        "model_loaded": True,
-        "probability": round(probability, 3),
-        "prediction_score": prediction_score,
-        "note": llm_note,
-    }
-
+    return {"symbol": symbol.upper(), "model_loaded": True, "probability": round(probability, 3), "prediction_score": prediction_score, "note": llm_note}
 
 if __name__ == "__main__":
     import uvicorn

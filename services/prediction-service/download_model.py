@@ -4,16 +4,14 @@ import httpx
 
 print(">>> Starting Model Download during Build Phase...")
 
-# Direct public URL to the old GGML model (will always be available)
-URL = "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGML/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.bin"
+# Public GGUF model (always available)
+URL = "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 
-# Path to store the model (Render's cache persists across builds)
 cache_dir = "/opt/render/.cache/huggingface/hub"
 os.makedirs(cache_dir, exist_ok=True)
-model_path = os.path.join(cache_dir, "tinyllama-1.1b-chat-v1.0.Q4_0.bin")
+model_path = os.path.join(cache_dir, "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")
 
 try:
-    # Download the file with a timeout
     print(f"Downloading from {URL} ...")
     response = httpx.get(URL, timeout=120)
     response.raise_for_status()
