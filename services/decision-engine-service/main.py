@@ -3,7 +3,7 @@ Decision Engine Service
 -------------------------
 Combines Technical + Fundamental + News + Prediction scores.
 Now includes fundamental metrics in the response, and global error handler.
-Gracefully degrades if fundamental analysis fails.
+Gracefully degrades if any score is missing.
 """
 import os
 import asyncio
@@ -72,7 +72,6 @@ async def _fetch_required(client: httpx.AsyncClient, url: str, label: str) -> di
         resp.raise_for_status()
         return resp.json()
     except httpx.HTTPError as e:
-        # For required services, we still raise, but we can add a retry or fallback later.
         raise HTTPException(status_code=502, detail=f"{label} unavailable: {e}")
 
 async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
@@ -85,6 +84,10 @@ async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
         return None
 
 def _combined_score(technical_score: int, fundamental_score: int, news_score: int | None, prediction_score: int | None) -> float:
+    # Ensure scores are ints
+    tech = technical_score if technical_score is not None else 50
+    fund = fundamental_score if fundamental_score is not None else 50
+    
     weights = {"technical": 0.55, "fundamental": 0.45, "news": 0.0, "prediction": 0.0}
     if news_score is not None and prediction_score is not None:
         weights = {"technical": 0.40, "fundamental": 0.30, "news": 0.10, "prediction": 0.20}
@@ -92,7 +95,7 @@ def _combined_score(technical_score: int, fundamental_score: int, news_score: in
         weights = {"technical": 0.45, "fundamental": 0.35, "news": 0.20, "prediction": 0.0}
     elif prediction_score is not None:
         weights = {"technical": 0.40, "fundamental": 0.30, "news": 0.0, "prediction": 0.30}
-    total = technical_score * weights["technical"] + fundamental_score * weights["fundamental"]
+    total = tech * weights["technical"] + fund * weights["fundamental"]
     if news_score is not None:
         total += news_score * weights["news"]
     if prediction_score is not None:
@@ -108,7 +111,7 @@ def _decide(technical_score: int, fundamental_score: int, news_score: int | None
         return Decision.HOLD
     news_ok = news_score is None or news_score >= 35
     model_ok = prediction_score is None or prediction_score >= 50
-    if (technical_score >= 60 and fundamental_score >= 50 
+    if (technical_score is not None and technical_score >= 60 and fundamental_score is not None and fundamental_score >= 50 
         and trend_strength in ("strong", "moderate") 
         and volume_surge
         and dist_to_resistance_pct > 1
@@ -117,7 +120,7 @@ def _decide(technical_score: int, fundamental_score: int, news_score: int | None
         if event_risk:
             return Decision.PREPARE_TO_BUY
         return Decision.BUY_NOW
-    if fundamental_score >= 45 and 50 <= technical_score < 60:
+    if fundamental_score is not None and fundamental_score >= 45 and technical_score is not None and 50 <= technical_score < 60:
         return Decision.PREPARE_TO_BUY
     if already_owned and combined >= 65:
         return Decision.HOLD
@@ -155,16 +158,52 @@ async def decide(symbol: str, already_owned: bool = False):
                 technical_task, news_task, prediction_task, events_task
             )
 
-        technical_score = technical["technical_score"]
+        technical_score = technical.get("technical_score", 50)
+        if technical_score is None:
+            technical_score = 50
+        
         fundamental_score = fundamental.get("fundamental_score", 50)
+        if fundamental_score is None:
+            fundamental_score = 50
+            
         news_score = news["news_score"] if news else None
         prediction_score = prediction["prediction_score"] if prediction and prediction.get("model_loaded") else None
         fundamental_metrics = fundamental.get("metrics")
 
-        close = technical["close"]
-        resistance = technical["resistance"]
-        support = technical["support"]
-        dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
+        close = technical.get("close")
+        resistance = technical.get("resistance")
+        support = technical.get("support")
+        
+        # Handle missing close/resistance/support
+        if close is None or resistance is None or support is None:
+            # Return a neutral response with data_insufficient flag
+            return {
+                "symbol": symbol.upper(),
+                "decision": "DO NOT BUY",
+                "confidence": "Low",
+                "combined_score": 50,
+                "technical_score": technical_score,
+                "fundamental_score": fundamental_score,
+                "news_score": news_score,
+                "prediction_score": prediction_score,
+                "event_risk": False,
+                "entry_range": {"low": 0, "high": 0},
+                "target": 0,
+                "stop_loss": 0,
+                "holding_period": "N/A",
+                "close": 0,
+                "support": 0,
+                "resistance": 0,
+                "reasons": {
+                    "technical": ["Insufficient data for technical analysis"],
+                    "fundamental": fundamental.get("reasons", ["Data unavailable"])
+                },
+                "valuation": "fair",
+                "sector": None,
+                "data_insufficient": True,
+            }
+
+        dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2) if close and resistance else 0
 
         event_risk = False
         event_reason = None
@@ -180,7 +219,7 @@ async def decide(symbol: str, already_owned: bool = False):
                 pass
 
         decision = _decide(technical_score, fundamental_score, news_score, prediction_score,
-                           technical["trend_strength"], technical["volume_surge"], dist_to_resistance_pct,
+                           technical.get("trend_strength", "weak"), technical.get("volume_surge", False), dist_to_resistance_pct,
                            event_risk, already_owned)
         combined_score = _combined_score(technical_score, fundamental_score, news_score, prediction_score)
 
@@ -194,13 +233,13 @@ async def decide(symbol: str, already_owned: bool = False):
         confidence = "High" if combined_score >= 75 else "Medium" if combined_score >= 55 else "Low"
 
         reasons = {
-            "technical": technical["reasons"],
+            "technical": technical.get("reasons", []),
             "fundamental": fundamental.get("reasons", ["No fundamental data"]),
         }
         if news:
-            reasons["news"] = news["reasons"]
+            reasons["news"] = news.get("reasons", [])
         if prediction and prediction.get("model_loaded"):
-            reasons["prediction"] = [prediction["note"]]
+            reasons["prediction"] = [prediction.get("note", "Prediction available")]
         if event_reason:
             reasons["event"] = [event_reason]
 
