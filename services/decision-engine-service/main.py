@@ -91,6 +91,9 @@ def _combined_score(technical_score: int, fundamental_score: int, news_score: in
         weights = {"technical": 0.45, "fundamental": 0.35, "news": 0.20, "prediction": 0.0}
     elif prediction_score is not None:
         weights = {"technical": 0.40, "fundamental": 0.30, "news": 0.0, "prediction": 0.30}
+    else:
+        # Only technical and fundamental
+        weights = {"technical": 0.55, "fundamental": 0.45, "news": 0.0, "prediction": 0.0}
     total = technical_score * weights["technical"] + fundamental_score * weights["fundamental"]
     if news_score is not None:
         total += news_score * weights["news"]
@@ -101,8 +104,11 @@ def _combined_score(technical_score: int, fundamental_score: int, news_score: in
 def _decide(technical_score: int, fundamental_score: int, news_score: int | None, prediction_score: int | None,
             trend_strength: str, volume_surge: bool, dist_to_resistance_pct: float, 
             event_risk: bool, already_owned: bool, data_insufficient: bool = False) -> Decision:
+    
+    # If data is insufficient (e.g., newly listed stock), always return DO NOT BUY
     if data_insufficient:
         return Decision.DO_NOT_BUY
+    
     combined = _combined_score(technical_score, fundamental_score, news_score, prediction_score)
     if already_owned and combined < 35:
         return Decision.SELL
@@ -129,6 +135,7 @@ def _decide(technical_score: int, fundamental_score: int, news_score: int | None
 async def decide(symbol: str, already_owned: bool = False):
     try:
         async with httpx.AsyncClient(timeout=70) as client:
+            # Technical
             technical = {}
             data_insufficient = False
             try:
@@ -153,6 +160,7 @@ async def decide(symbol: str, already_owned: bool = False):
                 }
                 data_insufficient = True
 
+            # Fundamental
             fundamental = {}
             try:
                 fundamental_resp = await client.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=70)
@@ -171,18 +179,18 @@ async def decide(symbol: str, already_owned: bool = False):
                     "fallback_used": True
                 }
 
-            news_task = _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
-            prediction_task = _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
-            events_task = _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
-            news, prediction, events = await asyncio.gather(
-                news_task, prediction_task, events_task
-            )
+            # News (optional)
+            news = await _fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News Intelligence")
+            # Events (optional)
+            events = await _fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Event Tracker")
+            # Prediction (optional)
+            prediction = await _fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction Service")
 
         technical_score = technical.get("technical_score", 50)
         fundamental_score = fundamental.get("fundamental_score", 50)
         news_score = news["news_score"] if news else None
         prediction_score = prediction["prediction_score"] if prediction and prediction.get("model_loaded") else None
-        fundamental_metrics = fundamental.get("metrics")  # ✅ forward metrics
+        fundamental_metrics = fundamental.get("metrics")
 
         close = technical.get("close")
         support = technical.get("support")
@@ -190,10 +198,12 @@ async def decide(symbol: str, already_owned: bool = False):
         trend_strength = technical.get("trend_strength", "unknown")
         volume_surge = technical.get("volume_surge", False)
 
+        # Distance to resistance
         dist_to_resistance_pct = None
         if close and resistance and resistance > 0:
             dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
 
+        # Event risk
         event_risk = False
         event_reason = None
         if events and isinstance(events, dict):
@@ -209,11 +219,13 @@ async def decide(symbol: str, already_owned: bool = False):
                 except (ValueError, TypeError):
                     pass
 
+        # Decision
         decision = _decide(technical_score, fundamental_score, news_score, prediction_score,
                            trend_strength, volume_surge, dist_to_resistance_pct,
                            event_risk, already_owned, data_insufficient)
         combined_score = _combined_score(technical_score, fundamental_score, news_score, prediction_score)
 
+        # Entry/Target/Stop (only if we have price)
         entry_low, entry_high = None, None
         target = None
         stop_loss = None
@@ -264,6 +276,12 @@ async def decide(symbol: str, already_owned: bool = False):
 
         if fundamental_metrics and isinstance(fundamental_metrics, dict):
             response["fundamental_metrics"] = fundamental_metrics
+
+        # Also pass through news and event raw data if needed
+        if news:
+            response["news_data"] = news.get("raw", {})
+        if events:
+            response["event_data"] = events
 
         return response
 

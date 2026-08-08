@@ -76,7 +76,6 @@ def _with_retry(func, max_retries=3, base_delay=2):
         except Exception as e:
             if attempt == max_retries - 1:
                 raise
-            # Full jitter: avoids every concurrent request retrying in lockstep
             wait = random.uniform(0, base_delay * (2 ** attempt))
             logging.warning(f"Retry {attempt+1}/{max_retries} after {wait:.1f}s: {e}")
             time.sleep(wait)
@@ -128,20 +127,6 @@ def _cache_set(key: str, value: dict, ttl: int = CACHE_TTL_SECONDS):
         return
     cache.setex(key, ttl, json.dumps(value, default=str))
 
-# Separate fallback cache (30-day rolling TTL)
-FALLBACK_TTL_SECONDS = 30 * 24 * 60 * 60
-
-def _fallback_get(key: str):
-    if not cache:
-        return None
-    val = cache.get(f"fallback:{key}")
-    return json.loads(val) if val else None
-
-def _fallback_set(key: str, value: dict):
-    if not cache:
-        return
-    cache.setex(f"fallback:{key}", FALLBACK_TTL_SECONDS, json.dumps(value, default=str))
-
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
     if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
@@ -181,7 +166,6 @@ async def root():
 def health():
     return {"status": "ok", "service": "market-data-service", "cache": bool(cache)}
 
-# ✅ /quote endpoint – returns latest price and other quote data
 @app.get("/quote/{symbol}", response_model=QuoteResponse)
 def get_quote(symbol: str):
     sym = normalize_symbol(symbol)
@@ -278,12 +262,14 @@ def get_fundamentals_raw(symbol: str):
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
 
+        # Try to get info with retry
         info = {}
         try:
             info = _with_retry(lambda: ticker.info, max_retries=4, base_delay=2)
         except Exception as e:
             logger.warning(f"Could not fetch info for {sym}: {e}")
 
+        # Try to get financial statements (may be None)
         financials = None
         balance = None
         cashflow = None
@@ -313,7 +299,7 @@ def get_fundamentals_raw(symbol: str):
         balance_available = balance is not None and not balance.empty
         cashflow_available = cashflow is not None and not cashflow.empty
 
-        # Revenue growth
+        # Revenue growth (from financials)
         revenue_growth = None
         if financials_available and "Total Revenue" in financials.index:
             rev_series = financials.loc["Total Revenue"]
@@ -322,6 +308,7 @@ def get_fundamentals_raw(symbol: str):
                 prev_rev = rev_series.iloc[1]
                 revenue_growth = _compute_growth(current_rev, prev_rev)
 
+        # Earnings growth (Net Income)
         earnings_growth = None
         if financials_available and "Net Income" in financials.index:
             earnings_series = financials.loc["Net Income"]
@@ -330,6 +317,7 @@ def get_fundamentals_raw(symbol: str):
                 prev_earn = earnings_series.iloc[1]
                 earnings_growth = _compute_growth(current_earn, prev_earn)
 
+        # ROE
         roe = None
         if "returnOnEquity" in info:
             roe = _safe_info("returnOnEquity") * 100 if _safe_info("returnOnEquity") else None
@@ -340,6 +328,7 @@ def get_fundamentals_raw(symbol: str):
                 if equity != 0:
                     roe = (net_income / equity) * 100
 
+        # Debt to Equity
         debt_to_equity = None
         if "debtToEquity" in info:
             debt_to_equity = _safe_info("debtToEquity")
@@ -349,12 +338,14 @@ def get_fundamentals_raw(symbol: str):
             if equity != 0:
                 debt_to_equity = total_debt / equity
 
+        # Free Cash Flow
         free_cashflow = None
         if "freeCashflow" in info:
             free_cashflow = _safe_info("freeCashflow")
         elif cashflow_available and "Free Cash Flow" in cashflow.index:
             free_cashflow = cashflow.loc["Free Cash Flow"].iloc[0]
 
+        # Profit Margins
         profit_margins = None
         if "profitMargins" in info:
             profit_margins = _safe_info("profitMargins") * 100
@@ -365,34 +356,41 @@ def get_fundamentals_raw(symbol: str):
                 if revenue != 0:
                     profit_margins = (net_income / revenue) * 100
 
+        # Institutional Holding
         held_percent_institutions = None
         if "heldPercentInstitutions" in info:
             held_percent_institutions = _safe_info("heldPercentInstitutions") * 100
         elif "institutionalPercent" in info:
             held_percent_institutions = _safe_info("institutionalPercent") * 100
 
+        # PE Ratio
         pe_ratio = None
         if "trailingPE" in info:
             pe_ratio = _safe_info("trailingPE")
         elif "peRatio" in info:
             pe_ratio = _safe_info("peRatio")
 
+        # Forward PE
         forward_pe = None
         if "forwardPE" in info:
             forward_pe = _safe_info("forwardPE")
 
+        # EPS
         eps = None
         if "trailingEps" in info:
             eps = _safe_info("trailingEps")
         elif "eps" in info:
             eps = _safe_info("eps")
 
+        # Price to Book
         price_to_book = None
         if "priceToBook" in info:
             price_to_book = _safe_info("priceToBook")
 
+        # Market Cap
         market_cap = _safe_info("marketCap")
 
+        # Dividend Yield
         dividend_yield = None
         if "dividendYield" in info:
             dividend_yield = _safe_info("dividendYield") * 100
@@ -407,6 +405,7 @@ def get_fundamentals_raw(symbol: str):
             except Exception:
                 pass
 
+        # Year high/low, averages
         year_high = _safe_info("fiftyTwoWeekHigh")
         year_low = _safe_info("fiftyTwoWeekLow")
         fifty_day_average = _safe_info("fiftyDayAverage")
@@ -415,6 +414,7 @@ def get_fundamentals_raw(symbol: str):
         if year_change_pct is not None:
             year_change_pct = year_change_pct * 100
 
+        # Range position
         range_position = None
         if year_high and year_low:
             last_price = _safe_info("regularMarketPrice") or _safe_info("last_price")
@@ -452,22 +452,8 @@ def get_fundamentals_raw(symbol: str):
 
         logger.info(f"Fundamentals for {sym}: PE={pe_ratio}, ROE={roe}, Revenue growth={revenue_growth}")
 
+        # Cache for 1 day (fundamentals change slowly)
         _cache_set(cache_key, result, ttl=86400)
-
-        meaningful_fields = [
-            revenue_growth, earnings_growth, roe, debt_to_equity,
-            free_cashflow, profit_margins, pe_ratio,
-        ]
-        if any(v is not None for v in meaningful_fields):
-            _fallback_set(cache_key, result)
-        else:
-            stale = _fallback_get(cache_key)
-            if stale:
-                logger.info("Live fetch for %s came back empty; serving last-known-good fallback", sym)
-                stale = dict(stale)
-                stale["stale"] = True
-                _cache_set(cache_key, stale, ttl=1800)
-                return stale
 
         return result
 
@@ -475,13 +461,6 @@ def get_fundamentals_raw(symbol: str):
         raise
     except Exception as e:
         logger.exception("Failed to fetch fundamentals for %s", sym)
-        stale = _fallback_get(cache_key)
-        if stale:
-            logger.info("Live fetch for %s failed (%s); serving last-known-good fallback", sym, e)
-            stale = dict(stale)
-            stale["stale"] = True
-            _cache_set(cache_key, stale, ttl=1800)
-            return stale
         raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
 
 if __name__ == "__main__":
