@@ -46,7 +46,10 @@ def _pct(x):
 @app.get("/analyze/{symbol}")
 def analyze(symbol: str):
     try:
-        resp = httpx.get(f"{MARKET_DATA_URL}/fundamentals/{symbol}", timeout=15)
+        # 60s, not 15s: market-data-service now retries against Yahoo's
+        # rate limiter with real patience (see its _with_retry usage) —
+        # a short timeout here would cut that off before it can help.
+        resp = httpx.get(f"{MARKET_DATA_URL}/fundamentals/{symbol}", timeout=60)
         resp.raise_for_status()
         f = resp.json()
     except httpx.HTTPError as e:
@@ -165,6 +168,9 @@ def analyze(symbol: str):
 
     if not reasons:
         reasons.append("Fundamental data partially available; score is based on available metrics")
+
+    if f.get("stale"):
+        reasons.append("Live data was temporarily unavailable (Yahoo Finance rate limit) — showing the last known values instead")
 
     score = max(0, min(100, round(score)))
 
