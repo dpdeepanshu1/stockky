@@ -13,7 +13,8 @@ import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from llama_cpp import Llama # <--- Lightweight GenAI replaced transformers
+from llama_cpp import Llama
+from huggingface_hub import hf_hub_download # <--- Added for v0.1.78 compatibility
 
 from features import latest_feature_vector, FEATURE_COLUMNS
 
@@ -40,10 +41,13 @@ else:
 _llm = None
 try:
     logger.info("Loading GenAI model (TinyLlama)...")
-    # Uses llama.cpp, automatically downloads the quantized model on first run
-    _llm = Llama.from_pretrained(
+    # FIXED: v0.1.78 does not support .from_pretrained. We download it via huggingface_hub first.
+    model_path = hf_hub_download(
         repo_id="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
-        filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        filename="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+    )
+    _llm = Llama(
+        model_path=model_path,
         n_ctx=512,      # Low context to keep memory usage under 300MB
         n_threads=2,    # Render CPU thread limit
         verbose=False
