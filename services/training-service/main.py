@@ -8,6 +8,7 @@ import logging
 import json
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
+
 import joblib
 import pandas as pd
 import numpy as np
@@ -17,11 +18,11 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-# Import internal modules
-from . import models as db_models
-from .train import train_model
-from .evaluate import evaluate_predictions, evaluate_t1, evaluate_t5
-from .scanner import TrainingScanner
+# --- ✅ FIX: Use absolute imports (no leading dot) ---
+import models as db_models
+from train import train_model
+from evaluate import evaluate_t1, evaluate_t5
+from scanner import TrainingScanner
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("training-service")
@@ -73,6 +74,12 @@ class ModelStatusResponse(BaseModel):
     last_training_date: Optional[datetime]
     dataset_size: int
     performance: Dict
+
+# --- Startup event: create tables ---
+@app.on_event("startup")
+def startup():
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created (if missing)")
 
 # --- API Endpoints ---
 @app.post("/record-prediction")
@@ -176,4 +183,5 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8010)
+    port = int(os.getenv("PORT", 8010))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
