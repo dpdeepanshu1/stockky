@@ -153,6 +153,23 @@ def _add_searched(symbol: str):
         _redis_set(SEARCHED_KEY, searched[-200:])
 
 # ── Dynamic Universe Sources ──────────────────────────────────────────────
+_nse_client = None
+
+def _get_nse_client() -> httpx.Client:
+    """Get a reusable httpx Client with cookies set for NSE API."""
+    global _nse_client
+    if _nse_client is None:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/",
+            "DNT": "1",
+        }
+        _nse_client = httpx.Client(headers=headers, timeout=15)
+        # First hit the homepage to get cookies
+        _nse_client.get("https://www.nseindia.com")
+    return _nse_client
 
 def _fetch_from_nse_api(endpoint: str, cache_key: str, ttl: int = 21600):
     cached = _redis_get(cache_key)
@@ -160,25 +177,23 @@ def _fetch_from_nse_api(endpoint: str, cache_key: str, ttl: int = 21600):
         return cached
 
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-        }
-        resp = httpx.get(f"https://www.nseindia.com/api/{endpoint}", headers=headers, timeout=15)
+        client = _get_nse_client()
+        url = f"https://www.nseindia.com/api/{endpoint}"
+        resp = client.get(url)
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, dict):
                 _redis_set(cache_key, data, ttl)
                 return data
-            else:
-                logger.warning(f"NSE API {endpoint} returned non-dict: {type(data).__name__}")
-                return None
         else:
             logger.warning(f"NSE API {endpoint} returned {resp.status_code}")
-            return None
     except Exception as e:
         logger.warning(f"Failed to fetch {endpoint}: {e}")
-        return None
+
+    # If API fails, try to return stale cache if exists
+    if cached:
+        return cached
+    return None
 
 def _get_all_nse_securities() -> List[str]:
     data = _fetch_from_nse_api("equity-stockIndices?index=SECURITIES%20IN%20NSE", "nse:all_securities")
@@ -188,6 +203,21 @@ def _get_all_nse_securities() -> List[str]:
             if isinstance(item, dict) and item.get("symbol"):
                 symbols.append(item["symbol"].upper())
     logger.info(f"Fetched {len(symbols)} securities from NSE")
+    # Fallback to a static list if API fails
+    if not symbols:
+        symbols = [
+            "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HCLTECH",
+            "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "M&M", "MARUTI",
+            "NESTLEIND", "NTPC", "ONGC", "POWERGRID", "SBILIFE", "SUNPHARMA",
+            "TATAMOTORS", "TATASTEEL", "WIPRO", "ADANIENT", "ADANIPORTS",
+            "ASIANPAINT", "AXISBANK", "BAJAJFINSV", "BRITANNIA", "CIPLA",
+            "COALINDIA", "DIVISLAB", "DRREDDY", "EICHERMOT", "GRASIM",
+            "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "INDUSINDBK",
+            "JSWSTEEL", "LTIM", "POWERGRID", "SBILIFE", "SHRIRAMFIN",
+            "TATACONSUM", "TRENT", "TITAN", "ULTRACEMCO", "BAJAJ-AUTO",
+            "BPCL", "APOLLOHOSP", "BAJFINANCE"
+        ]
+        logger.warning(f"Using static fallback list with {len(symbols)} symbols")
     return symbols
 
 def _get_nifty_indices() -> List[str]:
@@ -199,7 +229,6 @@ def _get_nifty_indices() -> List[str]:
             for item in data["data"]:
                 if isinstance(item, dict) and item.get("symbol"):
                     all_symbols.append(item["symbol"].upper())
-    
     fallback = [
         "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
         "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BHARTIARTL", "BPCL",
@@ -257,7 +286,7 @@ def _get_news_mentioned_symbols() -> List[str]:
         )
         text = " ".join(e.title for e in feed.entries[:30]).upper()
         all_symbols = _get_all_nse_securities()
-        for sym in all_symbols[:300]: # UPDATED: Increased to 300
+        for sym in all_symbols[:300]:
             if sym in text:
                 mentioned.append(sym)
     except Exception as e:
@@ -274,7 +303,7 @@ def _build_scan_universe() -> List[str]:
     try:
         all_stocks = _get_all_nse_securities()
         if all_stocks:
-            universe.update(all_stocks[:300]) # UPDATED: Increased to 300
+            universe.update(all_stocks[:300])
         else:
             universe.update(_get_nifty_indices())
     except Exception as e:
@@ -321,7 +350,7 @@ def _build_scan_universe() -> List[str]:
         fallback = ["RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HCLTECH", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK"]
         clean = fallback
 
-    result = clean[:300] # UPDATED: Increased to 300
+    result = clean[:300]
     _redis_set(SCAN_UNIVERSE_KEY, result, ttl=21600)
     logger.info(f"Scan universe built: {len(result)} symbols")
     return result
@@ -333,7 +362,7 @@ def _get_all_known_symbols() -> Set[str]:
         return set(cached)
     combined = set()
     try:
-        combined.update(_get_all_nse_securities()[:300]) # UPDATED: Increased to 300
+        combined.update(_get_all_nse_securities()[:300])
     except:
         pass
     combined.update(_get_nifty_indices())
@@ -390,7 +419,7 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
         "fundamental_score": 50,
         "news_score": None,
         "prediction_score": None,
-        "prediction_note": None, # <--- Added to preserve LLM note
+        "prediction_note": None,
         "event_risk": False,
         "entry_range": None,
         "target": None,
@@ -495,8 +524,6 @@ def _generate_summary(data) -> str:
     holding = data.get("holding_period")
     reasons = data.get("reasons") or {}
     close = data.get("close")
-    
-    # NEW: Grab the GenAI Prediction Note if available
     prediction_note = data.get("prediction_note")
 
     if decision == "BUY NOW":
@@ -510,19 +537,15 @@ def _generate_summary(data) -> str:
         if fund:
             summary += f"फंडामेंटल: {fund[0]}. "
         summary += "जल्दी शामिल करें!"
-        
     elif decision == "PREPARE TO BUY":
         summary = f"⏳ {symbol} के लिए, तैयारी करें, अभी इंतज़ार करें. "
         summary += f"एंट्री {entry.get('low')}-{entry.get('high')}, टारगेट {target}, स्टॉप {stop}. "
         summary += f"स्कोर {combined_score}. वॉल्यूम कन्फर्मेशन का इंतज़ार करें."
-        
     elif decision == "HOLD":
         summary = f"🔄 {symbol} को होल्ड करें. टारगेट {target}, स्टॉप {stop}. स्कोर {combined_score}."
-        
     elif decision == "SELL":
         summary = f"🔴 {symbol} को बेचें. कीमत {close}, टारगेट से नीचे. स्टॉप {stop} पार. स्कोर {combined_score}."
-        
-    else: # DO NOT BUY / WAIT
+    else:
         summary = f"❌ {symbol} अभी न खरीदें. स्कोर {combined_score}. "
         tech = reasons.get("technical", [])
         if tech:
@@ -532,7 +555,6 @@ def _generate_summary(data) -> str:
             summary += f"फंडामेंटल: {fund[0]}. "
         summary += "कुछ दिन और देखें."
 
-    # NEW: Append the GenAI prediction note for a truly AI-driven narrative
     if prediction_note:
         summary += f" 🤖 {prediction_note}"
 
@@ -929,24 +951,21 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                 reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
                 result["reasons"] = reasons
 
-        # --- NEW: Retrieve GenAI prediction note ---
         if result.get("prediction_score") is None:
-            # Attempt to fetch prediction to get the LLM note
             try:
                 pred_resp = httpx.get(f"{PREDICTION_URL}/predict/{symbol_to_use}", timeout=60)
                 if pred_resp.status_code == 200:
                     pred_data = pred_resp.json()
                     if pred_data.get("model_loaded"):
                         result["prediction_score"] = pred_data.get("prediction_score")
-                        result["prediction_note"] = pred_data.get("note") # Capture GenAI Narrative
+                        result["prediction_note"] = pred_data.get("note")
             except Exception as e:
                 logger.warning(f"Prediction service lookup failed for {symbol_to_use}: {e}")
 
         if corrected_from:
             result["corrected_from"] = corrected_from
             result["symbol"] = symbol_to_use
-            
-        # Generate the composite summary (Hinglish + AI Note)
+
         result["natural_language_summary"] = _generate_summary(result)
         return result
 
@@ -1009,7 +1028,6 @@ def run_scan(force_refresh: bool = False):
                         reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
                         normalized["reasons"] = reasons
 
-                # --- NEW: Retrieve GenAI prediction note ---
                 if normalized.get("prediction_score") is None:
                     try:
                         pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=25)
@@ -1017,7 +1035,7 @@ def run_scan(force_refresh: bool = False):
                             pred_data = pred_resp.json()
                             if pred_data.get("model_loaded"):
                                 normalized["prediction_score"] = pred_data.get("prediction_score")
-                                normalized["prediction_note"] = pred_data.get("note") # Capture GenAI Narrative
+                                normalized["prediction_note"] = pred_data.get("note")
                     except Exception as e:
                         logger.warning(f"Prediction service lookup failed during scan for {symbol}: {e}")
 
@@ -1168,7 +1186,6 @@ def scan_watchlist():
                         reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
                         normalized["reasons"] = reasons
 
-                # --- NEW: Retrieve GenAI prediction note ---
                 if normalized.get("prediction_score") is None:
                     try:
                         pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=25)
@@ -1176,7 +1193,7 @@ def scan_watchlist():
                             pred_data = pred_resp.json()
                             if pred_data.get("model_loaded"):
                                 normalized["prediction_score"] = pred_data.get("prediction_score")
-                                normalized["prediction_note"] = pred_data.get("note") # Capture GenAI Narrative
+                                normalized["prediction_note"] = pred_data.get("note")
                     except Exception as e:
                         logger.warning(f"Prediction service lookup failed during watchlist scan for {symbol}: {e}")
 
