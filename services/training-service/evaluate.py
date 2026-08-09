@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 import yfinance as yf
 
-from . import models as db_models
+# ✅ Absolute import
+import models as db_models
 
 logger = logging.getLogger("training-service.evaluate")
 

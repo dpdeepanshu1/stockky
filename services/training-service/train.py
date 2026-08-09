@@ -15,7 +15,8 @@ import xgboost as xgb
 import joblib
 from sqlalchemy.orm import Session
 
-from . import models as db_models
+# ✅ Absolute import
+import models as db_models
 
 logger = logging.getLogger("training-service.train")
 

@@ -1,7 +1,7 @@
 """
 Database models for the Training Service.
 """
-from sqlalchemy import Column, String, Float, Integer, DateTime, JSON, Text, create_engine
+from sqlalchemy import Column, String, Float, Integer, DateTime, JSON, Text
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
 
