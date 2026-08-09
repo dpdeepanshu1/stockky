@@ -65,7 +65,7 @@ else:
 # failure to a different vendor. Check ai.google.dev/gemini-api/docs/models
 # for the current recommended free-tier model if this one gets retired —
 # Google rotates these roughly as often as Groq does.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     GEMINI_API_KEY = GEMINI_API_KEY.strip()
@@ -236,6 +236,23 @@ def _generate_llm_note(features: dict, probability: float) -> str:
     return fallback
 
 
+# --------------------- NEW: Feature alignment ---------------------
+def _align_features(features: dict, model) -> dict:
+    """Return only the features that the model was trained on."""
+    if hasattr(model, 'feature_names_in_'):
+        expected = model.feature_names_in_
+        # Keep only features that exist in both
+        aligned = {col: features[col] for col in expected if col in features}
+        # If any required feature is missing, it will raise later, but we at least align
+        if len(aligned) != len(expected):
+            missing = [col for col in expected if col not in aligned]
+            logger.warning(f"Missing features: {missing}")
+        return aligned
+    # If model doesn't store feature names, use all features (may cause issues)
+    return features
+# -------------------------------------------------------------------
+
+
 @app.get("/predict/{symbol}")
 def predict(symbol: str):
     if _model is None:
@@ -250,8 +267,17 @@ def predict(symbol: str):
     features = latest_feature_vector(df)
     missing = [c for c in FEATURE_COLUMNS if c not in features]
     if missing:
-        raise HTTPException(status_code=422, detail=f"Missing features: {missing}")
-    X = pd.DataFrame([features])[FEATURE_COLUMNS]
+        # Only warn if some core features are missing; we'll still try to predict
+        logger.warning(f"Missing features: {missing}")
+
+    # Align features to model's expectations
+    aligned = _align_features(features, _model)
+
+    X = pd.DataFrame([aligned])
+    # Ensure column order matches model's feature_names_
+    if hasattr(_model, 'feature_names_in_'):
+        X = X[_model.feature_names_in_]
+
     probability = float(_model.predict_proba(X)[0, 1])
     prediction_score = round(probability * 100)
     llm_note = _generate_llm_note(features, probability)
