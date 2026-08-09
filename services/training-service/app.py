@@ -1,11 +1,13 @@
 # services/training-service/app.py
 """
 Training-service FastAPI application.
+Exposes REST API endpoints for training intelligence.
 """
 import os
 import logging
 import json
 import time
+import numpy as np
 from datetime import datetime
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
@@ -42,12 +44,28 @@ SessionLocal = sessionmaker(bind=engine)
 LOCK_FILE = 'training.lock'
 LOCK_TIMEOUT_SECONDS = 300  # 5 minutes
 
+# ---------- Numpy conversion helper ----------
+def convert_numpy(obj):
+    """Recursively convert numpy types to Python native types."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: convert_numpy(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [convert_numpy(v) for v in obj]
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    return obj
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
     ensure_schema(engine)
     logger.info("Database schema initialized.")
-    # Clean up any stale lock on startup
     if os.path.exists(LOCK_FILE):
         try:
             os.remove(LOCK_FILE)
@@ -84,7 +102,7 @@ def release_lock():
         os.remove(LOCK_FILE)
 
 # ----------------------------------------------------------------------
-# Helper functions (same as before)
+# Helper functions
 # ----------------------------------------------------------------------
 def get_training_status():
     report_path = 'training_report.joblib'
@@ -105,8 +123,9 @@ def get_training_status():
             status['last_training'] = report.get('timestamp')
             status['dataset_size'] = report.get('dataset_size', 0)
             status['num_symbols'] = report.get('num_symbols', 0)
-            status['metrics'] = report.get('walk_forward_metrics', {})
-            status['fold_details'] = report.get('fold_details', [])
+            # Convert numpy types in metrics and fold_details
+            status['metrics'] = convert_numpy(report.get('walk_forward_metrics', {}))
+            status['fold_details'] = convert_numpy(report.get('fold_details', []))
             status['model_version'] = report.get('model_version')
         except Exception as e:
             logger.error(f"Error loading report: {e}")
@@ -120,7 +139,7 @@ def get_training_status():
                 status['model_version'] = pointer.get('version')
         except Exception as e:
             logger.warning(f"Could not read model registry: {e}")
-    return status
+    return convert_numpy(status)  # final conversion
 
 def get_models_list():
     if not HAS_MODEL_REGISTRY:
@@ -139,7 +158,7 @@ def get_models_list():
                     'version': version,
                     'created_at': meta.get('created_at'),
                     'status': meta.get('status', 'candidate'),
-                    'metrics': meta.get('metrics', {})
+                    'metrics': convert_numpy(meta.get('metrics', {}))
                 })
             else:
                 models.append({'version': version, 'status': 'unknown'})
@@ -153,7 +172,7 @@ def get_models_list():
                 m['status'] = 'production'
                 break
     models.sort(key=lambda x: x.get('created_at', ''), reverse=True)
-    return models
+    return convert_numpy(models)
 
 def promote_model(version: str):
     if not HAS_MODEL_REGISTRY:
@@ -170,7 +189,7 @@ def promote_model(version: str):
         meta['status'] = 'production'
         meta['promoted_at'] = datetime.now().isoformat()
         with open(meta_path, 'w') as f:
-            json.dump(meta, f, indent=2)
+            json.dump(convert_numpy(meta), f, indent=2)
     pointer = {'version': version, 'path': model_path}
     with open(os.path.join(registry.model_dir, 'production_pointer.json'), 'w') as f:
         json.dump(pointer, f, indent=2)
@@ -210,7 +229,7 @@ def get_summary_metrics():
                 "timestamp": latest_run.run_timestamp.isoformat(),
                 "dataset_size": latest_run.dataset_size,
                 "num_symbols": latest_run.num_symbols,
-                "metrics": metrics
+                "metrics": convert_numpy(metrics)
             }
         }
     except Exception as e:
@@ -267,14 +286,7 @@ async def api_report():
         raise HTTPException(status_code=404, detail="No report found")
     try:
         report = joblib.load(report_path)
-        import numpy as np
-        def convert(o):
-            if isinstance(o, (np.integer, np.floating)):
-                return float(o)
-            if isinstance(o, np.ndarray):
-                return o.tolist()
-            return o
-        return JSONResponse(content={k: convert(v) if not isinstance(v, dict) else {kk: convert(vv) for kk, vv in v.items()} for k, v in report.items()})
+        return JSONResponse(content=convert_numpy(report))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
