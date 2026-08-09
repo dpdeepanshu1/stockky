@@ -91,8 +91,10 @@ UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 
-app = FastAPI(title="Stockky Market Data Service", version="0.1.3")
+app = FastAPI(title="Stockky Market Data Service", version="0.1.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -169,7 +171,7 @@ class QuoteResponse(BaseModel):
 async def root():
     return {
         "service": "Stockky Market Data Service",
-        "version": "0.1.3",
+        "version": "0.1.4",
         "status": "running",
         "cache_enabled": bool(cache),
         "endpoints": {
@@ -185,26 +187,7 @@ async def root():
 def health():
     return {"status": "ok", "service": "market-data-service", "cache": bool(cache)}
 
-# --- Yahoo Raw API Fallback (Secondary) ---
-def _fetch_price_from_yahoo_raw(symbol: str) -> Optional[float]:
-    try:
-        for sym in [symbol, symbol.replace(".NS", "")]:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-            resp = httpx.get(url, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                chart = data.get("chart", {})
-                result = chart.get("result", [])
-                if result and "meta" in result[0]:
-                    price = result[0]["meta"].get("regularMarketPrice")
-                    if price is not None:
-                        logger.info(f"Yahoo Raw API fallback found price for {sym}: {price}")
-                        return price
-    except Exception as e:
-        logger.warning(f"Yahoo Raw API fallback failed: {e}")
-    return None
-
-# --- NEW: NSE India Official API (Primary Source for Indian Stocks) ---
+# --- NSE India Official API (Primary Source for Indian Stocks) ---
 _nse_headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -242,6 +225,25 @@ def _fetch_nse_fundamentals(symbol: str) -> Optional[dict]:
                     return data
     except Exception as e:
         logger.warning(f"NSE Fundamentals fetch failed: {e}")
+    return None
+
+# --- Yahoo Raw API Fallback (Secondary) ---
+def _fetch_price_from_yahoo_raw(symbol: str) -> Optional[float]:
+    try:
+        for sym in [symbol, symbol.replace(".NS", "")]:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+            resp = httpx.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                chart = data.get("chart", {})
+                result = chart.get("result", [])
+                if result and "meta" in result[0]:
+                    price = result[0]["meta"].get("regularMarketPrice")
+                    if price is not None:
+                        logger.info(f"Yahoo Raw API fallback found price for {sym}: {price}")
+                        return price
+    except Exception as e:
+        logger.warning(f"Yahoo Raw API fallback failed: {e}")
     return None
 
 @app.get("/quote/{symbol}", response_model=QuoteResponse)
@@ -292,11 +294,39 @@ def get_quote(symbol: str):
             except Exception as e:
                 logger.warning(f"Alpha Vantage fallback for {alpha_sym} failed: {e}")
 
-    # 3. Tertiary: Yahoo Raw API
+    # 3. Twelve Data (free, reliable)
+    if price is None and TWELVE_DATA_API_KEY:
+        try:
+            clean_sym = sym.replace(".NS", "").replace(".BO", "")
+            url = f"https://api.twelvedata.com/price?symbol={clean_sym}&apikey={TWELVE_DATA_API_KEY}"
+            resp = httpx.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                price = _safe(data.get("price"))
+                if price is not None:
+                    logger.info(f"Twelve Data fallback found price for {sym}: {price}")
+        except Exception as e:
+            logger.warning(f"Twelve Data fallback failed: {e}")
+
+    # 4. Polygon.io (free tier, 5 calls/min)
+    if price is None and POLYGON_API_KEY:
+        try:
+            clean_sym = sym.replace(".NS", "").replace(".BO", "")
+            url = f"https://api.polygon.io/v1/open-close/{clean_sym}/latest?apiKey={POLYGON_API_KEY}"
+            resp = httpx.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                price = _safe(data.get("close"))
+                if price is not None:
+                    logger.info(f"Polygon.io fallback found price for {sym}: {price}")
+        except Exception as e:
+            logger.warning(f"Polygon.io fallback failed: {e}")
+
+    # 5. Yahoo Raw API
     if price is None:
         price = _fetch_price_from_yahoo_raw(sym)
 
-    # 4. Final fallback: yfinance
+    # 6. Final fallback: yfinance
     if price is None:
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
@@ -328,7 +358,25 @@ def get_quote(symbol: str):
             _cache_set(cache_key, result)
             return result
 
-    # 🔥 CRITICAL FIX: Instead of raising a 404 error, return a 200 response with price: None.
+    # If we extracted price via one of the APIs, return a simplified response
+    if price is not None:
+        result = {
+            "symbol": sym,
+            "name": sym,
+            "price": price,
+            "previous_close": None,
+            "day_change_pct": None,
+            "day_high": None,
+            "day_low": None,
+            "volume": None,
+            "market_cap": None,
+            "pe_ratio": None,
+            "fetched_at": datetime.utcnow().isoformat(),
+        }
+        _cache_set(cache_key, result, ttl=300)
+        return result
+
+    # No price from any source – return a fallback with price=None
     logger.warning(f"Could not fetch price for {sym} from any source. Returning fallback quote with price: None.")
     result = {
         "symbol": sym,
@@ -405,22 +453,18 @@ def get_fundamentals_raw(symbol: str):
 
     result = {}
     try:
-        # UPDATED: Try to fetch from yfinance first
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
 
-        # Try to get info with retry
         info = {}
         try:
             info = _with_retry(lambda: ticker.info, max_retries=5, base_delay=3)
         except Exception as e:
             logger.warning(f"Could not fetch info for {sym}: {e}")
-        
-        # --- FIXED: Prevent "NoneType is not iterable" error ---
+
         if info is None:
             info = {}
 
-        # Try to get financial statements (may be None)
         financials = None
         balance = None
         cashflow = None
@@ -450,7 +494,6 @@ def get_fundamentals_raw(symbol: str):
         balance_available = balance is not None and not balance.empty
         cashflow_available = cashflow is not None and not cashflow.empty
 
-        # Revenue growth (from financials)
         revenue_growth = None
         if financials_available and "Total Revenue" in financials.index:
             rev_series = financials.loc["Total Revenue"]
@@ -459,7 +502,6 @@ def get_fundamentals_raw(symbol: str):
                 prev_rev = rev_series.iloc[1]
                 revenue_growth = _compute_growth(current_rev, prev_rev)
 
-        # Earnings growth (Net Income)
         earnings_growth = None
         if financials_available and "Net Income" in financials.index:
             earnings_series = financials.loc["Net Income"]
@@ -468,7 +510,6 @@ def get_fundamentals_raw(symbol: str):
                 prev_earn = earnings_series.iloc[1]
                 earnings_growth = _compute_growth(current_earn, prev_earn)
 
-        # ROE
         roe = None
         if "returnOnEquity" in info:
             roe = _safe_info("returnOnEquity") * 100 if _safe_info("returnOnEquity") else None
@@ -479,7 +520,6 @@ def get_fundamentals_raw(symbol: str):
                 if equity != 0:
                     roe = (net_income / equity) * 100
 
-        # Debt to Equity
         debt_to_equity = None
         if "debtToEquity" in info:
             debt_to_equity = _safe_info("debtToEquity")
@@ -489,14 +529,12 @@ def get_fundamentals_raw(symbol: str):
             if equity != 0:
                 debt_to_equity = total_debt / equity
 
-        # Free Cash Flow
         free_cashflow = None
         if "freeCashflow" in info:
             free_cashflow = _safe_info("freeCashflow")
         elif cashflow_available and "Free Cash Flow" in cashflow.index:
             free_cashflow = cashflow.loc["Free Cash Flow"].iloc[0]
 
-        # Profit Margins
         profit_margins = None
         if "profitMargins" in info:
             profit_margins = _safe_info("profitMargins") * 100
@@ -507,87 +545,16 @@ def get_fundamentals_raw(symbol: str):
                 if revenue != 0:
                     profit_margins = (net_income / revenue) * 100
 
-        # Institutional Holding
         held_percent_institutions = None
         if "heldPercentInstitutions" in info:
             held_percent_institutions = _safe_info("heldPercentInstitutions") * 100
         elif "institutionalPercent" in info:
             held_percent_institutions = _safe_info("institutionalPercent") * 100
 
-        # --- NEW METRICS ---
-        # PEG (P/E to Growth)
-        pe_growth = None
-        if pe_ratio is not None and earnings_growth is not None and earnings_growth != 0:
-            pe_growth = pe_ratio / earnings_growth
-
-        # EV/EBITDA
-        ev_ebitda = None
-        if "enterpriseToEbitda" in info:
-            ev_ebitda = _safe_info("enterpriseToEbitda")
-
-        # Price to Book
-        price_to_book = None
-        if "priceToBook" in info:
-            price_to_book = _safe_info("priceToBook")
-
-        # ROCE (Return on Capital Employed)
-        roce = None
-        if "returnOnCapitalEmployed" in info:
-            roce = _safe_info("returnOnCapitalEmployed") * 100
-
-        # Operating Profit Margin (OPM)
-        opm = None
-        if "operatingMargins" in info:
-            opm = _safe_info("operatingMargins") * 100
-        elif financials_available and "Operating Income" in financials.index and "Total Revenue" in financials.index:
-            op_income = financials.loc["Operating Income"].iloc[0]
-            revenue = financials.loc["Total Revenue"].iloc[0]
-            opm = (op_income / revenue) * 100 if revenue != 0 else None
-
-        # Current Ratio
-        current_ratio = None
-        if balance_available and "Total Current Assets" in balance.index and "Total Current Liabilities" in balance.index:
-            ca = balance.loc["Total Current Assets"].iloc[0]
-            cl = balance.loc["Total Current Liabilities"].iloc[0]
-            current_ratio = ca / cl if cl != 0 else None
-
-        # Interest Coverage Ratio (EBIT / Interest Expense)
-        interest_coverage = None
-        if financials_available:
-            if "EBIT" in financials.index and "Interest Expense" in financials.index:
-                ebit = financials.loc["EBIT"].iloc[0]
-                interest = financials.loc["Interest Expense"].iloc[0]
-                interest_coverage = ebit / interest if interest != 0 else None
-            elif "Operating Income" in financials.index and "Interest Expense" in financials.index:
-                ebit = financials.loc["Operating Income"].iloc[0]
-                interest = financials.loc["Interest Expense"].iloc[0]
-                interest_coverage = ebit / interest if interest != 0 else None
-
-        # Promoter Holding (often not available in yfinance)
-        promoter_holding = None
-        if "promoterHolding" in info:
-            promoter_holding = _safe_info("promoterHolding") * 100
-
-        # Promoter Pledging
-        promoter_pledging = None
-        if "promoterPledging" in info:
-            promoter_pledging = _safe_info("promoterPledging") * 100
-
-        # PE Ratio (already extracted)
         pe_ratio = _safe_info("trailingPE") if "trailingPE" in info else _safe_info("peRatio")
         forward_pe = _safe_info("forwardPE")
-
-        # EPS
-        eps = None
-        if "trailingEps" in info:
-            eps = _safe_info("trailingEps")
-        elif "eps" in info:
-            eps = _safe_info("eps")
-
-        # Market Cap
+        eps = _safe_info("trailingEps") or _safe_info("eps")
         market_cap = _safe_info("marketCap")
-
-        # Dividend Yield
         dividend_yield = None
         if "dividendYield" in info:
             dividend_yield = _safe_info("dividendYield") * 100
@@ -602,7 +569,6 @@ def get_fundamentals_raw(symbol: str):
             except Exception:
                 pass
 
-        # Year high/low, averages
         year_high = _safe_info("fiftyTwoWeekHigh")
         year_low = _safe_info("fiftyTwoWeekLow")
         fifty_day_average = _safe_info("fiftyDayAverage")
@@ -613,6 +579,36 @@ def get_fundamentals_raw(symbol: str):
 
         sector = info.get("sector")
         industry = info.get("industry")
+
+        pe_growth = pe_ratio / earnings_growth if (pe_ratio is not None and earnings_growth is not None and earnings_growth != 0) else None
+        ev_ebitda = _safe_info("enterpriseToEbitda")
+        price_to_book = _safe_info("priceToBook")
+        roce = _safe_info("returnOnCapitalEmployed") * 100 if _safe_info("returnOnCapitalEmployed") else None
+        opm = _safe_info("operatingMargins") * 100
+        if opm is None and financials_available and "Operating Income" in financials.index and "Total Revenue" in financials.index:
+            op_income = financials.loc["Operating Income"].iloc[0]
+            revenue = financials.loc["Total Revenue"].iloc[0]
+            opm = (op_income / revenue) * 100 if revenue != 0 else None
+
+        current_ratio = None
+        if balance_available and "Total Current Assets" in balance.index and "Total Current Liabilities" in balance.index:
+            ca = balance.loc["Total Current Assets"].iloc[0]
+            cl = balance.loc["Total Current Liabilities"].iloc[0]
+            current_ratio = ca / cl if cl != 0 else None
+
+        interest_coverage = None
+        if financials_available:
+            if "EBIT" in financials.index and "Interest Expense" in financials.index:
+                ebit = financials.loc["EBIT"].iloc[0]
+                interest = financials.loc["Interest Expense"].iloc[0]
+                interest_coverage = ebit / interest if interest != 0 else None
+            elif "Operating Income" in financials.index and "Interest Expense" in financials.index:
+                ebit = financials.loc["Operating Income"].iloc[0]
+                interest = financials.loc["Interest Expense"].iloc[0]
+                interest_coverage = ebit / interest if interest != 0 else None
+
+        promoter_holding = _safe_info("promoterHolding") * 100 if "promoterHolding" in info else None
+        promoter_pledging = _safe_info("promoterPledging") * 100 if "promoterPledging" in info else None
 
         result = {
             "symbol": sym,
@@ -650,7 +646,6 @@ def get_fundamentals_raw(symbol: str):
         logger.info(f"Fundamentals for {sym}: PE={pe_ratio}, ROE={roe}, Revenue growth={revenue_growth}")
 
     except Exception as e:
-        # UPDATED: If yfinance fails outright, try NSE India fundamentals fallback
         logger.warning(f"YFinance failed for {sym}, falling back to NSE India: {e}")
         nse_data = _fetch_nse_fundamentals(sym)
         if nse_data:
@@ -689,16 +684,13 @@ def get_fundamentals_raw(symbol: str):
             }
             logger.info(f"NSE India fallback fundamentals found for {sym}")
 
-    # Store in fallback cache if we got any valid data
     if result and any(v is not None for v in [result.get("pe_ratio"), result.get("sector"), result.get("market_cap"), result.get("revenue_growth"), result.get("roe")]):
         _fallback_set(cache_key, result)
 
-    # Cache for 1 day (fundamentals change slowly)
     if result:
         _cache_set(cache_key, result, ttl=86400)
         return result
 
-    # If we still have no data, try the stale fallback
     stale = _fallback_get(cache_key)
     if stale:
         logger.info(f"Serving fallback fundamentals for {sym} (stale data)")
@@ -706,8 +698,8 @@ def get_fundamentals_raw(symbol: str):
         stale["stale"] = True
         _cache_set(cache_key, stale, ttl=1800)
         return stale
-        
-    raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}: {e}")
+
+    raise HTTPException(status_code=502, detail=f"Could not fetch fundamentals for {sym}")
 
 if __name__ == "__main__":
     import uvicorn
