@@ -19,7 +19,7 @@ from typing import List, Optional, Set, Dict, Union
 import httpx
 import yfinance as yf
 import feedparser
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -51,7 +51,6 @@ SYSTEM_SERVICES = {
     "event-tracker": {"url": EVENT_URL, "required": False},
     "prediction": {"url": PREDICTION_URL, "required": False},
     "notification": {"url": NOTIFICATION_URL, "required": False},
-    # NEW: Training service (optional for health)
     "training": {"url": TRAINING_URL, "required": False},
 }
 
@@ -1536,9 +1535,6 @@ async def training_other_proxy(path: str, request: Request):
             )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Training service unreachable: {str(e)}")
-
-# (Note: The Request and Response classes need to be imported)
-from fastapi import Request, Response
 
 if __name__ == "__main__":
     import uvicorn
