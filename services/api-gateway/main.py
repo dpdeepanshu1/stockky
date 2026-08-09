@@ -12,6 +12,7 @@ import asyncio
 import logging
 import difflib
 import uuid
+from datetime import datetime
 from typing import List, Optional, Set, Dict, Union
 
 import httpx
@@ -100,6 +101,7 @@ SCAN_UNIVERSE_KEY   = "stockky:scan_universe"
 IPO_CACHE_KEY       = "stockky:ipos:recent"
 KNOWN_SYMBOLS_KEY   = "stockky:known_symbols"
 SCAN_TASK_PREFIX    = "stockky:scan_task:"
+MARKET_MOVERS_CACHE_PREFIX = "stockky:market_movers:"  # NEW: daily cache prefix
 
 # ── Symbol Alias Mapping (old → new) ──────────────────────────────────────
 SYMBOL_ALIASES: Dict[str, Union[str, List[str]]] = {
@@ -749,8 +751,17 @@ async def run_scan_async(task_id: str, universe: List[str]):
 
     _send_scan_notification(final_result.get("recommendations", []), final_result["verdict"], final_result["scanned"], final_result["universe_size"])
 
-# ── Market Movers ──────────────────────────────────────────────────────────
+# ── Cached Market Movers Data (daily cache in Redis) ────────────────────
 def _get_nifty50_data() -> List[dict]:
+    """Fetch top 50 Nifty symbols data. Cached in Redis for 24 hours, keyed by date."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    cache_key = f"{MARKET_MOVERS_CACHE_PREFIX}{today}"
+    cached = _redis_get(cache_key)
+    if cached and isinstance(cached, list) and len(cached) > 0:
+        logger.info("Serving cached market movers data for %s", today)
+        return cached
+
+    logger.info("Fetching fresh market movers data from yfinance for %s", today)
     nifty_symbols = _get_nifty_indices()[:50]
     data = []
     for sym in nifty_symbols:
@@ -773,17 +784,8 @@ def _get_nifty50_data() -> List[dict]:
             })
         except Exception as e:
             logger.warning(f"Could not fetch {sym}: {e}")
-    return data
-
-CACHE_TTL = 300
-_market_cache = {}
-
-def _get_cached_market_data(key: str, fetch_func):
-    now = time.time()
-    if key in _market_cache and _market_cache[key]["expires"] > now:
-        return _market_cache[key]["data"]
-    data = fetch_func()
-    _market_cache[key] = {"data": data, "expires": now + CACHE_TTL}
+    # Cache for 24 hours (86400 seconds)
+    _redis_set(cache_key, data, ttl=86400)
     return data
 
 # ── Pydantic models ──────────────────────────────────────────────────────────
@@ -1271,19 +1273,19 @@ def scan_watchlist():
 # ── Market routes ──────────────────────────────────────────────────────────
 @app.get("/market/top-gainers")
 def market_top_gainers():
-    data = _get_cached_market_data("top_gainers", _get_nifty50_data)
+    data = _get_nifty50_data()
     sorted_data = sorted(data, key=lambda x: x["change_pct"], reverse=True)[:10]
     return {"data": sorted_data, "count": len(sorted_data)}
 
 @app.get("/market/top-losers")
 def market_top_losers():
-    data = _get_cached_market_data("top_losers", _get_nifty50_data)
+    data = _get_nifty50_data()
     sorted_data = sorted(data, key=lambda x: x["change_pct"])[:10]
     return {"data": sorted_data, "count": len(sorted_data)}
 
 @app.get("/market/most-active")
 def market_most_active():
-    data = _get_cached_market_data("most_active", _get_nifty50_data)
+    data = _get_nifty50_data()
     sorted_data = sorted(data, key=lambda x: x["volume"], reverse=True)[:10]
     return {"data": sorted_data, "count": len(sorted_data)}
 
