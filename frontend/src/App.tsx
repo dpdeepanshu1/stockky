@@ -10,7 +10,7 @@ import NotificationsPanel from "./components/NotificationsPanel";
 import SystemCheck from "./components/SystemCheck";
 import MarketMovers from "./components/MarketMovers";
 import ServiceManager from "./components/ServiceManager";
-import { Training } from "./components/Training"; // ADDED import for Training component
+import Training from "./components/Training"; // ADDED import for Training component
 
 type ViewState =
   | { mode: "idle" }

@@ -1,5 +1,4 @@
 // frontend/src/components/Training.tsx
-
 import React, { useState, useEffect } from "react";
 import { api, TrainingModelStatus } from "../api";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
