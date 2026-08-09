@@ -1,9 +1,8 @@
+# services/training-service/app.py
 """
 Training-service FastAPI application.
 Serves the training dashboard and exposes endpoints to trigger and monitor training,
 list and promote models, and retrieve learning insights.
-
-All endpoints are backward‑compatible with the existing UI.
 """
 import os
 import subprocess
@@ -15,6 +14,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 import joblib
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+# Import our models and helpers
+from models import Base, ensure_schema, PredictionSnapshot, PredictionOutcome, TrainingRun
 
 # Optional imports for enhanced functionality
 try:
@@ -22,13 +26,6 @@ try:
     HAS_MODEL_REGISTRY = True
 except ImportError:
     HAS_MODEL_REGISTRY = False
-
-try:
-    import models as db_models
-    from sqlalchemy.orm import Session
-    HAS_DB = True
-except ImportError:
-    HAS_DB = False
 
 try:
     from insights import InsightGenerator
@@ -47,6 +44,19 @@ templates = Jinja2Templates(directory="templates")
 
 # Service URL – can be overridden by environment variable
 SERVICE_URL = os.environ.get('SERVICE_URL', "https://training-service-5e9v.onrender.com")
+
+# ----------------------------------------------------------------------
+# Database setup
+DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./training.db')
+engine = create_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(bind=engine)
+
+@app.on_event("startup")
+def startup():
+    """Create tables and apply migrations on startup."""
+    Base.metadata.create_all(engine)   # creates tables if they don't exist
+    ensure_schema(engine)              # add missing columns if needed
+    logger.info("Database schema initialized.")
 
 # ----------------------------------------------------------------------
 # Helper functions
@@ -69,7 +79,6 @@ def get_training_status():
         'model_version': None
     }
 
-    # Read the latest training report if available
     if os.path.exists(report_path):
         try:
             report = joblib.load(report_path)
@@ -82,7 +91,6 @@ def get_training_status():
         except Exception as e:
             logger.error(f"Error loading report: {e}")
 
-    # If ModelRegistry exists, get production version from registry
     if HAS_MODEL_REGISTRY:
         try:
             registry = ModelRegistry()
@@ -97,17 +105,11 @@ def get_training_status():
     return status
 
 def get_models_list():
-    """
-    Return a list of all models (production and candidates) from the registry.
-    """
     if not HAS_MODEL_REGISTRY:
         raise HTTPException(status_code=501, detail="Model registry not available")
-
     registry = ModelRegistry()
     models = []
     model_dir = registry.model_dir
-
-    # List all .pkl files that are not scalers
     for fname in os.listdir(model_dir):
         if fname.endswith('.pkl') and '_scaler' not in fname and 'production_pointer' not in fname:
             version = fname.replace('.pkl', '')
@@ -122,10 +124,7 @@ def get_models_list():
                     'metrics': meta.get('metrics', {})
                 })
             else:
-                # Fallback: just the filename
                 models.append({'version': version, 'status': 'unknown'})
-
-    # Add production pointer info
     pointer_path = os.path.join(model_dir, 'production_pointer.json')
     if os.path.exists(pointer_path):
         with open(pointer_path, 'r') as f:
@@ -135,27 +134,18 @@ def get_models_list():
             if m['version'] == prod_version:
                 m['status'] = 'production'
                 break
-
-    # Sort by version (most recent first)
     models.sort(key=lambda x: x.get('created_at', ''), reverse=True)
     return models
 
 def promote_model(version: str):
-    """
-    Promote a candidate model to production.
-    """
     if not HAS_MODEL_REGISTRY:
         raise HTTPException(status_code=501, detail="Model registry not available")
-
     registry = ModelRegistry()
     model_path = os.path.join(registry.model_dir, f'{version}.pkl')
     scaler_path = os.path.join(registry.model_dir, f'{version}_scaler.pkl')
     meta_path = os.path.join(registry.model_dir, f'{version}_meta.json')
-
     if not os.path.exists(model_path):
         raise HTTPException(status_code=404, detail=f"Model version {version} not found")
-
-    # Update metadata to production
     if os.path.exists(meta_path):
         with open(meta_path, 'r') as f:
             meta = json.load(f)
@@ -163,81 +153,42 @@ def promote_model(version: str):
         meta['promoted_at'] = datetime.now().isoformat()
         with open(meta_path, 'w') as f:
             json.dump(meta, f, indent=2)
-
-    # Update production pointer
     pointer = {'version': version, 'path': model_path}
     with open(os.path.join(registry.model_dir, 'production_pointer.json'), 'w') as f:
         json.dump(pointer, f, indent=2)
-
-    # Also update the simple model.pkl symlink (or copy) for backward compatibility
-    # We'll copy the model to model.pkl and scaler to scaler.pkl
     try:
         import shutil
         shutil.copy(model_path, 'model.pkl')
         shutil.copy(scaler_path, 'scaler.pkl')
     except Exception as e:
         logger.warning(f"Could not create model.pkl symlink: {e}")
-
     logger.info(f"Promoted model {version} to production")
     return {"status": "success", "version": version}
 
 def get_learning_insights():
-    """
-    Generate learning insights from the training data.
-    """
     if not HAS_INSIGHTS:
         raise HTTPException(status_code=501, detail="Insights module not available")
-
-    # Check if we have a training report with predictions
     report_path = 'training_report.joblib'
     if not os.path.exists(report_path):
         raise HTTPException(status_code=404, detail="No training report found")
-
-    report = joblib.load(report_path)
-    # If we have fold details, we can generate insights based on those metrics
-    # In a full implementation, we'd query the database for all predictions and outcomes.
-    # Here we'll return a placeholder
+    # Return placeholder insights
     return {
         "insights": [
-            {
-                "insight": "Bullish market regimes show higher T+5 success rates",
-                "sample_size": 124,
-                "confidence": "high",
-                "active": True
-            },
-            {
-                "insight": "RSI between 50-65 performs best for BUY signals",
-                "sample_size": 87,
-                "confidence": "medium",
-                "active": True
-            },
-            {
-                "insight": "Volume > 1.5x average improves win rate by 12%",
-                "sample_size": 65,
-                "confidence": "high",
-                "active": True
-            }
+            {"insight": "Bullish market regimes show higher T+5 success rates", "sample_size": 124, "confidence": "high", "active": True},
+            {"insight": "RSI between 50-65 performs best for BUY signals", "sample_size": 87, "confidence": "medium", "active": True},
+            {"insight": "Volume > 1.5x average improves win rate by 12%", "sample_size": 65, "confidence": "high", "active": True}
         ],
         "last_updated": datetime.now().isoformat()
     }
 
 def get_summary_metrics():
-    """
-    Return aggregated training metrics over time (if DB available).
-    """
     if not HAS_DB:
         raise HTTPException(status_code=501, detail="Database not available")
-
-    db = Session()
+    db = SessionLocal()
     try:
-        # Get the latest training run
-        latest_run = db.query(db_models.TrainingRun).order_by(
-            db_models.TrainingRun.run_timestamp.desc()
-        ).first()
+        latest_run = db.query(TrainingRun).order_by(TrainingRun.run_timestamp.desc()).first()
         if not latest_run:
             return {"error": "No training runs found"}
-
-        # Parse metrics from JSON
         metrics = json.loads(latest_run.walk_forward_metrics) if latest_run.walk_forward_metrics else {}
         return {
             "latest_run": {
@@ -258,42 +209,27 @@ def get_summary_metrics():
 # ----------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    """Serve the dashboard."""
     return templates.TemplateResponse("dashboard.html", {"request": request, "service_url": SERVICE_URL})
 
 @app.get("/api/status")
 async def status():
-    """Return current training status as JSON."""
     return JSONResponse(content=get_training_status())
 
 @app.post("/api/train")
 async def trigger_training(background_tasks: BackgroundTasks):
-    """
-    Start training in the background.
-    Returns immediately with a 202 Accepted status.
-    """
     lock_file = 'training.lock'
     if os.path.exists(lock_file):
         raise HTTPException(status_code=409, detail="Training already in progress")
-
-    # Create lock file
     with open(lock_file, 'w') as f:
         f.write(str(os.getpid()))
 
-    # Run training as a background task
     def run_training():
         try:
-            # Use the enhanced train.py
-            subprocess.run(
-                ['python', 'train.py'],
-                cwd=os.path.dirname(__file__),
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            logger.info("Training completed successfully.")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Training failed: {e.stderr}")
+            from train import train_model
+            # Pass session and model store path
+            train_model(SessionLocal(), os.environ.get('MODEL_STORE_PATH', './model-store'))
+        except Exception as e:
+            logger.error(f"Training failed: {e}")
         finally:
             if os.path.exists(lock_file):
                 os.remove(lock_file)
@@ -303,13 +239,11 @@ async def trigger_training(background_tasks: BackgroundTasks):
 
 @app.get("/api/report")
 async def get_report():
-    """Return the full training report (if available)."""
     report_path = 'training_report.joblib'
     if not os.path.exists(report_path):
         raise HTTPException(status_code=404, detail="No report found")
     try:
         report = joblib.load(report_path)
-        # Convert numpy types to Python types
         import numpy as np
         def convert(o):
             if isinstance(o, (np.integer, np.floating)):
@@ -323,7 +257,6 @@ async def get_report():
 
 @app.get("/api/models")
 async def list_models():
-    """List all models (production and candidates)."""
     try:
         models = get_models_list()
         return JSONResponse(content={"models": models})
@@ -335,7 +268,6 @@ async def list_models():
 
 @app.post("/api/models/promote/{version}")
 async def promote_candidate(version: str):
-    """Promote a candidate model to production."""
     try:
         result = promote_model(version)
         return JSONResponse(content=result)
@@ -347,7 +279,6 @@ async def promote_candidate(version: str):
 
 @app.get("/api/insights")
 async def get_insights():
-    """Return learning insights derived from training data."""
     try:
         insights = get_learning_insights()
         return JSONResponse(content=insights)
@@ -359,7 +290,6 @@ async def get_insights():
 
 @app.get("/api/metrics/summary")
 async def summary():
-    """Return aggregated training metrics summary."""
     try:
         summary_data = get_summary_metrics()
         return JSONResponse(content=summary_data)

@@ -1,3 +1,4 @@
+# services/training-service/models.py
 """
 SQLAlchemy models for the training service.
 
@@ -8,7 +9,7 @@ Tables:
 """
 from datetime import datetime
 from sqlalchemy import (
-    Column, String, Float, Integer, Boolean, DateTime, JSON, Text, create_engine
+    Column, String, Float, Integer, Boolean, DateTime, JSON, Text, create_engine, inspect
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -23,12 +24,12 @@ class PredictionSnapshot(Base):
     __tablename__ = "prediction_snapshots"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    prediction_id = Column(String(50), unique=True, nullable=False, index=True)  # e.g., STK-20260810-001
+    prediction_id = Column(String(50), unique=True, nullable=False, index=True)
     symbol = Column(String(20), nullable=False, index=True)
-    timestamp = Column(DateTime, nullable=False, index=True)  # when prediction was made
-    price = Column(Float, nullable=False)                     # entry price
-    decision = Column(String(20), nullable=False)             # BUY, PREPARE_TO_BUY, etc.
-    confidence = Column(String(20))                           # High/Medium/Low
+    timestamp = Column(DateTime, nullable=False, index=True)
+    price = Column(Float, nullable=False)
+    decision = Column(String(20), nullable=False)
+    confidence = Column(String(20))
     combined_score = Column(Float)
     technical_score = Column(Float)
     fundamental_score = Column(Float)
@@ -49,8 +50,8 @@ class PredictionSnapshot(Base):
     valuation = Column(Text, nullable=True)
 
     # Market sentiment at prediction time
-    market_mood = Column(String(20), nullable=True)           # BULLISH, BEARISH, NEUTRAL
-    market_score = Column(Float, nullable=True)
+    market_mood = Column(String(20), nullable=True)
+    market_score_extra = Column(Float, nullable=True)  # renamed to avoid conflict
     nifty_change_pct = Column(Float, nullable=True)
     sensex_change_pct = Column(Float, nullable=True)
 
@@ -84,28 +85,24 @@ class PredictionOutcome(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     prediction_id = Column(String(50), nullable=False, index=True)
-    evaluation_period = Column(String(10), nullable=False, index=True)  # 'T+1' or 'T+5'
+    evaluation_period = Column(String(10), nullable=False, index=True)
     evaluation_date = Column(DateTime, nullable=False)
 
-    # Price data for the evaluation day
     open_price = Column(Float, nullable=True)
     high_price = Column(Float, nullable=True)
     low_price = Column(Float, nullable=True)
     close_price = Column(Float, nullable=True)
 
-    # Metrics
-    max_favorable_excursion = Column(Float, nullable=True)   # percentage
-    max_adverse_excursion = Column(Float, nullable=True)    # percentage
+    max_favorable_excursion = Column(Float, nullable=True)
+    max_adverse_excursion = Column(Float, nullable=True)
     return_pct = Column(Float, nullable=True)
 
-    # Flags
     entry_reached = Column(Integer, default=0)
     target_reached = Column(Integer, default=0)
     stop_loss_reached = Column(Integer, default=0)
     direction_correct = Column(Integer, default=0)
-    success = Column(Integer, default=0)   # 1 = success, 0 = failure
+    success = Column(Integer, default=0)
 
-    # Additional information
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -116,25 +113,67 @@ class TrainingRun(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_timestamp = Column(DateTime, nullable=False, index=True)
-    config = Column(JSON, nullable=False)                     # full config JSON
+    config = Column(JSON, nullable=False)
     dataset_size = Column(Integer)
     num_symbols = Column(Integer)
     model_version = Column(String(50), nullable=True)
-    walk_forward_metrics = Column(JSON, nullable=True)        # metrics from evaluation
-    fold_details = Column(JSON, nullable=True)                # list of fold info
+    walk_forward_metrics = Column(JSON, nullable=True)
+    fold_details = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ---------- Migration helper ----------
+def ensure_schema(engine):
+    """Add missing columns to existing tables if needed."""
+    inspector = inspect(engine)
+    table_name = "prediction_snapshots"
+    if inspector.has_table(table_name):
+        existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
+        required_columns = {
+            'combined_score': 'FLOAT',
+            'technical_score': 'FLOAT',
+            'fundamental_score': 'FLOAT',
+            'news_score': 'FLOAT',
+            'prediction_score': 'FLOAT',
+            'market_score': 'FLOAT',
+            'market_sentiment_adjustment': 'FLOAT',
+            'training_score': 'FLOAT',
+            'entry_range_low': 'FLOAT',
+            'entry_range_high': 'FLOAT',
+            'support': 'FLOAT',
+            'resistance': 'FLOAT',
+            'market_mood': 'VARCHAR(20)',
+            'nifty_change_pct': 'FLOAT',
+            'sensex_change_pct': 'FLOAT',
+            'rsi': 'FLOAT',
+            'macd': 'VARCHAR(20)',
+            'ema': 'VARCHAR(20)',
+            'volume_ratio': 'FLOAT',
+            'debt_to_equity': 'FLOAT',
+            'roe': 'FLOAT',
+            'roce': 'FLOAT',
+            'feature_snapshot': 'JSON',
+            'model_version': 'VARCHAR(50)',
+            't1_success': 'INTEGER',
+            't5_success': 'INTEGER',
+            'overall_success': 'INTEGER',
+        }
+        with engine.connect() as conn:
+            for col_name, col_type in required_columns.items():
+                if col_name not in existing_columns:
+                    alter_sql = f'ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}'
+                    conn.execute(alter_sql)
+                    conn.commit()
+                    print(f"Added column {col_name} to {table_name}")
 
 
 # ---------- Database setup helpers ----------
 def get_engine(database_url="sqlite:///./training.db"):
-    """Return a SQLAlchemy engine."""
     return create_engine(database_url, echo=False)
 
 def create_tables(engine):
-    """Create all tables if they don't exist."""
     Base.metadata.create_all(engine)
 
 def get_session(engine):
-    """Return a new session."""
     Session = sessionmaker(bind=engine)
     return Session()

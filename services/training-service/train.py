@@ -1,3 +1,4 @@
+# services/training-service/train.py
 """
 Training script for training‑service.
 Uses financial ML best practices: walk‑forward, per‑fold scaling, financial metrics.
@@ -17,6 +18,7 @@ import gc
 import time
 import random
 from datetime import datetime
+from typing import List, Dict, Any
 
 # Import our modules
 from targets import TargetGenerator
@@ -33,8 +35,8 @@ except ImportError:
     HAS_MODEL_REGISTRY = False
 
 try:
-    import models as db_models
     from sqlalchemy.orm import Session
+    import models as db_models
     HAS_DB = True
 except ImportError:
     HAS_DB = False
@@ -66,8 +68,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("training-service")
 
 # ---------- Configuration ----------
+DEFAULT_SYMBOLS = [
+    "TCS", "INFY", "HDFCBANK", "ICICIBANK", "RELIANCE", "HCLTECH",
+    "WIPRO", "COFORGE", "ANGELONE", "ADANIPOWER", "BEL", "HAL",
+    "SBIN", "AXISBANK", "KOTAKBANK", "LT", "MARUTI", "SUNPHARMA",
+    "TITAN", "ITC", "BAJFINANCE", "ASIANPAINT", "NESTLEIND", "ULTRACEMCO",
+    "BHARTIARTL", "M&M", "SHRIRAMFIN", "DMART", "CHOLAFIN", "PHOENIXLTD",
+    "FORTIS", "CUMMINSIND", "SYRMA", "ADANIPORTS", "HINDALCO", "AUROPHARMA"
+]
+
 DEFAULT_TRAINING_CONFIG = {
-    "target_type": "Log_Return",          # "Log_Return", "Percentage_Return", "Directional"
+    "target_type": "Log_Return",
     "forecast_horizon_days": 5,
     "validation_strategy": {
         "method": "WalkForward",
@@ -98,58 +109,59 @@ DEFAULT_TRAINING_CONFIG = {
     },
     "random_seed": 42,
     "data": {
-        "symbols": [
-            "TCS", "INFY", "HDFCBANK", "ICICIBANK", "RELIANCE", "HCLTECH",
-            "WIPRO", "COFORGE", "ANGELONE", "ADANIPOWER", "BEL", "HAL",
-            "SBIN", "AXISBANK", "KOTAKBANK", "LT", "MARUTI", "SUNPHARMA",
-            "TITAN", "ITC", "BAJFINANCE", "ASIANPAINT", "NESTLEIND", "ULTRACEMCO",
-            "BHARTIARTL", "M&M", "SHRIRAMFIN", "DMART", "CHOLAFIN", "PHOENIXLTD",
-            "FORTIS", "CUMMINSIND", "SYRMA", "ADANIPORTS", "HINDALCO", "AUROPHARMA"
-        ],
-        "start_date": "2020-01-01",
-        "end_date": "2025-12-31",
+        "symbols": DEFAULT_SYMBOLS,
         "period": "5y"
     }
 }
 
 # ---------- Helpers ----------
-def fetch_symbol_data(symbol, period="5y"):
-    """Fetch OHLCV data for a single symbol with retries."""
+def fetch_symbol_data(symbol, period="5y", max_retries=5):
+    """Fetch OHLCV data with exponential backoff for rate limits."""
     tickers = [f"{symbol}.NS", f"{symbol}.BO", symbol]
     for ticker in tickers:
-        try:
-            df = yf.download(ticker, period=period, interval="1d", auto_adjust=True,
-                             progress=False, threads=False)
-            if not df.empty and "Close" in df.columns:
-                return df
-        except Exception:
-            continue
+        for attempt in range(max_retries):
+            try:
+                df = yf.download(ticker, period=period, interval="1d", auto_adjust=True,
+                                 progress=False, threads=False)
+                if not df.empty and "Close" in df.columns:
+                    return df
+                else:
+                    break  # try next ticker
+            except Exception as e:
+                if "Rate limit" in str(e) or "Too Many Requests" in str(e):
+                    wait = (2 ** attempt) * 5 + random.uniform(0, 5)
+                    logger.warning(f"Rate limit for {ticker}, retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                else:
+                    logger.warning(f"Error fetching {ticker}: {e}")
+                    break
     return pd.DataFrame()
 
 def build_multi_symbol_dataset(symbols, period="5y"):
-    """Aggregate data from multiple symbols into one DataFrame with a 'symbol' column."""
+    """Build dataset with delays between symbols to avoid rate limits."""
     all_rows = []
-    for sym in symbols:
+    total = len(symbols)
+    for idx, sym in enumerate(symbols):
+        logger.info(f"Fetching {sym} ({idx+1}/{total})...")
         df = fetch_symbol_data(sym, period)
         if df.empty:
             logger.warning(f"No data for {sym}")
             continue
         df = df[['Open','High','Low','Close','Volume']].copy()
-        df.columns = ['open','high','low','close','volume']  # lower case for consistency
+        df.columns = ['open','high','low','close','volume']
         df['symbol'] = sym
         df = df.dropna()
-        # Compute features (per symbol)
         feat = compute_feature_frame(df)
-        # Keep only rows with all features
         feat = feat.dropna(subset=FEATURE_COLUMNS)
         if len(feat) < 100:
             logger.warning(f"Too few rows for {sym}: {len(feat)}")
             continue
-        # Add to all_rows
         feat['symbol'] = sym
         feat['date'] = feat.index
         all_rows.append(feat)
-        time.sleep(0.2)  # polite delay
+        # Polite delay between symbols
+        delay = 1.0 + random.uniform(0, 1.0)
+        time.sleep(delay)
     if not all_rows:
         raise ValueError("No data collected")
     full = pd.concat(all_rows, ignore_index=True)
@@ -157,7 +169,6 @@ def build_multi_symbol_dataset(symbols, period="5y"):
     return full
 
 def save_training_run_to_db(config, metrics, fold_details, model_version, dataset_size, num_symbols):
-    """Log training run details to the database (optional)."""
     if not HAS_DB:
         return
     try:
@@ -180,17 +191,15 @@ def save_training_run_to_db(config, metrics, fold_details, model_version, datase
         db.close()
 
 # ---------- Main Training Pipeline ----------
-def run_training_pipeline(config, config_path=None):
+def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     np.random.seed(config['random_seed'])
     random.seed(config['random_seed'])
 
-    # 1. Load data
     symbols = config['data']['symbols']
     logger.info(f"Fetching data for {len(symbols)} symbols...")
     df = build_multi_symbol_dataset(symbols, period=config['data']['period'])
     logger.info(f"Total dataset shape: {df.shape}")
 
-    # 2. Prepare features and targets
     feature_cols = FEATURE_COLUMNS
     target_gen = TargetGenerator(
         target_type=config['target_type'],
@@ -198,13 +207,7 @@ def run_training_pipeline(config, config_path=None):
         price_col='close'
     )
 
-    # We need to generate targets per symbol to avoid leakage between symbols?
-    # But since we treat each row independently, we can generate targets on the full DataFrame
-    # if the shift is within the same symbol. Because we have grouped by symbol, we must apply
-    # target generation per symbol group to avoid cross‑symbol shifts.
-    # Let's do groupby('symbol') and apply.
     def apply_targets(group):
-        # group is a DataFrame with 'close' column
         t, g = target_gen.generate(group, inplace=False)
         group['target'] = t
         group['pct_return'] = g['pct_return']
@@ -212,11 +215,9 @@ def run_training_pipeline(config, config_path=None):
         return group
 
     df = df.groupby('symbol', group_keys=False).apply(apply_targets)
-    # Drop rows where target is NaN (due to insufficient future data at the end of each symbol)
     df = df.dropna(subset=['target'])
     logger.info(f"After target generation: {df.shape}")
 
-    # 3. Walk‑forward validation
     vc = config['validation_strategy']
     splitter = WalkForwardSplitter(
         train_window=vc['train_window_size'],
@@ -227,22 +228,13 @@ def run_training_pipeline(config, config_path=None):
         method=vc['method']
     )
 
-    # Because we have multiple symbols interleaved, we need to split chronologically on the overall
-    # sorted DataFrame (ignoring symbol) – but this mixes symbols. To be strict, we should split per symbol.
-    # For simplicity, we'll sort by date and treat it as a single time series (which is acceptable if we have many symbols
-    # and we assume the model is general enough). However, to avoid leakage between symbols,
-    # we would need to ensure that the split is by date and that we don't use future data from other symbols.
-    # Here we'll sort globally and split; this is a common simplification.
     df = df.sort_values('date').reset_index(drop=True)
-
     folds = splitter.split(df)
     logger.info(f"Number of folds: {len(folds)}")
-
     if not folds:
         logger.error("No folds generated – insufficient data.")
         return None
 
-    # Containers for OOS
     all_preds = []
     all_actuals = []
     all_strategy_returns = []
@@ -261,12 +253,10 @@ def run_training_pipeline(config, config_path=None):
         X_val = val_data[feature_cols].values.astype(np.float32)
         y_val = val_data['target'].values.astype(np.float32)
 
-        # Scale per fold
         scaler = TimeAwareScaler(config['preprocessing']['scaler_type'])
         X_train_scaled = scaler.fit_transform(X_train)
         X_val_scaled = scaler.transform(X_val)
 
-        # Train model
         model = xgb.XGBRegressor(
             **config['model'],
             random_state=config['random_seed'],
@@ -274,10 +264,8 @@ def run_training_pipeline(config, config_path=None):
         )
         model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)], verbose=False)
 
-        # Predict OOS
         pred_val = model.predict(X_val_scaled)
 
-        # Trading simulation
         trade_cfg = config['trading']
         trade_sim = TradingSimulator(
             long_threshold=trade_cfg['long_threshold'],
@@ -288,7 +276,6 @@ def run_training_pipeline(config, config_path=None):
         )
         signals, costs, strategy_ret = trade_sim.simulate(pred_val, y_val)
 
-        # Store
         all_preds.extend(pred_val)
         all_actuals.extend(y_val)
         all_strategy_returns.extend(strategy_ret)
@@ -303,11 +290,9 @@ def run_training_pipeline(config, config_path=None):
             'val_samples': len(val_data)
         })
 
-        # Cleanup
         del train_data, val_data, X_train, X_val, y_train, y_val, model
         gc.collect()
 
-    # Compute overall OOS metrics
     all_preds = np.array(all_preds)
     all_actuals = np.array(all_actuals)
     all_strategy_returns = np.array(all_strategy_returns)
@@ -320,12 +305,11 @@ def run_training_pipeline(config, config_path=None):
         logger.info(f"{k:>20}: {v:.4f}" if isinstance(v, float) else f"{k:>20}: {v}")
     logger.info("="*50)
 
-    # 4. Train final production model on the entire dataset
+    # Train final production model
     logger.info("Training production model on full dataset...")
     X_full = df[feature_cols].values.astype(np.float32)
     y_full = df['target'].values.astype(np.float32)
 
-    # Scale on all data (no leakage here because it's the final model)
     final_scaler = TimeAwareScaler(config['preprocessing']['scaler_type'])
     X_full_scaled = final_scaler.fit_transform(X_full)
 
@@ -336,21 +320,18 @@ def run_training_pipeline(config, config_path=None):
     )
     final_model.fit(X_full_scaled, y_full)
 
-    # ---------- NEW: Use Model Registry for versioned storage ----------
     model_version = None
     if HAS_MODEL_REGISTRY:
         registry = ModelRegistry()
         model_version = registry.save_production_model(final_model, final_scaler, config, metrics)
         logger.info(f"Production model saved with version: {model_version}")
     else:
-        # Fallback: save as before
         joblib.dump(final_model, 'model.pkl')
         joblib.dump(final_scaler, 'scaler.pkl')
         with open('training_config.json', 'w') as f:
             json.dump(config, f, indent=2)
         logger.info("Production model saved as model.pkl (legacy mode)")
 
-    # 5. Prepare final report for dashboard
     report = {
         'timestamp': datetime.now().isoformat(),
         'dataset_size': len(df),
@@ -365,14 +346,13 @@ def run_training_pipeline(config, config_path=None):
     joblib.dump(report, 'training_report.joblib')
     logger.info("Training report saved to training_report.joblib")
 
-    # ---------- NEW: Log training run to database ----------
     if HAS_DB:
         save_training_run_to_db(config, metrics, fold_reports, model_version, len(df), len(df['symbol'].unique()))
 
     return report
 
 # ============================================================
-# Entry point for FastAPI background task (FIX for ImportError)
+# Entry point for FastAPI background task
 # ============================================================
 def train_model(db_session, model_store_path: str):
     """
@@ -386,14 +366,16 @@ def train_model(db_session, model_store_path: str):
     logger.info("TRAINING STARTED (via train_model)")
     logger.info("=" * 60)
     
-    # Override model store path if provided
     if model_store_path:
         os.environ["MODEL_STORE_PATH"] = model_store_path
-    
-    # Run the existing training pipeline
+
     config = DEFAULT_TRAINING_CONFIG.copy()
-    
-    # Optionally override config with environment variables
+    # Allow override of symbols via environment variable
+    env_symbols = os.getenv("TRAINING_SYMBOLS")
+    if env_symbols:
+        config['data']['symbols'] = [s.strip() for s in env_symbols.split(',') if s.strip()]
+        logger.info(f"Using symbols from environment: {config['data']['symbols']}")
+
     if os.getenv("TRAINING_CONFIG_PATH"):
         try:
             with open(os.getenv("TRAINING_CONFIG_PATH"), 'r') as f:
@@ -430,7 +412,6 @@ if __name__ == '__main__':
         config = DEFAULT_TRAINING_CONFIG
         logger.info("Using default configuration")
 
-    # Optionally override DB flag
     if args.no_db:
         HAS_DB = False
 
