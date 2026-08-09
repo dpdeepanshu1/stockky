@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 # Import our models and helpers
 from models import Base, ensure_schema, PredictionSnapshot, PredictionOutcome, TrainingRun
 
-# Optional imports for enhanced functionality
+# Optional imports
 try:
     from models import ModelRegistry
     HAS_MODEL_REGISTRY = True
@@ -29,16 +29,13 @@ try:
 except ImportError:
     HAS_INSIGHTS = False
 
-# Database is always available
 HAS_DB = True
 
 app = FastAPI(title="Training Intelligence", version="1.0")
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Service URL – can be overridden by environment variable
 SERVICE_URL = os.environ.get('SERVICE_URL', "https://training-service-5e9v.onrender.com")
 
 # ----------------------------------------------------------------------
@@ -49,19 +46,14 @@ SessionLocal = sessionmaker(bind=engine)
 
 @app.on_event("startup")
 def startup():
-    """Create tables and apply migrations on startup."""
-    Base.metadata.create_all(engine)   # creates tables if they don't exist
-    ensure_schema(engine)              # add missing columns if needed
+    Base.metadata.create_all(engine)
+    ensure_schema(engine)
     logger.info("Database schema initialized.")
 
 # ----------------------------------------------------------------------
-# Helper functions
+# Helper functions (same as before)
 # ----------------------------------------------------------------------
 def get_training_status():
-    """
-    Return a dict with current training status.
-    This is the primary status endpoint used by the dashboard.
-    """
     report_path = 'training_report.joblib'
     model_path = 'model.pkl'
     status = {
@@ -74,7 +66,6 @@ def get_training_status():
         'fold_details': [],
         'model_version': None
     }
-
     if os.path.exists(report_path):
         try:
             report = joblib.load(report_path)
@@ -86,7 +77,6 @@ def get_training_status():
             status['model_version'] = report.get('model_version')
         except Exception as e:
             logger.error(f"Error loading report: {e}")
-
     if HAS_MODEL_REGISTRY:
         try:
             registry = ModelRegistry()
@@ -97,7 +87,6 @@ def get_training_status():
                 status['model_version'] = pointer.get('version')
         except Exception as e:
             logger.warning(f"Could not read model registry: {e}")
-
     return status
 
 def get_models_list():
@@ -167,7 +156,6 @@ def get_learning_insights():
     report_path = 'training_report.joblib'
     if not os.path.exists(report_path):
         raise HTTPException(status_code=404, detail="No training report found")
-    # Return placeholder insights
     return {
         "insights": [
             {"insight": "Bullish market regimes show higher T+5 success rates", "sample_size": 124, "confidence": "high", "active": True},
@@ -178,8 +166,6 @@ def get_learning_insights():
     }
 
 def get_summary_metrics():
-    if not HAS_DB:
-        raise HTTPException(status_code=501, detail="Database not available")
     db = SessionLocal()
     try:
         latest_run = db.query(TrainingRun).order_by(TrainingRun.run_timestamp.desc()).first()
@@ -201,45 +187,33 @@ def get_summary_metrics():
         db.close()
 
 # ----------------------------------------------------------------------
-# Routes
+# Main Routes
 # ----------------------------------------------------------------------
 @app.get("/")
 async def root():
-    """Root endpoint – returns service status."""
     return JSONResponse(content={
         "message": "Training Service is running",
         "service_url": SERVICE_URL,
         "status": "healthy"
     })
 
+@app.get("/health")
+async def health():
+    return JSONResponse(content={"status": "ok"})
+
+# ----------------------------------------------------------------------
+# API routes (with /api prefix) – used by frontend via gateway
+# ----------------------------------------------------------------------
 @app.get("/api/status")
-async def status():
+async def api_status():
     return JSONResponse(content=get_training_status())
 
 @app.post("/api/train")
-async def trigger_training(background_tasks: BackgroundTasks):
-    lock_file = 'training.lock'
-    if os.path.exists(lock_file):
-        raise HTTPException(status_code=409, detail="Training already in progress")
-    with open(lock_file, 'w') as f:
-        f.write(str(os.getpid()))
-
-    def run_training():
-        try:
-            from train import train_model
-            # Pass session and model store path
-            train_model(SessionLocal(), os.environ.get('MODEL_STORE_PATH', './model-store'))
-        except Exception as e:
-            logger.error(f"Training failed: {e}")
-        finally:
-            if os.path.exists(lock_file):
-                os.remove(lock_file)
-
-    background_tasks.add_task(run_training)
-    return JSONResponse(content={"status": "Training started successfully", "service_url": SERVICE_URL}, status_code=202)
+async def api_trigger_training(background_tasks: BackgroundTasks):
+    return await trigger_training_impl(background_tasks)
 
 @app.get("/api/report")
-async def get_report():
+async def api_report():
     report_path = 'training_report.joblib'
     if not os.path.exists(report_path):
         raise HTTPException(status_code=404, detail="No report found")
@@ -257,7 +231,7 @@ async def get_report():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/models")
-async def list_models():
+async def api_models():
     try:
         models = get_models_list()
         return JSONResponse(content={"models": models})
@@ -268,7 +242,7 @@ async def list_models():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/models/promote/{version}")
-async def promote_candidate(version: str):
+async def api_promote(version: str):
     try:
         result = promote_model(version)
         return JSONResponse(content=result)
@@ -279,7 +253,7 @@ async def promote_candidate(version: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/insights")
-async def get_insights():
+async def api_insights():
     try:
         insights = get_learning_insights()
         return JSONResponse(content=insights)
@@ -290,7 +264,7 @@ async def get_insights():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/metrics/summary")
-async def summary():
+async def api_summary():
     try:
         summary_data = get_summary_metrics()
         return JSONResponse(content=summary_data)
@@ -301,7 +275,43 @@ async def summary():
         raise HTTPException(status_code=500, detail=str(e))
 
 # ----------------------------------------------------------------------
-# Run with uvicorn (for local development)
+# Aliases for frontend compatibility (without /api prefix)
+# ----------------------------------------------------------------------
+@app.get("/model-status")
+async def model_status():
+    """Alias for /api/status – used by frontend health checks."""
+    return JSONResponse(content=get_training_status())
+
+@app.post("/train")
+async def trigger_train(background_tasks: BackgroundTasks):
+    """Alias for /api/train – used by frontend trigger."""
+    return await trigger_training_impl(background_tasks)
+
+# ----------------------------------------------------------------------
+# Shared training trigger logic
+# ----------------------------------------------------------------------
+async def trigger_training_impl(background_tasks: BackgroundTasks):
+    lock_file = 'training.lock'
+    if os.path.exists(lock_file):
+        raise HTTPException(status_code=409, detail="Training already in progress")
+    with open(lock_file, 'w') as f:
+        f.write(str(os.getpid()))
+
+    def run_training():
+        try:
+            from train import train_model
+            train_model(SessionLocal(), os.environ.get('MODEL_STORE_PATH', './model-store'))
+        except Exception as e:
+            logger.error(f"Training failed: {e}")
+        finally:
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+
+    background_tasks.add_task(run_training)
+    return JSONResponse(content={"status": "Training started successfully", "service_url": SERVICE_URL}, status_code=202)
+
+# ----------------------------------------------------------------------
+# Run with uvicorn
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
