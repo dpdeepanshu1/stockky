@@ -10,7 +10,9 @@ import NotificationsPanel from "./components/NotificationsPanel";
 import SystemCheck from "./components/SystemCheck";
 import MarketMovers from "./components/MarketMovers";
 import ServiceManager from "./components/ServiceManager";
-import Training from "./components/Training"; // ADDED import for Training component
+import Training from "./components/Training";
+// ── NEW: import Market Sentiment Header ──
+import MarketSentimentHeader from "./components/MarketSentimentHeader";
 
 type ViewState =
   | { mode: "idle" }
@@ -19,7 +21,7 @@ type ViewState =
   | { mode: "scan"; data: ScanResult }
   | { mode: "error"; message: string };
 
-type Tab = "dashboard" | "notifications" | "training"; // ADDED training
+type Tab = "dashboard" | "notifications" | "training";
 
 export default function App() {
   const [systemReady, setSystemReady] = useState(false);
@@ -414,6 +416,11 @@ export default function App() {
                 >
                   Run market scan
                 </button>
+              </div>
+
+              {/* ── NEW: Market Sentiment Header placed above Market Movers ── */}
+              <div className="mt-8">
+                <MarketSentimentHeader />
               </div>
 
               <div className="mt-8">

@@ -39,11 +39,9 @@ export interface Decision {
   fundamental_score: number;
   news_score: number | null;
   prediction_score: number | null;
-  // ── NEW ──
   market_score: number;
   market_sentiment_adjustment: number;
   training_score: number;
-  // ─────────
   event_risk: boolean;
   entry_range: { low: number | null; high: number | null } | null;
   target: number | null;
@@ -58,10 +56,8 @@ export interface Decision {
     news?: string[];
     prediction?: string[];
     event?: string[];
-    // ── NEW ──
     market?: string[];
     training?: string[];
-    // ─────────
   };
   valuation: string;
   sector: string | null;
@@ -199,6 +195,20 @@ export interface TrainingScore {
   }>;
 }
 
+// ── NEW: Market Indices types ──
+export interface IndexData {
+  price: number;
+  change: number;
+  change_pct: number;
+}
+
+export interface MarketIndicesResponse {
+  nifty: IndexData;
+  sensex: IndexData;
+  market_mood: "BULLISH" | "BEARISH" | "NEUTRAL";
+  market_score: number;
+}
+
 async function request<T>(path: string, init?: RequestInit, retries = 2, timeoutMs = 60000): Promise<T> {
   const base = getApiUrl();
   if (!base) {
@@ -305,6 +315,9 @@ export const api = {
   marketTopLosers: () => request<MarketResponse>("/market/top-losers", undefined, 2, 30000),
   marketMostActive: () => request<MarketResponse>("/market/most-active", undefined, 2, 30000),
   marketTrending: () => request<MarketResponse>("/market/trending", undefined, 2, 30000),
+
+  // ── NEW: Market Indices ──
+  marketIndices: () => request<MarketIndicesResponse>("/market/indices", undefined, 2, 10000),
 
   getNotificationConfig: () => request<NotificationConfig>("/notifications/config", undefined, 2, 30000),
 

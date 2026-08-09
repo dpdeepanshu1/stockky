@@ -5,6 +5,7 @@ Single entry point for the React frontend.
 Includes async scan with progress, symbol correction, Hinglish summaries,
 market movers, watchlist scan, Telegram notifications, and dynamic universe.
 v2.2.0 adds Training Service proxy routes.
+v2.3.0 adds /market/indices endpoint for live NIFTY & SENSEX.
 """
 import os
 import json
@@ -38,7 +39,7 @@ FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-ser
 EVENT_URL = os.getenv("EVENT_URL", "https://event-tracker-service-m1lw.onrender.com")
 PREDICTION_URL = os.getenv("PREDICTION_URL", "https://prediction-service-wowb.onrender.com")
 
-# ---- NEW: Training Service URL ----
+# ---- Training Service URL ----
 TRAINING_URL = os.getenv("TRAINING_URL", "http://training-service:8010")
 
 # Service definitions for system health
@@ -54,7 +55,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.2.0")
+app = FastAPI(title="Stockky API Gateway", version="2.3.0")
 
 # --- CORS Middleware (explicit) ---
 app.add_middleware(
@@ -833,7 +834,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
@@ -853,6 +854,7 @@ def root():
             "/market/top-losers": "GET – top 10 losers",
             "/market/most-active": "GET – top 10 most active by volume",
             "/market/trending": "GET – trending stocks (momentum + news)",
+            "/market/indices": "GET – live NIFTY 50 & SENSEX points",
             "/notifications/health": "GET – notification service health",
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
@@ -1302,7 +1304,7 @@ def scan_watchlist():
     _send_scan_notification(result.get("recommendations", []), result["verdict"], result["scanned"], result["universe_size"])
     return result
 
-# ── Market routes (unchanged) ──────────────────────────────────────────────
+# ── Market routes (unchanged + new indices endpoint) ─────────────────────────
 @app.get("/market/top-gainers")
 def market_top_gainers():
     data = _get_nifty50_data()
@@ -1344,6 +1346,68 @@ def market_trending():
         except:
             pass
     return {"data": trending_data, "count": len(trending_data)}
+
+# ── NEW: Market Indices endpoint ──
+@app.get("/market/indices")
+def get_market_indices():
+    """
+    Fetch real-time NIFTY 50 and SENSEX index values with point changes.
+    """
+    try:
+        nifty = yf.Ticker("^NSEI")
+        sensex = yf.Ticker("^BSESN")
+
+        # Get 1-day history
+        nifty_hist = nifty.history(period="1d")
+        sensex_hist = sensex.history(period="1d")
+
+        if nifty_hist.empty or sensex_hist.empty:
+            raise HTTPException(status_code=503, detail="Index data temporarily unavailable")
+
+        # Current price and previous close
+        nifty_close = nifty_hist['Close'].iloc[-1]
+        nifty_open = nifty_hist['Open'].iloc[0]
+        nifty_prev_close = nifty_hist['Close'].iloc[0] if len(nifty_hist) > 1 else nifty_open
+        nifty_change = nifty_close - nifty_prev_close
+        nifty_change_pct = (nifty_change / nifty_prev_close) * 100
+
+        sensex_close = sensex_hist['Close'].iloc[-1]
+        sensex_open = sensex_hist['Open'].iloc[0]
+        sensex_prev_close = sensex_hist['Close'].iloc[0] if len(sensex_hist) > 1 else sensex_open
+        sensex_change = sensex_close - sensex_prev_close
+        sensex_change_pct = (sensex_change / sensex_prev_close) * 100
+
+        # Market mood based on average change
+        avg_change_pct = (nifty_change_pct + sensex_change_pct) / 2
+        if avg_change_pct > 0.3:
+            mood = "BULLISH"
+        elif avg_change_pct < -0.3:
+            mood = "BEARISH"
+        else:
+            mood = "NEUTRAL"
+
+        # Rough market score (0-100)
+        market_score = 50 + (avg_change_pct * 10)
+        market_score = max(0, min(100, market_score))
+
+        return {
+            "nifty": {
+                "price": round(nifty_close, 2),
+                "change": round(nifty_change, 2),
+                "change_pct": round(nifty_change_pct, 2)
+            },
+            "sensex": {
+                "price": round(sensex_close, 2),
+                "change": round(sensex_change, 2),
+                "change_pct": round(sensex_change_pct, 2)
+            },
+            "market_mood": mood,
+            "market_score": round(market_score)
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching indices: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ── Universe preview endpoints ──────────────────────────────────────────────
 @app.get("/scan/universe")
@@ -1475,7 +1539,7 @@ def send_picks_to_telegram(payload: dict):
         raise HTTPException(status_code=502, detail=f"Notification service failed: {e}")
 
 # ============================================================================
-# NEW: Training Service Proxy Routes
+# Training Service Proxy Routes
 # ============================================================================
 
 @app.get("/training/status")
