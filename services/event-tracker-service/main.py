@@ -1,15 +1,12 @@
 """
-Event Tracker Service v0.3.0
+Event Tracker Service v0.3.1
 -----------------------------
 Tracks material corporate events for subscribed NSE symbols.
 State is persisted in Upstash Redis so restarts don't lose subscriptions.
 
-v0.3 changes:
-  - Per-symbol event cache in Redis (4hr TTL) — prevents Yahoo rate-limit
-    errors when /check is called for 18+ symbols.
-  - Staggered fetching with a small delay between symbols in /check.
-  - All yfinance calls wrapped in individual try/except with graceful
-    degradation — one failing field never blocks the rest.
+v0.3.1 changes:
+  - Added /symbols_with_events endpoint to return symbols with upcoming events.
+  - Aggregated list is cached in Redis for 1 hour.
 
 Data sources (yfinance — free, no API key):
   - Earnings calendar, dividends, splits
@@ -25,7 +22,7 @@ import json
 import math
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List
 
 import yfinance as yf
@@ -37,12 +34,14 @@ from upstash_redis import Redis
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("event-tracker-service")
 
-app = FastAPI(title="Stockky Event Tracker Service", version="0.3.0")
+app = FastAPI(title="Stockky Event Tracker Service", version="0.3.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 EVENT_CACHE_TTL = 4 * 3600  # 4 hours — events don't change minute-to-minute
 STATE_KEY = "stockky:event_state"
 EVENT_CACHE_PREFIX = "stockky:event:"
+EVENTS_LIST_CACHE_KEY = "stockky:events_list"      # NEW: cache for symbols_with_events
+EVENTS_LIST_CACHE_TTL = 3600                      # 1 hour
 
 # ── Redis ──────────────────────────────────────────────────────────────────────
 _redis = None
@@ -226,7 +225,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # --- NEW: Earnings Surprise ---
+    # Earnings surprise
     earnings_surprise = None
     earnings_history = _yf_call(lambda: ticker.earnings_history, "Earnings history", sym)
     if earnings_history is not None and not earnings_history.empty:
@@ -245,10 +244,10 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # --- NEW: Bulk/Block Deals (placeholder) ---
+    # Bulk/Block deals (placeholder)
     bulk_deals = []
 
-    # --- NEW: FII/DII Net Flow (placeholder) ---
+    # FII/DII Net Flow (placeholder)
     fii_dii_net_flow = None
 
     result = {
@@ -277,7 +276,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
 def root():
     return {
         "service": "Stockky Event Tracker Service",
-        "version": "0.3.0",
+        "version": "0.3.1",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
@@ -286,6 +285,7 @@ def root():
             "/subscribe": "POST – subscribe symbols",
             "/subscriptions": "GET – list subscriptions",
             "/check": "GET – check for changes",
+            "/symbols_with_events": "GET – list symbols with upcoming events",
         },
     }
 
@@ -377,7 +377,7 @@ def check_for_changes():
                     f"Insider {txn.get('transaction')}: {txn.get('insider')} — {txn.get('shares')} shares"
                 )
 
-        # --- NEW: Earnings surprise changes ---
+        # Earnings surprise changes
         prev_surprise = previous.get("earnings_surprise") or {}
         cur_surprise = current.get("earnings_surprise") or {}
         if prev_surprise.get("surprise_pct") != cur_surprise.get("surprise_pct"):
@@ -385,7 +385,7 @@ def check_for_changes():
                 f"Earnings surprise: {cur_surprise.get('surprise_pct')}%"
             )
 
-        # --- NEW: Bulk/Block deals ---
+        # Bulk/Block deals
         prev_bulk = previous.get("bulk_deals") or []
         cur_bulk = current.get("bulk_deals") or []
         if len(cur_bulk) != len(prev_bulk):
@@ -402,6 +402,77 @@ def check_for_changes():
         "changes": changes,
         "checked_at": datetime.utcnow().isoformat(),
     }
+
+
+# ── NEW: symbols_with_events endpoint ──────────────────────────────────────────
+@app.get("/symbols_with_events")
+def symbols_with_events(days_ahead: int = 7):
+    """Return a list of subscribed symbols that have an upcoming event
+    (earnings, dividend, split) within the next `days_ahead` days.
+    The list is cached in Redis for 1 hour."""
+    # Try to serve from cache
+    cached = _redis_get(EVENTS_LIST_CACHE_KEY)
+    if cached and isinstance(cached, list):
+        logger.info("Serving cached symbols_with_events list")
+        return {"symbols": cached}
+
+    state = _load_state()
+    subscriptions = state.get("subscriptions", [])
+    if not subscriptions:
+        logger.info("No subscriptions, returning empty list")
+        _redis_set(EVENTS_LIST_CACHE_KEY, [], ttl=EVENTS_LIST_CACHE_TTL)
+        return {"symbols": []}
+
+    now = datetime.utcnow()
+    cutoff = now + timedelta(days=days_ahead)
+    result_symbols = []
+
+    for symbol in subscriptions:
+        # Fetch cached event data (do not force fresh fetch)
+        cache_key = f"{EVENT_CACHE_PREFIX}{symbol}"
+        cached_events = _redis_get(cache_key)
+        if not cached_events:
+            # If not cached, skip – we don't want to trigger expensive fetches
+            continue
+
+        next_earnings = cached_events.get("next_earnings_date")
+        if next_earnings:
+            try:
+                dt = datetime.fromisoformat(next_earnings)
+                if now <= dt <= cutoff:
+                    result_symbols.append(symbol)
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        # Check dividends
+        last_div = cached_events.get("last_dividend")
+        if last_div and last_div.get("date"):
+            try:
+                dt = datetime.fromisoformat(last_div["date"])
+                if now <= dt <= cutoff:
+                    result_symbols.append(symbol)
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        # Check splits
+        last_split = cached_events.get("last_split")
+        if last_split and last_split.get("date"):
+            try:
+                dt = datetime.fromisoformat(last_split["date"])
+                if now <= dt <= cutoff:
+                    result_symbols.append(symbol)
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+    # Deduplicate and sort
+    result_symbols = sorted(set(result_symbols))
+    # Cache for 1 hour
+    _redis_set(EVENTS_LIST_CACHE_KEY, result_symbols, ttl=EVENTS_LIST_CACHE_TTL)
+    logger.info(f"Returning {len(result_symbols)} symbols with upcoming events")
+    return {"symbols": result_symbols}
 
 
 if __name__ == "__main__":

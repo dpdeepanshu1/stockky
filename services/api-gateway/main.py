@@ -320,6 +320,22 @@ def _get_news_mentioned_symbols() -> List[str]:
         logger.warning("Could not parse news for symbols: %s", e)
     return mentioned[:15]
 
+# ── NEW: Fetch symbols with upcoming events from Event Tracker ───────────
+def _get_event_symbols() -> List[str]:
+    """Fetch list of symbols that have upcoming corporate events from the Event Tracker service."""
+    try:
+        # Assuming the Event Tracker exposes a new endpoint /symbols_with_events
+        resp = httpx.get(f"{EVENT_URL}/symbols_with_events", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict):
+                return data.get("symbols", [])
+            elif isinstance(data, list):
+                return data
+    except Exception as e:
+        logger.warning(f"Could not fetch event symbols: {e}")
+    return []
+
 # ── Build scan universe (robust) ──────────────────────────────────────
 def _build_scan_universe() -> List[str]:
     cached = _redis_get(SCAN_UNIVERSE_KEY)
@@ -356,6 +372,11 @@ def _build_scan_universe() -> List[str]:
         universe.update(_get_recent_ipos())
     except Exception as e:
         logger.warning(f"Failed to fetch IPOs: {e}")
+
+    try:
+        universe.update(_get_event_symbols())   # NEW: add upcoming event symbols
+    except Exception as e:
+        logger.warning(f"Failed to fetch event symbols: {e}")
 
     universe.update(_load_watchlist())
     universe.update(_load_searched())
