@@ -1,4 +1,5 @@
 version: "3.9"
+
 services:
   market-data-service:
     build: ./services/market-data-service
@@ -124,29 +125,19 @@ services:
     depends_on:
       - market-data-service
 
+  # ===================== CORRECTED training-service =====================
   training-service:
-    build: ./services/training-service
+    build: ./services/training-service          # path to your Dockerfile
     ports:
-      - "8010:8010"
+      - "8010:5001"                             # external 8010 → container 5001
     environment:
-      - DATABASE_URL=${TRAINING_DATABASE_URL:-sqlite:///./training.db}
+      - SERVICE_URL=http://training-service:5001   # internal service discovery
+      - PORT=5001                               # container port
+      - DATABASE_URL=${TRAINING_DATABASE_URL:-sqlite:///./data/training.db}
       - MODEL_STORE_PATH=/app/model-store
     volumes:
-      - ./data/training-model:/app/model-store
-      - ./data/training-db:/app/data
+      - ./data/training-model:/app/model-store   # persistent model storage
+      - ./data/training-db:/app/data             # persistent SQLite database
     depends_on:
-      - market-data-service
-      - decision-engine-service    
-training-service:
-  build: ./training-service
-  ports:
-    - "5001:5001"
-  environment:
-    - SERVICE_URL=http://training-service:5001
-    - PORT=5001
-  volumes:
-    - ./training-service:/app
-  depends_on:
-    - market-data-service
-    - prediction-service
-  restart: unless-stopped        
+      - market-data-service                      # only needs market data
+    restart: unless-stopped
