@@ -67,8 +67,24 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("training-service")
 
+# ---------- Numpy conversion helper ----------
+def convert_numpy(obj):
+    """Recursively convert numpy types to Python native types."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: convert_numpy(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [convert_numpy(v) for v in obj]
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    return obj
+
 # ---------- Configuration ----------
-# Reduced symbol set and shorter period to avoid rate limits
 DEFAULT_SYMBOLS = [
     "TCS", "INFY", "RELIANCE", "HDFCBANK", "ICICIBANK",
     "HCLTECH", "SBIN", "LT", "MARUTI", "SUNPHARMA"
@@ -107,7 +123,7 @@ DEFAULT_TRAINING_CONFIG = {
     "random_seed": 42,
     "data": {
         "symbols": DEFAULT_SYMBOLS,
-        "period": "2y"   # only 2 years to reduce download
+        "period": "2y"
     }
 }
 
@@ -172,12 +188,12 @@ def save_training_run_to_db(config, metrics, fold_details, model_version, datase
         db = Session()
         run = db_models.TrainingRun(
             run_timestamp=datetime.now(),
-            config=json.dumps(config),
+            config=json.dumps(convert_numpy(config)),
             dataset_size=dataset_size,
             num_symbols=num_symbols,
             model_version=model_version,
-            walk_forward_metrics=json.dumps(metrics),
-            fold_details=json.dumps(fold_details)
+            walk_forward_metrics=json.dumps(convert_numpy(metrics)),
+            fold_details=json.dumps(convert_numpy(fold_details))
         )
         db.add(run)
         db.commit()
@@ -326,18 +342,18 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         joblib.dump(final_model, 'model.pkl')
         joblib.dump(final_scaler, 'scaler.pkl')
         with open('training_config.json', 'w') as f:
-            json.dump(config, f, indent=2)
+            json.dump(convert_numpy(config), f, indent=2)
         logger.info("Production model saved as model.pkl (legacy mode)")
 
     report = {
         'timestamp': datetime.now().isoformat(),
         'dataset_size': len(df),
         'num_symbols': len(df['symbol'].unique()),
-        'walk_forward_metrics': metrics,
-        'fold_details': fold_reports,
+        'walk_forward_metrics': convert_numpy(metrics),
+        'fold_details': convert_numpy(fold_reports),
         'production_model_saved': True,
         'model_version': model_version,
-        'config': config
+        'config': convert_numpy(config)
     }
 
     joblib.dump(report, 'training_report.joblib')
@@ -367,7 +383,6 @@ def train_model(db_session, model_store_path: str):
         os.environ["MODEL_STORE_PATH"] = model_store_path
 
     config = DEFAULT_TRAINING_CONFIG.copy()
-    # Allow override of symbols via environment variable
     env_symbols = os.getenv("TRAINING_SYMBOLS")
     if env_symbols:
         config['data']['symbols'] = [s.strip() for s in env_symbols.split(',') if s.strip()]
