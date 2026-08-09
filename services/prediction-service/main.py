@@ -227,11 +227,8 @@ def _generate_llm_note(features: dict, probability: float) -> str:
         "Explain the estimate."
     )
 
-    # Try each configured provider in turn. Any single one being down,
-    # rate-limited, or deprecated (as just happened with Groq's old model)
-    # degrades to the next provider instead of breaking the feature — the
-    # plain-number fallback only fires if BOTH are unavailable.
-    for call in (_call_groq, _call_gemini):
+    # UPDATED: Try Gemini first, then Groq, then fallback.
+    for call in (_call_gemini, _call_groq):
         note = call(system_prompt, user_prompt)
         if note:
             return note
