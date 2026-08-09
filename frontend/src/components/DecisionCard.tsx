@@ -14,12 +14,14 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const isBullish = data.decision === "BUY NOW" || data.decision === "PREPARE TO BUY";
   const [isAddingWatchlist, setIsAddingWatchlist] = useState(false);
 
-  // Build score breakdown including news and prediction if available
+  // ── UPDATED: Include Market Sentiment and Training scores ──
   const scores = [
     { label: "Technical", value: data.technical_score },
     { label: "Fundamental", value: data.fundamental_score },
     ...(data.news_score !== null && data.news_score !== undefined ? [{ label: "News", value: data.news_score }] : []),
     ...(data.prediction_score !== null && data.prediction_score !== undefined ? [{ label: "AI Model", value: data.prediction_score }] : []),
+    { label: "Market Sentiment", value: data.market_score ?? 50 },
+    { label: "Training", value: data.training_score ?? 50 },
   ];
 
   const metrics = data.fundamental_metrics;
@@ -27,6 +29,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const hasPrice = data.close != null;
   const hasNews = data.reasons.news && data.reasons.news.length > 0;
   const hasEvent = data.reasons.event && data.reasons.event.length > 0;
+  const hasMarket = data.reasons.market && data.reasons.market.length > 0;
 
   const handleAddToWatchlist = async () => {
     if (isAddingWatchlist) return;
@@ -36,6 +39,12 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
     } finally {
       setIsAddingWatchlist(false);
     }
+  };
+
+  // ── Helper to format adjustment with sign ──
+  const formatAdjustment = (adj: number) => {
+    if (adj === 0) return "±0";
+    return adj > 0 ? `+${adj}` : `${adj}`;
   };
 
   return (
@@ -66,8 +75,14 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
             <div className="text-4xl text-paper">
               {hasPrice ? `₹${data.close!.toLocaleString("en-IN")}` : data.data_insufficient ? "Awaiting Data" : "N/A"}
             </div>
-            <div className="text-xs text-mist/60 mt-1">
-              Combined {data.combined_score}/100
+            <div className="text-xs text-mist/60 mt-1 flex items-center justify-end gap-2">
+              <span>Combined {data.combined_score}/100</span>
+              {/* ── NEW: Show adjustment ── */}
+              {data.market_sentiment_adjustment !== undefined && data.market_sentiment_adjustment !== 0 && (
+                <span className={`text-xs font-medium ${data.market_sentiment_adjustment > 0 ? 'text-signal-buy' : 'text-signal-sell'}`}>
+                  ({formatAdjustment(data.market_sentiment_adjustment)})
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -210,7 +225,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* Reasons – including News and Event */}
+      {/* Reasons – including News, Event, Market, Training */}
       <div className="grid md:grid-cols-2 gap-4">
         <ReasonList title="Technical" items={data.reasons.technical} />
         <ReasonList title="Fundamental" items={data.reasons.fundamental} />
@@ -219,6 +234,11 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
           <ReasonList title="AI Prediction" items={data.reasons.prediction} />
         )}
         {hasEvent && <ReasonList title="Event Tracker" items={data.reasons.event!} />}
+        {/* ── NEW: Market Sentiment reasons ── */}
+        {hasMarket && <ReasonList title="Market Sentiment" items={data.reasons.market!} />}
+        {data.reasons.training && data.reasons.training.length > 0 && (
+          <ReasonList title="Training Intelligence" items={data.reasons.training} />
+        )}
       </div>
 
       {/* Holding period */}

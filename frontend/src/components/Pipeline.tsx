@@ -5,7 +5,9 @@ const STAGES = [
   { label: "Technical analysis", detail: "RSI, MACD, EMA, ADX…" },
   { label: "Fundamental analysis", detail: "P/E, P/B, growth, valuation…" },
   { label: "News intelligence", detail: "Sentiment scoring" },
-  { label: "Event tracker", detail: "Earnings, dividends, splits, insider trades…" }, // NEW
+  // ── NEW: Market Sentiment stage ──
+  { label: "Market sentiment", detail: "Bullish/Bearish/Neutral scoring" },
+  { label: "Event tracker", detail: "Earnings, dividends, splits, insider trades…" },
   { label: "AI prediction", detail: "XGBoost model inference" },
   { label: "Decision synthesis", detail: "Combining all signals" },
 ];
@@ -21,7 +23,7 @@ export default function Pipeline({ running }: { running: boolean }) {
         if (i >= STAGES.length - 1) { clearInterval(interval); return i; }
         return i + 1;
       });
-    }, 400); // slightly faster to fit 7 stages
+    }, 400);
     return () => clearInterval(interval);
   }, [running]);
 

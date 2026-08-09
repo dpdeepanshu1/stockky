@@ -39,6 +39,11 @@ export interface Decision {
   fundamental_score: number;
   news_score: number | null;
   prediction_score: number | null;
+  // ── NEW ──
+  market_score: number;
+  market_sentiment_adjustment: number;
+  training_score: number;
+  // ─────────
   event_risk: boolean;
   entry_range: { low: number | null; high: number | null } | null;
   target: number | null;
@@ -53,6 +58,10 @@ export interface Decision {
     news?: string[];
     prediction?: string[];
     event?: string[];
+    // ── NEW ──
+    market?: string[];
+    training?: string[];
+    // ─────────
   };
   valuation: string;
   sector: string | null;
@@ -135,7 +144,7 @@ export interface SystemHealth {
   services: Record<string, SystemServiceStatus>;
 }
 
-// --- NEW: Training Service types ---
+// --- Training Service types ---
 export interface TrainingModelStatus {
   production_model: {
     version: string;
@@ -340,7 +349,7 @@ export const api = {
       30000
     ),
 
-  // --- NEW: Training Service endpoints ---
+  // --- Training Service endpoints ---
   getTrainingStatus: () => request<TrainingModelStatus>("/training/status", undefined, 2, 30000),
 
   triggerTraining: () =>
