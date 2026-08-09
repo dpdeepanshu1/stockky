@@ -1,8 +1,9 @@
-""" Decision Engine Service v0.5.0
+""" Decision Engine Service v0.6.0
 Changes:
 - Market Sentiment now acts as an independent adjustment factor (not weighted)
 - Positive sentiment (>60) adds bonus; negative sentiment (<40) subtracts
 - Added market_sentiment_adjustment to response
+- Records BUY/PREPARE predictions to Training Service for T+1/T+5 tracking
 """
 import os
 import asyncio
@@ -29,7 +30,7 @@ TRAINING_SERVICE_URL = os.getenv("TRAINING_SERVICE_URL", "http://training-servic
 EARNINGS_RISK_DAYS = 3
 EARNINGS_BOOST_DAYS = 7
 
-app = FastAPI(title="Stockky Decision Engine", version="0.5.0")
+app = FastAPI(title="Stockky Decision Engine", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -54,7 +55,7 @@ class Decision(str, Enum):
 
 @app.get("/")
 def root():
-    return {"service": "Stockky Decision Engine", "version": "0.5.0", "status": "running"}
+    return {"service": "Stockky Decision Engine", "version": "0.6.0", "status": "running"}
 
 
 @app.get("/health")
@@ -210,30 +211,23 @@ def _extract_event_signals(events: dict | None) -> dict:
     }
 
 
-# ── NEW: Market Sentiment Adjustment ──────────────────────────────
+# ── Market Sentiment Adjustment ──────────────────────────────
 def _market_sentiment_adjustment(market_score: int) -> tuple:
-    """
-    Calculate adjustment based on market sentiment.
-    Returns: (adjustment_value, reason_text)
-    - Positive sentiment (>60): adds bonus (scaled 0 to +10)
-    - Negative sentiment (<40): subtracts penalty (scaled 0 to -10)
-    - Neutral (40-60): no adjustment
-    """
     if market_score >= 70:
         return (10, f"📈 Strong bullish market sentiment (+10)")
     elif market_score >= 60:
-        bonus = int((market_score - 60) / 10 * 10)  # 0 to +10
+        bonus = int((market_score - 60) / 10 * 10)
         return (bonus, f"📈 Positive market sentiment (+{bonus})")
     elif market_score <= 30:
         return (-10, f"📉 Strong bearish market sentiment (-10)")
     elif market_score <= 40:
-        penalty = int((40 - market_score) / 10 * 10)  # 0 to -10
+        penalty = int((40 - market_score) / 10 * 10)
         return (-penalty, f"📉 Negative market sentiment (-{penalty})")
     else:
         return (0, f"➖ Neutral market sentiment (no adjustment)")
 
 
-# ── Combined score (UPDATED: market sentiment as adjustment) ──────────────
+# ── Combined score ──────────────────────────────────────────────
 def _combined_score(
     technical_score: int,
     fundamental_score: int,
@@ -243,11 +237,6 @@ def _combined_score(
     event_delta: int = 0,
     market_adjustment: int = 0,
 ) -> float:
-    """
-    Calculate combined score with market sentiment as an independent adjustment.
-    Market sentiment no longer has a weight — it adds/subtracts directly.
-    """
-    # Base weights (market sentiment removed from weights)
     if news_score is not None and prediction_score is not None:
         weights = {"t": 0.35, "f": 0.25, "n": 0.14, "p": 0.20, "train": 0.06}
     elif news_score is not None:
@@ -265,15 +254,11 @@ def _combined_score(
         training_score * weights["train"]
     )
 
-    # News delta (existing)
     if news_score is not None:
         news_delta = (news_score - 50) / 50 * 10
         total += news_delta
 
-    # Event delta (existing)
     total += event_delta
-
-    # ── NEW: Market sentiment adjustment ──
     total += market_adjustment
 
     return round(max(0, min(100, total)), 1)
@@ -298,13 +283,11 @@ def _decide(
             return Decision.WAIT
         return Decision.DO_NOT_BUY
 
-    # Sell / Hold if already owned
     if already_owned and combined < 35:
         return Decision.SELL
     if already_owned and 35 <= combined < 60:
         return Decision.HOLD
 
-    # Buy / Prepare if not owned
     news_ok = news_score is None or news_score >= 35
     model_ok = prediction_score is None or prediction_score >= 50
     resistance_ok = dist_to_resistance_pct is None or dist_to_resistance_pct > 1
@@ -330,7 +313,7 @@ def _decide(
     return Decision.DO_NOT_BUY
 
 
-# ── Background task to record prediction snapshot ─────────────────────
+# ── Record prediction to Training Service ────────────────────────────
 async def record_prediction_for_training(
     symbol: str,
     decision: str,
@@ -341,31 +324,62 @@ async def record_prediction_for_training(
     stop_loss: float,
     market_sentiment: dict,
     features: dict,
+    event_data: dict | None = None,
+    fundamental_metrics: dict | None = None,
 ):
-    """Send immutable prediction snapshot to Training Service."""
-    prediction_id = f"STK-{datetime.now().strftime('%Y%m%d%H%M%S')}-{symbol}"
+    """
+    Send immutable prediction snapshot to Training Service's /api/predictions endpoint.
+    This is the new endpoint that stores predictions for T+1/T+5 evaluation.
+    """
     payload = {
-        "prediction_id": prediction_id,
         "symbol": symbol,
-        "timestamp": datetime.now().isoformat(),
-        "price": price,
         "decision": decision,
-        "confidence": confidence,
-        "entry_range": f"{entry_range.get('low')}-{entry_range.get('high')}" if entry_range else None,
+        "confidence": "High" if confidence >= 75 else "Medium" if confidence >= 55 else "Low",
+        "price": price,
+        "combined_score": confidence,
+        "technical_score": features.get("technical", 50),
+        "fundamental_score": features.get("fundamental", 50),
+        "news_score": features.get("news"),
+        "prediction_score": features.get("prediction"),
+        "market_score": features.get("market", 50),
+        "market_sentiment_adjustment": features.get("market_adjustment", 0),
+        "training_score": features.get("training", 50),
+        "event_risk": features.get("event_risk", False),
+        "entry_range_low": entry_range.get("low") if entry_range else None,
+        "entry_range_high": entry_range.get("high") if entry_range else None,
         "target": target,
         "stop_loss": stop_loss,
-        "market_sentiment": market_sentiment,
-        "features": features,
+        "holding_period": "2-6 weeks",
+        "support": features.get("support"),
+        "resistance": features.get("resistance"),
+        "sector": None,  # Not available here, can be added if needed
+        "valuation": "fair",  # placeholder
+        "market_mood": market_sentiment.get("classification", "NEUTRAL"),
+        "nifty_change_pct": market_sentiment.get("nifty_change_pct"),
+        "sensex_change_pct": market_sentiment.get("sensex_change_pct"),
+        "rsi": None,         # Not available directly, could be extracted from technical if present
+        "macd": None,
+        "ema": None,
+        "volume_ratio": None,
+        "debt_to_equity": fundamental_metrics.get("debt_to_equity") if fundamental_metrics else None,
+        "roe": fundamental_metrics.get("roe") if fundamental_metrics else None,
+        "roce": fundamental_metrics.get("roce") if fundamental_metrics else None,
+        "feature_snapshot": features,  # store all features as JSON
     }
+
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.post(f"{TRAINING_SERVICE_URL}/record-prediction", json=payload)
-            if response.status_code == 200:
-                logger.info(f"Prediction recorded: {prediction_id}")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{TRAINING_SERVICE_URL}/api/predictions",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            if response.status_code in (200, 201):
+                logger.info(f"Prediction recorded for {symbol}: {response.json().get('prediction_id')}")
             else:
-                logger.warning(f"Failed to record prediction: {response.status_code}")
+                logger.warning(f"Failed to record prediction: {response.status_code} - {response.text}")
     except Exception as e:
-        logger.error(f"Error recording prediction: {e}")
+        logger.error(f"Error recording prediction for {symbol}: {e}")
 
 
 # ── Main route ────────────────────────────────────────────────────
@@ -373,24 +387,19 @@ async def record_prediction_for_training(
 async def decide(symbol: str, already_owned: bool = False, background_tasks: BackgroundTasks = None):
     try:
         async with httpx.AsyncClient(timeout=70) as client:
-            # Existing tasks
             technical_task = asyncio.create_task(_fetch_optional(client, f"{TECHNICAL_URL}/analyze/{symbol}", "Technical"))
             fundamental_task = asyncio.create_task(_fetch_optional(client, f"{FUNDAMENTAL_URL}/analyze/{symbol}", "Fundamental"))
             news_task = asyncio.create_task(_fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News"))
             events_task = asyncio.create_task(_fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Events"))
             prediction_task = asyncio.create_task(_fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction"))
-
-            # NEW: Fetch market sentiment and training score concurrently
             sentiment_task = asyncio.create_task(get_market_sentiment())
             training_task = asyncio.create_task(get_training_score(symbol))
 
-            # Gather all
             technical, fundamental, news, events, prediction, sentiment, training = await asyncio.gather(
                 technical_task, fundamental_task, news_task, events_task,
                 prediction_task, sentiment_task, training_task
             )
 
-        # ── Extract scores ──────────────────
         data_insufficient = False
 
         if not technical or not isinstance(technical, dict):
@@ -440,20 +449,16 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         if technical.get("data_insufficient"):
             data_insufficient = True
 
-        # ── Extract market & training scores ────────────────────────
         market_score = sentiment.get("market_score", 50)
         training_score = training.get("training_score", 50)
 
-        # ── NEW: Calculate market sentiment adjustment ──
         market_adjustment, market_adjustment_reason = _market_sentiment_adjustment(market_score)
 
-        # ── Event signals ──────────────────────────────────────
         event_signals = _extract_event_signals(events)
         event_delta = event_signals["event_score_delta"]
         event_risk = event_signals["event_risk"]
         event_reasons = event_signals["event_reasons"]
 
-        # ── Price data ─────────────────────────────────────────
         close = technical.get("close")
         support = technical.get("support")
         resistance = technical.get("resistance")
@@ -463,7 +468,6 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         if close and resistance and resistance > 0:
             dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
 
-        # ── Combined score (UPDATED: includes market adjustment) ──────────────────────
         combined = _combined_score(
             technical_score,
             fundamental_score,
@@ -474,7 +478,6 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             market_adjustment,
         )
 
-        # ── Decision ───────────────────────────────────────────
         decision = _decide(
             technical_score,
             fundamental_score,
@@ -489,7 +492,6 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             data_insufficient,
         )
 
-        # ── Entry / Target / Stop ─────────────────────────────
         entry_low = entry_high = target = stop_loss = None
         if close:
             support_val = support if support else close * 0.95
@@ -507,7 +509,6 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
 
         confidence = "High" if combined >= 75 else "Medium" if combined >= 55 else "Low"
 
-        # ── Reasons assembly ──────────────────────────────────
         reasons: dict = {
             "technical": technical.get("reasons", []),
             "fundamental": fundamental.get("reasons", []),
@@ -518,12 +519,9 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             reasons["prediction"] = [prediction.get("note", "AI prediction available")]
         if event_reasons:
             reasons["event"] = event_reasons
-
-        # ── NEW: Market & training insights ──
         reasons["market"] = [market_adjustment_reason]
         reasons["training"] = [f"Training intelligence score: {training_score}/100"]
 
-        # ── Build response ─────────────────────────────────────────────────
         response = {
             "symbol": symbol.upper(),
             "decision": decision.value,
@@ -534,7 +532,7 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             "news_score": news_score,
             "prediction_score": prediction_score,
             "market_score": market_score,
-            "market_sentiment_adjustment": market_adjustment,  # NEW: separate adjustment value
+            "market_sentiment_adjustment": market_adjustment,
             "training_score": training_score,
             "event_score_delta": event_delta,
             "event_risk": event_risk,
@@ -552,7 +550,6 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             "fundamental_fallback": fundamental.get("fallback_used", False),
         }
 
-        # Add optional extra data
         if news and isinstance(news, dict):
             response["news_data"] = {
                 "headline_count": news.get("headline_count", 0),
@@ -585,18 +582,20 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
                     "market_adjustment": market_adjustment,
                     "training": training_score,
                     "event_delta": event_delta,
+                    "event_risk": event_risk,
                     "support": support,
                     "resistance": resistance,
                     "volume_surge": volume_surge,
                     "trend_strength": trend_strength,
-                }
+                },
+                event_data=events,
+                fundamental_metrics=fundamental.get("metrics")
             )
 
         return response
 
     except Exception as e:
         logger.error(f"Decision failed for {symbol}: {e}", exc_info=True)
-        # Always return 200 with fallback values
         return {
             "symbol": symbol.upper(),
             "decision": Decision.DO_NOT_BUY.value,

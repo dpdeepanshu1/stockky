@@ -1,22 +1,26 @@
 # services/training-service/app.py
 """
 Training-service FastAPI application.
-Exposes REST API endpoints for training intelligence.
+Exposes REST API endpoints for training intelligence, prediction recording, and evaluation.
 """
 import os
 import logging
 import json
 import time
-import numpy as np
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional, List
 import joblib
-from sqlalchemy import create_engine
+import numpy as np
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker
 
 from models import Base, ensure_schema, PredictionSnapshot, PredictionOutcome, TrainingRun
 
+# Optional imports
 try:
     from models import ModelRegistry
     HAS_MODEL_REGISTRY = True
@@ -42,11 +46,41 @@ engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine)
 
 LOCK_FILE = 'training.lock'
-LOCK_TIMEOUT_SECONDS = 300  # 5 minutes
+LOCK_TIMEOUT_SECONDS = 300
+
+# ---------- Pydantic models for prediction recording ----------
+class PredictionSnapshotCreate(BaseModel):
+    symbol: str
+    decision: str  # "BUY NOW", "PREPARE TO BUY", "HOLD", etc.
+    confidence: str  # "High", "Medium", "Low"
+    price: float
+    target: Optional[float] = None
+    stop_loss: Optional[float] = None
+    entry_range_low: Optional[float] = None
+    entry_range_high: Optional[float] = None
+    combined_score: float
+    technical_score: float
+    fundamental_score: float
+    news_score: Optional[float] = None
+    prediction_score: Optional[float] = None
+    market_score: float
+    training_score: float
+    event_risk: bool = False
+    rsi: Optional[float] = None
+    macd: Optional[str] = None
+    ema: Optional[str] = None
+    volume_ratio: Optional[float] = None
+    debt_to_equity: Optional[float] = None
+    roe: Optional[float] = None
+    roce: Optional[float] = None
+    market_mood: Optional[str] = None
+    nifty_change_pct: Optional[float] = None
+    sensex_change_pct: Optional[float] = None
+    # Additional fields for flexibility
+    extra: Optional[dict] = None
 
 # ---------- Numpy conversion helper ----------
 def convert_numpy(obj):
-    """Recursively convert numpy types to Python native types."""
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, np.floating):
@@ -61,6 +95,7 @@ def convert_numpy(obj):
         return bool(obj)
     return obj
 
+# ---------- Startup ----------
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
@@ -123,7 +158,6 @@ def get_training_status():
             status['last_training'] = report.get('timestamp')
             status['dataset_size'] = report.get('dataset_size', 0)
             status['num_symbols'] = report.get('num_symbols', 0)
-            # Convert numpy types in metrics and fold_details
             status['metrics'] = convert_numpy(report.get('walk_forward_metrics', {}))
             status['fold_details'] = convert_numpy(report.get('fold_details', []))
             status['model_version'] = report.get('model_version')
@@ -139,7 +173,7 @@ def get_training_status():
                 status['model_version'] = pointer.get('version')
         except Exception as e:
             logger.warning(f"Could not read model registry: {e}")
-    return convert_numpy(status)  # final conversion
+    return convert_numpy(status)
 
 def get_models_list():
     if not HAS_MODEL_REGISTRY:
@@ -239,7 +273,7 @@ def get_summary_metrics():
         db.close()
 
 # ----------------------------------------------------------------------
-# Routes
+# Routes (existing)
 # ----------------------------------------------------------------------
 @app.get("/")
 async def root():
@@ -334,7 +368,135 @@ async def api_summary():
         logger.error(f"Error getting summary metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ----------------------------------------------------------------------
+# NEW: Prediction recording and evaluation endpoints
+# ----------------------------------------------------------------------
+@app.post("/api/predictions")
+async def store_prediction(pred: PredictionSnapshotCreate, background_tasks: BackgroundTasks):
+    """Store a prediction snapshot from the decision engine."""
+    db = SessionLocal()
+    try:
+        # Generate unique ID
+        pred_id = f"STK-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+        # Clean up old predictions (keep last 90 days to save space)
+        cutoff = datetime.now() - timedelta(days=90)
+        db.query(PredictionSnapshot).filter(PredictionSnapshot.timestamp < cutoff).delete()
+        db.commit()
+
+        snapshot = PredictionSnapshot(
+            prediction_id=pred_id,
+            symbol=pred.symbol,
+            timestamp=datetime.utcnow(),
+            price=pred.price,
+            decision=pred.decision,
+            confidence=pred.confidence,
+            combined_score=pred.combined_score,
+            technical_score=pred.technical_score,
+            fundamental_score=pred.fundamental_score,
+            news_score=pred.news_score,
+            prediction_score=pred.prediction_score,
+            market_score=pred.market_score,
+            market_sentiment_adjustment=0.0,  # placeholder
+            training_score=pred.training_score,
+            event_risk=pred.event_risk,
+            entry_range_low=pred.entry_range_low,
+            entry_range_high=pred.entry_range_high,
+            target=pred.target,
+            stop_loss=pred.stop_loss,
+            holding_period=None,
+            support=None,
+            resistance=None,
+            sector=None,
+            valuation=None,
+            market_mood=pred.market_mood,
+            nifty_change_pct=pred.nifty_change_pct,
+            sensex_change_pct=pred.sensex_change_pct,
+            rsi=pred.rsi,
+            macd=pred.macd,
+            ema=pred.ema,
+            volume_ratio=pred.volume_ratio,
+            debt_to_equity=pred.debt_to_equity,
+            roe=pred.roe,
+            roce=pred.roce,
+            feature_snapshot=pred.extra,
+            model_version=None,
+            created_at=datetime.utcnow(),
+            t1_success=0,
+            t5_success=0,
+            overall_success=0
+        )
+        db.add(snapshot)
+        db.commit()
+        logger.info(f"Stored prediction {pred_id} for {pred.symbol}")
+        return JSONResponse(content={"status": "stored", "prediction_id": pred_id})
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to store prediction: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+@app.post("/api/evaluate/t1")
+async def evaluate_t1(background_tasks: BackgroundTasks):
+    """Trigger T+1 evaluation of pending predictions."""
+    def run_eval():
+        try:
+            from evaluator import evaluate_pending_predictions
+            evaluate_pending_predictions('T+1')
+        except Exception as e:
+            logger.error(f"T+1 evaluation failed: {e}")
+    background_tasks.add_task(run_eval)
+    return JSONResponse(content={"status": "T+1 evaluation triggered"})
+
+@app.post("/api/evaluate/t5")
+async def evaluate_t5(background_tasks: BackgroundTasks):
+    """Trigger T+5 evaluation of pending predictions."""
+    def run_eval():
+        try:
+            from evaluator import evaluate_pending_predictions
+            evaluate_pending_predictions('T+5')
+        except Exception as e:
+            logger.error(f"T+5 evaluation failed: {e}")
+    background_tasks.add_task(run_eval)
+    return JSONResponse(content={"status": "T+5 evaluation triggered"})
+
+@app.get("/api/predictions/history")
+async def prediction_history(limit: int = 50, offset: int = 0):
+    """Return recent predictions with outcomes."""
+    db = SessionLocal()
+    try:
+        results = (
+            db.query(PredictionSnapshot)
+            .order_by(PredictionSnapshot.timestamp.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        # For each, also get the outcomes
+        out = []
+        for r in results:
+            outcomes = db.query(PredictionOutcome).filter(
+                PredictionOutcome.prediction_id == r.prediction_id
+            ).all()
+            out.append({
+                "prediction_id": r.prediction_id,
+                "symbol": r.symbol,
+                "timestamp": r.timestamp.isoformat(),
+                "decision": r.decision,
+                "price": r.price,
+                "t1_success": r.t1_success,
+                "t5_success": r.t5_success,
+                "outcomes": [{"period": o.evaluation_period, "return_pct": o.return_pct, "success": o.success} for o in outcomes]
+            })
+        return JSONResponse(content={"predictions": out, "total": len(out)})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+# ----------------------------------------------------------------------
 # Aliases for frontend (no /api prefix)
+# ----------------------------------------------------------------------
 @app.get("/model-status")
 async def model_status():
     return JSONResponse(content=get_training_status())
@@ -344,7 +506,7 @@ async def trigger_train(background_tasks: BackgroundTasks):
     return await api_trigger_training(background_tasks)
 
 # ----------------------------------------------------------------------
-# Run
+# Run with uvicorn
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
