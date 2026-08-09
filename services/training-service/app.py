@@ -1,18 +1,14 @@
 # services/training-service/app.py
 """
 Training-service FastAPI application.
-Serves the training dashboard and exposes endpoints to trigger and monitor training,
-list and promote models, and retrieve learning insights.
+Exposes REST API endpoints for training intelligence.
 """
 import os
-import subprocess
 import logging
 import json
 from datetime import datetime
 from fastapi import FastAPI, BackgroundTasks, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
-from starlette.requests import Request
+from fastapi.responses import JSONResponse
 import joblib
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -33,7 +29,7 @@ try:
 except ImportError:
     HAS_INSIGHTS = False
 
-# Database is always available because we use SQLAlchemy
+# Database is always available
 HAS_DB = True
 
 app = FastAPI(title="Training Intelligence", version="1.0")
@@ -41,9 +37,6 @@ app = FastAPI(title="Training Intelligence", version="1.0")
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Templates (ensure you have a 'templates' folder)
-templates = Jinja2Templates(directory="templates")
 
 # Service URL – can be overridden by environment variable
 SERVICE_URL = os.environ.get('SERVICE_URL', "https://training-service-5e9v.onrender.com")
@@ -210,9 +203,14 @@ def get_summary_metrics():
 # ----------------------------------------------------------------------
 # Routes
 # ----------------------------------------------------------------------
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse("dashboard.html", {"request": request, "service_url": SERVICE_URL})
+@app.get("/")
+async def root():
+    """Root endpoint – returns service status."""
+    return JSONResponse(content={
+        "message": "Training Service is running",
+        "service_url": SERVICE_URL,
+        "status": "healthy"
+    })
 
 @app.get("/api/status")
 async def status():
