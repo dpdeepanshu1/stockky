@@ -704,6 +704,18 @@ async def run_scan_async(task_id: str, universe: List[str]):
                         reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
                         normalized["reasons"] = reasons
 
+                # --- NEW: Retrieve GenAI prediction note ---
+                if normalized.get("prediction_score") is None:
+                    try:
+                        pred_resp = await client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=60)
+                        if pred_resp.status_code == 200:
+                            pred_data = pred_resp.json()
+                            if pred_data.get("model_loaded"):
+                                normalized["prediction_score"] = pred_data.get("prediction_score")
+                                normalized["prediction_note"] = pred_data.get("note")
+                    except Exception as e:
+                        logger.warning(f"Prediction service lookup failed during scan for {symbol}: {e}")
+
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
             except httpx.HTTPError as e:

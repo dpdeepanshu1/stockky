@@ -4,23 +4,18 @@ Event Tracker Service v0.3.1
 Tracks material corporate events for subscribed NSE symbols.
 State is persisted in Upstash Redis so restarts don't lose subscriptions.
 
-v0.3.1 changes:
-  - Added /symbols_with_events endpoint to return symbols with upcoming events.
-  - Aggregated list is cached in Redis for 1 hour.
-
-Data sources (yfinance — free, no API key):
-  - Earnings calendar, dividends, splits
-  - Insider transactions & purchases
-  - Analyst upgrades/downgrades
-  - Institutional holders
-  - Latest news headlines
-
-NSE/BSE direct endpoints return 403 from all cloud environments.
+v0.3.1 changes (merged from v0.3.0 + v0.3.1):
+  - Added /symbols_with_events endpoint with Redis caching (1hr TTL).
+  - Added earnings_surprise, bulk_deals, fii_dii_net_flow fields.
+  - Improved earnings date fetching using ticker.get_earnings_dates().
+  - Extended /check diff to include earnings surprise and bulk deals.
+  - Retained robust fallback caching, retry logic, and rate‑limit handling.
 """
 import os
 import json
 import math
 import time
+import random
 import logging
 from datetime import datetime, timedelta
 from typing import List
@@ -37,11 +32,13 @@ logger = logging.getLogger("event-tracker-service")
 app = FastAPI(title="Stockky Event Tracker Service", version="0.3.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-EVENT_CACHE_TTL = 4 * 3600  # 4 hours — events don't change minute-to-minute
+EVENT_CACHE_TTL = 4 * 3600          # 4 hours — events don't change minute-to-minute
+EVENT_FALLBACK_TTL = 30 * 24 * 3600 # 30 days for last‑known‑good fallback
 STATE_KEY = "stockky:event_state"
 EVENT_CACHE_PREFIX = "stockky:event:"
-EVENTS_LIST_CACHE_KEY = "stockky:events_list"      # NEW: cache for symbols_with_events
-EVENTS_LIST_CACHE_TTL = 3600                      # 1 hour
+EVENT_FALLBACK_PREFIX = "stockky:event:fallback:"
+EVENTS_LIST_CACHE_KEY = "stockky:events_list"
+EVENTS_LIST_CACHE_TTL = 3600        # 1 hour
 
 # ── Redis ──────────────────────────────────────────────────────────────────────
 _redis = None
@@ -105,16 +102,22 @@ def _safe_float(val):
         return None
 
 
-def _yf_call(fn, label: str, sym: str):
-    """Safely call a yfinance property, returning None on any error."""
-    try:
-        return fn()
-    except Exception as e:
-        logger.warning("%s unavailable for %s: %s", label, sym, e)
-        return None
+def _yf_call(fn, label: str, sym: str, max_retries: int = 3, base_delay: float = 2):
+    """Safely call a yfinance property, retrying transient failures with
+    jittered backoff, returning None only if every attempt fails."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.warning("%s unavailable for %s after %d attempts: %s", label, sym, max_retries, e)
+                return None
+            wait = random.uniform(0, base_delay * (2 ** attempt))
+            logger.info("%s retry %d/%d for %s after %.1fs: %s", label, attempt + 1, max_retries, sym, wait, e)
+            time.sleep(wait)
 
 
-# ── Core event fetch (with Redis cache) ───────────────────────────────────────
+# ── Core event fetch (with Redis cache and fallback) ─────────────────────────
 def _fetch_events(symbol: str, force: bool = False) -> dict:
     sym = _normalize(symbol)
     cache_key = f"{EVENT_CACHE_PREFIX}{sym}"
@@ -130,7 +133,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
     ticker = yf.Ticker(sym)
     ticker._tz = "Asia/Kolkata"
 
-    # 1. Earnings calendar (FIXED: using get_earnings_dates as calendar is flaky)
+    # 1. Earnings calendar (using get_earnings_dates for reliability)
     next_earnings = None
     earnings_dates = _yf_call(lambda: ticker.get_earnings_dates(limit=1), "Earnings dates", sym)
     if earnings_dates is not None and not earnings_dates.empty:
@@ -225,7 +228,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # Earnings surprise
+    # 8. Earnings surprise (new)
     earnings_surprise = None
     earnings_history = _yf_call(lambda: ticker.earnings_history, "Earnings history", sym)
     if earnings_history is not None and not earnings_history.empty:
@@ -244,10 +247,10 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # Bulk/Block deals (placeholder)
+    # 9. Bulk/Block deals (placeholder – can be extended later)
     bulk_deals = []
 
-    # FII/DII Net Flow (placeholder)
+    # 10. FII/DII Net Flow (placeholder)
     fii_dii_net_flow = None
 
     result = {
@@ -266,8 +269,29 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         "cached": False,
     }
 
-    # Cache for 4 hours
-    _redis_set(cache_key, {**result, "cached": True}, ttl=EVENT_CACHE_TTL)
+    fallback_key = f"{EVENT_FALLBACK_PREFIX}{sym}"
+    has_real_data = any([
+        next_earnings, last_dividend, last_split,
+        recent_insider, recent_analyst, institutional_holders, recent_news,
+        earnings_surprise, bulk_deals, fii_dii_net_flow,
+    ])
+
+    if has_real_data:
+        # Cache good data with normal TTL and also store as fallback
+        _redis_set(cache_key, {**result, "cached": True}, ttl=EVENT_CACHE_TTL)
+        _redis_set(fallback_key, result, ttl=EVENT_FALLBACK_TTL)
+        return result
+
+    # Live fetch returned empty – try to serve last‑known‑good fallback
+    stale = _redis_get(fallback_key)
+    if stale:
+        logger.info("Live fetch for %s came back empty; serving last-known-good fallback", sym)
+        stale = {**stale, "cached": True, "stale": True}
+        # Short TTL on the poisoned cache so we keep retrying the live path soon
+        _redis_set(cache_key, stale, ttl=900)
+        return stale
+
+    # Genuinely nothing available – return empty result
     return result
 
 
@@ -377,7 +401,7 @@ def check_for_changes():
                     f"Insider {txn.get('transaction')}: {txn.get('insider')} — {txn.get('shares')} shares"
                 )
 
-        # Earnings surprise changes
+        # Earnings surprise changed
         prev_surprise = previous.get("earnings_surprise") or {}
         cur_surprise = current.get("earnings_surprise") or {}
         if prev_surprise.get("surprise_pct") != cur_surprise.get("surprise_pct"):
