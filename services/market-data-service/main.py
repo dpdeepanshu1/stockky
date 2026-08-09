@@ -93,7 +93,7 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 
-app = FastAPI(title="Stockky Market Data Service", version="0.1.0")
+app = FastAPI(title="Stockky Market Data Service", version="0.1.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -170,7 +170,7 @@ class QuoteResponse(BaseModel):
 async def root():
     return {
         "service": "Stockky Market Data Service",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "status": "running",
         "cache_enabled": bool(cache),
         "endpoints": {
@@ -186,7 +186,7 @@ async def root():
 def health():
     return {"status": "ok", "service": "market-data-service", "cache": bool(cache)}
 
-# --- NEW: Yahoo Raw API Fallback ---
+# --- Yahoo Raw API Fallback (Secondary) ---
 def _fetch_price_from_yahoo_raw(symbol: str) -> Optional[float]:
     try:
         # Try with the exact symbol (e.g. MVELECTRO.NS), then without suffix
@@ -206,7 +206,7 @@ def _fetch_price_from_yahoo_raw(symbol: str) -> Optional[float]:
         logger.warning(f"Yahoo Raw API fallback failed: {e}")
     return None
 
-# --- NEW: NSE India Official API Fallback ---
+# --- NEW: NSE India Official API (Primary Source for Indian Stocks) ---
 _nse_headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -253,82 +253,100 @@ def get_quote(symbol: str):
     if cached:
         return cached
 
-    ticker = yf.Ticker(sym)
-    ticker._tz = "Asia/Kolkata"
-    try:
-        info = ticker.info
-    except Exception:
-        info = {}
-    
-    # UPDATED: If yfinance gives no info, try Alpha Vantage as a fallback
-    if not info:
-        price = None
-        if ALPHA_VANTAGE_API_KEY:
-            # Try with the exact sym (e.g., MVELECTRO.NS) then without .NS
-            possible_symbols = [sym, sym.replace(".NS", "")]
-            for alpha_sym in possible_symbols:
-                try:
-                    alpha_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={alpha_sym}&apikey={ALPHA_VANTAGE_API_KEY}"
-                    alpha_resp = httpx.get(alpha_url, timeout=10)
-                    if alpha_resp.status_code == 200:
-                        alpha_data = alpha_resp.json()
-                        quote = alpha_data.get("Global Quote", {})
-                        if quote:
-                            price = _safe(quote.get("05. price"))
-                            if price is not None:
-                                logger.info(f"Alpha Vantage fallback found price for {alpha_sym}: {price}")
-                                break
-                except Exception as e:
-                    logger.warning(f"Alpha Vantage fallback for {alpha_sym} failed: {e}")
+    # 1. Primary Source: NSE India Official API (Best for new Indian stocks)
+    nse_data = _fetch_nse_quote(sym)
+    if nse_data:
+        price = _safe(nse_data.get("priceInfo", {}).get("lastPrice"))
+        if price is not None:
+            result = {
+                "symbol": sym,
+                "name": nse_data.get("securityInfo", {}).get("symbol") or sym,
+                "price": price,
+                "previous_close": _safe(nse_data.get("priceInfo", {}).get("previousClose")),
+                "day_change_pct": _safe(nse_data.get("priceInfo", {}).get("pChange")),
+                "day_high": _safe(nse_data.get("priceInfo", {}).get("dayHigh")),
+                "day_low": _safe(nse_data.get("priceInfo", {}).get("dayLow")),
+                "volume": _safe_int(nse_data.get("priceInfo", {}).get("totalTradedVolume")),
+                "market_cap": _safe(nse_data.get("priceInfo", {}).get("marketCap")),
+                "pe_ratio": _safe(nse_data.get("priceInfo", {}).get("pe")),
+                "fetched_at": datetime.utcnow().isoformat(),
+            }
+            _cache_set(cache_key, result, ttl=300)
+            return result
 
-        # Try Yahoo Raw API if Alpha Vantage failed
-        if price is None:
-            price = _fetch_price_from_yahoo_raw(sym)
+    # 2. Secondary: Alpha Vantage
+    price = None
+    if ALPHA_VANTAGE_API_KEY:
+        # Try with the exact sym (e.g., MVELECTRO.NS) then without .NS
+        possible_symbols = [sym, sym.replace(".NS", "")]
+        for alpha_sym in possible_symbols:
+            try:
+                alpha_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={alpha_sym}&apikey={ALPHA_VANTAGE_API_KEY}"
+                alpha_resp = httpx.get(alpha_url, timeout=10)
+                if alpha_resp.status_code == 200:
+                    alpha_data = alpha_resp.json()
+                    quote = alpha_data.get("Global Quote", {})
+                    if quote:
+                        price = _safe(quote.get("05. price"))
+                        if price is not None:
+                            logger.info(f"Alpha Vantage fallback found price for {alpha_sym}: {price}")
+                            break
+            except Exception as e:
+                logger.warning(f"Alpha Vantage fallback for {alpha_sym} failed: {e}")
 
-        # NEW: Try NSE Official API if Yahoo Raw failed
-        if price is None:
-            nse_data = _fetch_nse_quote(sym)
-            if nse_data:
-                price = _safe(nse_data.get("priceInfo", {}).get("lastPrice"))
-                if price is not None:
-                    logger.info(f"NSE fallback found price for {sym}: {price}")
+    # Try Yahoo Raw API if Alpha Vantage failed
+    if price is None:
+        price = _fetch_price_from_yahoo_raw(sym)
 
-        result = {
-            "symbol": sym,
-            "name": sym,
-            "price": price,
-            "previous_close": None,
-            "day_change_pct": None,
-            "day_high": None,
-            "day_low": None,
-            "volume": None,
-            "market_cap": None,
-            "pe_ratio": None,
-            "fetched_at": datetime.utcnow().isoformat(),
-        }
-        _cache_set(cache_key, result, ttl=300)
-        return result
+    # If we still have no price, fallback to yfinance
+    if price is None:
+        ticker = yf.Ticker(sym)
+        ticker._tz = "Asia/Kolkata"
+        try:
+            info = ticker.info
+        except Exception:
+            info = {}
+        
+        if info:
+            price = info.get("regularMarketPrice") or info.get("last_price")
+            prev_close = info.get("previousClose")
+            change_pct = None
+            if price and prev_close:
+                change_pct = round(((price - prev_close) / prev_close) * 100, 2)
 
-    price = info.get("regularMarketPrice") or info.get("last_price")
-    prev_close = info.get("previousClose")
-    change_pct = None
-    if price and prev_close:
-        change_pct = round(((price - prev_close) / prev_close) * 100, 2)
+            result = {
+                "symbol": sym,
+                "name": info.get("longName") or info.get("shortName") or sym,
+                "price": price,
+                "previous_close": prev_close,
+                "day_change_pct": change_pct,
+                "day_high": info.get("dayHigh"),
+                "day_low": info.get("dayLow"),
+                "volume": info.get("volume"),
+                "market_cap": info.get("marketCap"),
+                "pe_ratio": info.get("trailingPE"),
+                "fetched_at": datetime.utcnow().isoformat(),
+            }
+            _cache_set(cache_key, result)
+            return result
+        else:
+            raise HTTPException(status_code=404, detail=f"Could not fetch quote for {sym}")
 
+    # If we extracted price via Alpha Vantage or Yahoo Raw, return a simplified response
     result = {
         "symbol": sym,
-        "name": info.get("longName") or info.get("shortName") or sym,
+        "name": sym,
         "price": price,
-        "previous_close": prev_close,
-        "day_change_pct": change_pct,
-        "day_high": info.get("dayHigh"),
-        "day_low": info.get("dayLow"),
-        "volume": info.get("volume"),
-        "market_cap": info.get("marketCap"),
-        "pe_ratio": info.get("trailingPE"),
+        "previous_close": None,
+        "day_change_pct": None,
+        "day_high": None,
+        "day_low": None,
+        "volume": None,
+        "market_cap": None,
+        "pe_ratio": None,
         "fetched_at": datetime.utcnow().isoformat(),
     }
-    _cache_set(cache_key, result)
+    _cache_set(cache_key, result, ttl=300)
     return result
 
 @app.get("/history/{symbol}")

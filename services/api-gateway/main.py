@@ -48,7 +48,7 @@ SYSTEM_SERVICES = {
     "notification": {"url": NOTIFICATION_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.1.0")
+app = FastAPI(title="Stockky API Gateway", version="2.1.1")
 
 # --- CORS Middleware (explicit) ---
 app.add_middleware(
@@ -257,7 +257,7 @@ def _get_news_mentioned_symbols() -> List[str]:
         )
         text = " ".join(e.title for e in feed.entries[:30]).upper()
         all_symbols = _get_all_nse_securities()
-        for sym in all_symbols[:200]:
+        for sym in all_symbols[:300]: # UPDATED: Increased to 300
             if sym in text:
                 mentioned.append(sym)
     except Exception as e:
@@ -274,7 +274,7 @@ def _build_scan_universe() -> List[str]:
     try:
         all_stocks = _get_all_nse_securities()
         if all_stocks:
-            universe.update(all_stocks[:100])
+            universe.update(all_stocks[:300]) # UPDATED: Increased to 300
         else:
             universe.update(_get_nifty_indices())
     except Exception as e:
@@ -321,7 +321,7 @@ def _build_scan_universe() -> List[str]:
         fallback = ["RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HCLTECH", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK"]
         clean = fallback
 
-    result = clean[:120]
+    result = clean[:300] # UPDATED: Increased to 300
     _redis_set(SCAN_UNIVERSE_KEY, result, ttl=21600)
     logger.info(f"Scan universe built: {len(result)} symbols")
     return result
@@ -333,7 +333,7 @@ def _get_all_known_symbols() -> Set[str]:
         return set(cached)
     combined = set()
     try:
-        combined.update(_get_all_nse_securities()[:200])
+        combined.update(_get_all_nse_securities()[:300]) # UPDATED: Increased to 300
     except:
         pass
     combined.update(_get_nifty_indices())

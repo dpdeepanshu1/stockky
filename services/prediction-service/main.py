@@ -73,7 +73,7 @@ if GEMINI_API_KEY:
 else:
     logger.warning("Gemini key is missing — no fallback provider if Groq fails")
 
-app = FastAPI(title="Stockky Prediction Service", version="0.5.0")
+app = FastAPI(title="Stockky Prediction Service", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _model = None
@@ -89,7 +89,7 @@ else:
 
 @app.get("/")
 async def root():
-    return {"service": "Stockky Prediction Service", "version": "0.5.0", "status": "running"}
+    return {"service": "Stockky Prediction Service", "version": "0.6.0", "status": "running"}
 
 
 @app.get("/health")
@@ -147,7 +147,7 @@ def _call_groq(system_prompt: str, user_prompt: str) -> str | None:
                     {"role": "user", "content": user_prompt},
                 ],
                 "temperature": 0.4,
-                "max_tokens": 150,
+                "max_tokens": 350,  # Increased from 150 to allow richer explanations
             },
             headers={
                 "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -175,7 +175,7 @@ def _call_gemini(system_prompt: str, user_prompt: str) -> str | None:
             json={
                 "system_instruction": {"parts": [{"text": system_prompt}]},
                 "contents": [{"parts": [{"text": user_prompt}]}],
-                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 200},
+                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 350},  # Increased
             },
             headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
             timeout=20,
@@ -191,7 +191,7 @@ def _call_gemini(system_prompt: str, user_prompt: str) -> str | None:
         return None
 
 
-def _generate_llm_note(features: dict, probability: float) -> str:
+def _generate_llm_note(features: dict, probability: float, symbol: str) -> str:
     fallback = f"Estimated {round(probability * 100)}% probability of a ~5%+ move within 10 trading days."
 
     # These are the ACTUAL keys latest_feature_vector() produces (see
@@ -207,27 +207,43 @@ def _generate_llm_note(features: dict, probability: float) -> str:
     ema20_vs_ema50 = features.get("ema20_over_ema50")
     ema50_vs_ema200 = features.get("ema50_over_ema200")
     vol_ratio = _describe_feature(features, "volume_ratio_20", "{:.2f}")
+    bb_pct = _describe_feature(features, "bb_pct", "{:.1f}")
+    dist_high = _describe_feature(features, "dist_from_20d_high_pct", "{:.1f}")
+    dist_low = _describe_feature(features, "dist_from_20d_low_pct", "{:.1f}")
+    atr_pct = _describe_feature(features, "atr_pct", "{:.1f}")
+    golden_cross = features.get("golden_cross", 0)
 
     trend_desc = "above" if (ema50_vs_ema200 or 0) > 1 else "below"
     price_desc = "above" if (close_vs_ema20 or 0) > 1 else "below"
     momentum_desc = "strengthening" if (ema20_vs_ema50 or 0) > 1 else "weakening"
+    golden_cross_desc = "Yes" if golden_cross == 1 else "No"
 
     system_prompt = (
-        "You are a concise stock market analyst. Given technical indicator readings, "
-        "explain in 2-3 short sentences why the model estimates the probability it does. "
-        "Be specific about which indicators support or contradict the estimate. Plain "
-        "English, no jargon dump, no financial advice disclaimers."
+        "You are a highly experienced stock market analyst. Given the technical indicator readings, "
+        "explain in 4-5 detailed sentences why the XGBoost model estimates the probability it does. "
+        "Be specific about which indicators support or contradict the estimate. Mention the RSI, ADX, "
+        "MACD, EMAs, and volume ratios. Explain the trend context and what it means for the price action. "
+        "Plain English, no jargon dump, no financial advice disclaimers, and avoid generic statements."
     )
     user_prompt = (
-        f"RSI(14): {rsi}. ADX(14) trend strength: {adx}. MACD histogram: {macd_hist}. "
-        f"Price is {price_desc} its 20-day EMA. Short-term momentum is {momentum_desc} "
-        f"(20 EMA vs 50 EMA). Price is {trend_desc} its long-term 200-day EMA trend line. "
-        f"20-day volume ratio: {vol_ratio}x average. "
-        f"Model's estimated probability of a 5%+ move in 10 trading days: {round(probability * 100)}%. "
-        "Explain the estimate."
+        f"Technical snapshot for {symbol}:\n"
+        f"- RSI(14): {rsi} (overbought/oversold/neutral)\n"
+        f"- ADX(14): {adx} (trend strength)\n"
+        f"- MACD Histogram: {macd_hist}\n"
+        f"- Price vs 20-day EMA: {price_desc} ({close_vs_ema20:.2f})\n"
+        f"- Short-term momentum (20 EMA vs 50 EMA): {momentum_desc}\n"
+        f"- Long-term trend (Price vs 200 EMA): {trend_desc}\n"
+        f"- 20-day volume ratio: {vol_ratio}x average\n"
+        f"- Golden Cross: {golden_cross_desc}\n"
+        f"- Distance from 20d high: {dist_high}%\n"
+        f"- Distance from 20d low: {dist_low}%\n"
+        f"- ATR %: {atr_pct}%\n"
+        f"- Bollinger Band % position: {bb_pct}%\n"
+        f"XGBoost model's estimated probability of a 5%+ move in 10 trading days: {round(probability * 100)}%.\n"
+        "Provide a detailed breakdown of why this probability is high, moderate, or low, and what it implies for the trader."
     )
 
-    # UPDATED: Try Gemini first, then Groq, then fallback.
+    # Try Gemini first, then Groq, then fallback.
     for call in (_call_gemini, _call_groq):
         note = call(system_prompt, user_prompt)
         if note:
@@ -236,21 +252,17 @@ def _generate_llm_note(features: dict, probability: float) -> str:
     return fallback
 
 
-# --------------------- NEW: Feature alignment ---------------------
+# --------------------- Feature alignment ---------------------
 def _align_features(features: dict, model) -> dict:
     """Return only the features that the model was trained on."""
     if hasattr(model, 'feature_names_in_'):
         expected = model.feature_names_in_
-        # Keep only features that exist in both
         aligned = {col: features[col] for col in expected if col in features}
-        # If any required feature is missing, it will raise later, but we at least align
         if len(aligned) != len(expected):
             missing = [col for col in expected if col not in aligned]
             logger.warning(f"Missing features: {missing}")
         return aligned
-    # If model doesn't store feature names, use all features (may cause issues)
     return features
-# -------------------------------------------------------------------
 
 
 @app.get("/predict/{symbol}")
@@ -267,20 +279,16 @@ def predict(symbol: str):
     features = latest_feature_vector(df)
     missing = [c for c in FEATURE_COLUMNS if c not in features]
     if missing:
-        # Only warn if some core features are missing; we'll still try to predict
         logger.warning(f"Missing features: {missing}")
 
-    # Align features to model's expectations
     aligned = _align_features(features, _model)
-
     X = pd.DataFrame([aligned])
-    # Ensure column order matches model's feature_names_
     if hasattr(_model, 'feature_names_in_'):
         X = X[_model.feature_names_in_]
 
     probability = float(_model.predict_proba(X)[0, 1])
     prediction_score = round(probability * 100)
-    llm_note = _generate_llm_note(features, probability)
+    llm_note = _generate_llm_note(features, probability, symbol)
     return {
         "symbol": symbol.upper(),
         "model_loaded": True,
