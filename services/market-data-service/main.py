@@ -26,7 +26,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# --- FIXED: Added missing httpx import ---
 import httpx
 
 # --- Patch yfinance session with a proper User-Agent ---
@@ -93,7 +92,7 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 
-app = FastAPI(title="Stockky Market Data Service", version="0.1.1")
+app = FastAPI(title="Stockky Market Data Service", version="0.1.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -170,7 +169,7 @@ class QuoteResponse(BaseModel):
 async def root():
     return {
         "service": "Stockky Market Data Service",
-        "version": "0.1.1",
+        "version": "0.1.2",
         "status": "running",
         "cache_enabled": bool(cache),
         "endpoints": {
@@ -189,7 +188,6 @@ def health():
 # --- Yahoo Raw API Fallback (Secondary) ---
 def _fetch_price_from_yahoo_raw(symbol: str) -> Optional[float]:
     try:
-        # Try with the exact symbol (e.g. MVELECTRO.NS), then without suffix
         for sym in [symbol, symbol.replace(".NS", "")]:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
             resp = httpx.get(url, timeout=5)
@@ -216,31 +214,35 @@ _nse_headers = {
 }
 
 def _fetch_nse_quote(symbol: str) -> Optional[dict]:
+    """Fetch quote from NSE India official API with robust cookie handling."""
     try:
-        client = httpx.Client(headers=_nse_headers, timeout=10)
-        client.get("https://www.nseindia.com") # Fetch cookies
         clean_sym = symbol.replace(".NS", "").replace(".BO", "")
-        url = f"https://www.nseindia.com/api/quote-equity?symbol={clean_sym}"
-        resp = client.get(url)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data and "priceInfo" in data:
-                return data
+        # Use a persistent client with cookie handling
+        with httpx.Client(headers=_nse_headers, timeout=15) as client:
+            # Fetch cookies from main page
+            client.get("https://www.nseindia.com")
+            time.sleep(0.5)  # Allow cookies to settle
+            url = f"https://www.nseindia.com/api/quote-equity?symbol={clean_sym}"
+            resp = client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and "priceInfo" in data:
+                    return data
     except Exception as e:
         logger.warning(f"NSE Quote fetch failed: {e}")
     return None
 
 def _fetch_nse_fundamentals(symbol: str) -> Optional[dict]:
     try:
-        client = httpx.Client(headers=_nse_headers, timeout=10)
-        client.get("https://www.nseindia.com")
         clean_sym = symbol.replace(".NS", "").replace(".BO", "")
-        url = f"https://www.nseindia.com/api/quote-equity?symbol={clean_sym}&section=secinfo"
-        resp = client.get(url)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data and "secInfo" in data:
-                return data
+        with httpx.Client(headers=_nse_headers, timeout=15) as client:
+            client.get("https://www.nseindia.com")
+            url = f"https://www.nseindia.com/api/quote-equity?symbol={clean_sym}&section=secinfo"
+            resp = client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and "secInfo" in data:
+                    return data
     except Exception as e:
         logger.warning(f"NSE Fundamentals fetch failed: {e}")
     return None
@@ -294,11 +296,11 @@ def get_quote(symbol: str):
             except Exception as e:
                 logger.warning(f"Alpha Vantage fallback for {alpha_sym} failed: {e}")
 
-    # Try Yahoo Raw API if Alpha Vantage failed
+    # 3. Tertiary: Yahoo Raw API
     if price is None:
         price = _fetch_price_from_yahoo_raw(sym)
 
-    # If we still have no price, fallback to yfinance
+    # 4. Final fallback: yfinance
     if price is None:
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
@@ -306,7 +308,7 @@ def get_quote(symbol: str):
             info = ticker.info
         except Exception:
             info = {}
-        
+
         if info:
             price = info.get("regularMarketPrice") or info.get("last_price")
             prev_close = info.get("previousClose")
@@ -329,25 +331,25 @@ def get_quote(symbol: str):
             }
             _cache_set(cache_key, result)
             return result
-        else:
-            raise HTTPException(status_code=404, detail=f"Could not fetch quote for {sym}")
 
-    # If we extracted price via Alpha Vantage or Yahoo Raw, return a simplified response
-    result = {
-        "symbol": sym,
-        "name": sym,
-        "price": price,
-        "previous_close": None,
-        "day_change_pct": None,
-        "day_high": None,
-        "day_low": None,
-        "volume": None,
-        "market_cap": None,
-        "pe_ratio": None,
-        "fetched_at": datetime.utcnow().isoformat(),
-    }
-    _cache_set(cache_key, result, ttl=300)
-    return result
+    if price is not None:
+        result = {
+            "symbol": sym,
+            "name": sym,
+            "price": price,
+            "previous_close": None,
+            "day_change_pct": None,
+            "day_high": None,
+            "day_low": None,
+            "volume": None,
+            "market_cap": None,
+            "pe_ratio": None,
+            "fetched_at": datetime.utcnow().isoformat(),
+        }
+        _cache_set(cache_key, result, ttl=300)
+        return result
+
+    raise HTTPException(status_code=404, detail=f"Could not fetch quote for {sym}")
 
 @app.get("/history/{symbol}")
 def get_history(
