@@ -1,11 +1,13 @@
 """
 Training script for training‑service.
 Uses financial ML best practices: walk‑forward, per‑fold scaling, financial metrics.
+Enhanced with model versioning, database logging, and configurable inputs.
 """
 import os
 import sys
 import json
 import logging
+import argparse
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -22,6 +24,20 @@ from walk_forward import WalkForwardSplitter
 from preprocessing import TimeAwareScaler
 from metrics import compute_all_metrics
 from trading import TradingSimulator
+
+# Optional imports for enhanced functionality
+try:
+    from models import ModelRegistry
+    HAS_MODEL_REGISTRY = True
+except ImportError:
+    HAS_MODEL_REGISTRY = False
+
+try:
+    import models as db_models
+    from sqlalchemy.orm import Session
+    HAS_DB = True
+except ImportError:
+    HAS_DB = False
 
 # If you have a features.py file, import it; otherwise define a minimal feature set.
 try:
@@ -50,7 +66,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("training-service")
 
 # ---------- Configuration ----------
-TRAINING_CONFIG = {
+DEFAULT_TRAINING_CONFIG = {
     "target_type": "Log_Return",          # "Log_Return", "Percentage_Return", "Directional"
     "forecast_horizon_days": 5,
     "validation_strategy": {
@@ -140,8 +156,31 @@ def build_multi_symbol_dataset(symbols, period="5y"):
     full = full.sort_values(['symbol','date']).reset_index(drop=True)
     return full
 
+def save_training_run_to_db(config, metrics, fold_details, model_version, dataset_size, num_symbols):
+    """Log training run details to the database (optional)."""
+    if not HAS_DB:
+        return
+    try:
+        db = Session()
+        run = db_models.TrainingRun(
+            run_timestamp=datetime.now(),
+            config=json.dumps(config),
+            dataset_size=dataset_size,
+            num_symbols=num_symbols,
+            model_version=model_version,
+            walk_forward_metrics=json.dumps(metrics),
+            fold_details=json.dumps(fold_details)
+        )
+        db.add(run)
+        db.commit()
+        logger.info("Training run logged to database")
+    except Exception as e:
+        logger.error(f"Failed to log training run to DB: {e}")
+    finally:
+        db.close()
+
 # ---------- Main Training Pipeline ----------
-def run_training_pipeline(config):
+def run_training_pipeline(config, config_path=None):
     np.random.seed(config['random_seed'])
     random.seed(config['random_seed'])
 
@@ -297,13 +336,19 @@ def run_training_pipeline(config):
     )
     final_model.fit(X_full_scaled, y_full)
 
-    # Save model, scaler, and config
-    joblib.dump(final_model, 'model.pkl')
-    joblib.dump(final_scaler, 'scaler.pkl')
-    with open('training_config.json', 'w') as f:
-        json.dump(config, f, indent=2)
-
-    logger.info("Production model saved as model.pkl")
+    # ---------- NEW: Use Model Registry for versioned storage ----------
+    model_version = None
+    if HAS_MODEL_REGISTRY:
+        registry = ModelRegistry()
+        model_version = registry.save_production_model(final_model, final_scaler, config, metrics)
+        logger.info(f"Production model saved with version: {model_version}")
+    else:
+        # Fallback: save as before
+        joblib.dump(final_model, 'model.pkl')
+        joblib.dump(final_scaler, 'scaler.pkl')
+        with open('training_config.json', 'w') as f:
+            json.dump(config, f, indent=2)
+        logger.info("Production model saved as model.pkl (legacy mode)")
 
     # 5. Prepare final report for dashboard
     report = {
@@ -313,17 +358,37 @@ def run_training_pipeline(config):
         'walk_forward_metrics': metrics,
         'fold_details': fold_reports,
         'production_model_saved': True,
+        'model_version': model_version,
         'config': config
     }
 
     joblib.dump(report, 'training_report.joblib')
     logger.info("Training report saved to training_report.joblib")
 
+    # ---------- NEW: Log training run to database ----------
+    if HAS_DB:
+        save_training_run_to_db(config, metrics, fold_reports, model_version, len(df), len(df['symbol'].unique()))
+
     return report
 
 # ---------- Entry point ----------
 if __name__ == '__main__':
-    # If you have a config file, load it; otherwise use the default.
-    config = TRAINING_CONFIG
-    # Optionally override with environment variables or command-line args
+    parser = argparse.ArgumentParser(description='Run Stockky training pipeline')
+    parser.add_argument('--config', type=str, help='Path to training config JSON file')
+    parser.add_argument('--no-db', action='store_true', help='Disable database logging')
+    args = parser.parse_args()
+
+    config = None
+    if args.config and os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            config = json.load(f)
+        logger.info(f"Loaded config from {args.config}")
+    else:
+        config = DEFAULT_TRAINING_CONFIG
+        logger.info("Using default configuration")
+
+    # Optionally override DB flag
+    if args.no_db:
+        HAS_DB = False
+
     run_training_pipeline(config)

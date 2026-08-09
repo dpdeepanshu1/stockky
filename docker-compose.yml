@@ -136,4 +136,17 @@ services:
       - ./data/training-db:/app/data
     depends_on:
       - market-data-service
-      - decision-engine-service      
+      - decision-engine-service    
+training-service:
+  build: ./training-service
+  ports:
+    - "5001:5001"
+  environment:
+    - SERVICE_URL=http://training-service:5001
+    - PORT=5001
+  volumes:
+    - ./training-service:/app
+  depends_on:
+    - market-data-service
+    - prediction-service
+  restart: unless-stopped        

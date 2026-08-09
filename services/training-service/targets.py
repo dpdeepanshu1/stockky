@@ -1,21 +1,20 @@
 """
-Target generation for financial time series.
-Supports Log Return, Percentage Return, and Directional (BUY/HOLD/SELL).
+Financial target generation for time-series forecasting.
+Supports Log Return, Percentage Return, and Directional Classification.
+[reference:16]
 """
 import numpy as np
 import pandas as pd
-from typing import Optional, Union, Tuple
+from typing import Optional, Tuple
 
 class TargetGenerator:
-    def __init__(self, target_type='Log_Return', forecast_horizon=5,
-                 classification_thresholds=None, price_col='close'):
-        """
-        Args:
-            target_type: 'Log_Return', 'Percentage_Return', or 'Directional'
-            forecast_horizon: number of days ahead to forecast
-            classification_thresholds: dict with 'buy' and 'sell' thresholds (for Directional)
-            price_col: name of the price column
-        """
+    def __init__(
+        self,
+        target_type: str = 'Log_Return',
+        forecast_horizon: int = 5,
+        classification_thresholds: Optional[dict] = None,
+        price_col: str = 'close'
+    ):
         self.target_type = target_type
         self.forecast_horizon = forecast_horizon
         self.price_col = price_col
@@ -23,12 +22,17 @@ class TargetGenerator:
             classification_thresholds = {'buy': 0.015, 'sell': -0.015}
         self.classification_thresholds = classification_thresholds
 
-    def generate(self, data: pd.DataFrame, inplace=False):
+    def generate(self, data: pd.DataFrame, inplace: bool = False):
+        """Generate targets from price data."""
         df = data.copy()
-        # Compute percentage return: (future_price / current_price) - 1
+        
+        # Percentage Return: (P[t+h] / P[t]) - 1
         df['pct_return'] = df[self.price_col].pct_change(self.forecast_horizon).shift(-self.forecast_horizon)
+        
+        # Log Return: log(P[t+h] / P[t])
         df['log_return'] = np.log(df[self.price_col].shift(-self.forecast_horizon) / df[self.price_col])
-        # Directional
+        
+        # Directional: BUY (1), HOLD (0), SELL (-1)
         df['directional'] = 0
         df.loc[df['pct_return'] > self.classification_thresholds['buy'], 'directional'] = 1
         df.loc[df['pct_return'] < self.classification_thresholds['sell'], 'directional'] = -1
@@ -41,16 +45,8 @@ class TargetGenerator:
             target = df['directional']
         else:
             raise ValueError(f"Unsupported target type: {self.target_type}")
+        
         if inplace:
             df['target'] = target
             return df
         return target, df
-
-    def validate(self, data):
-        if data.empty:
-            raise ValueError("Data is empty")
-        if self.price_col not in data.columns:
-            raise ValueError(f"Column {self.price_col} not found")
-        if len(data) < self.forecast_horizon + 1:
-            raise ValueError("Insufficient rows")
-        return True

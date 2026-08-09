@@ -366,7 +366,9 @@ export const api = {
   getTrainingStatus: () => request<TrainingModelStatus>("/training/status", undefined, 2, 30000),
 
   triggerTraining: () =>
-    request<{ status: string }>(
+    request<{
+        message: string; status: string 
+}>(
       "/training/train",
       { method: "POST" },
       2,

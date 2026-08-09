@@ -1,69 +1,83 @@
 """
-Database models for the Training Service.
+Model registry for production and candidate models.
+[reference:28]
 """
-from sqlalchemy import Column, String, Float, Integer, DateTime, JSON, Text
-from sqlalchemy.ext.declarative import declarative_base
+import joblib
+import os
+import json
 from datetime import datetime
+from typing import Dict, Optional
 
-Base = declarative_base()
+class ModelRegistry:
+    def __init__(self, model_dir: str = './models'):
+        self.model_dir = model_dir
+        os.makedirs(model_dir, exist_ok=True)
 
-class PredictionSnapshot(Base):
-    __tablename__ = "prediction_snapshots"
+    def save_production_model(self, model, scaler, config: Dict, metrics: Dict) -> str:
+        """Save production model with versioning."""
+        version = f"v{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        model_path = os.path.join(self.model_dir, f'production_{version}.pkl')
+        scaler_path = os.path.join(self.model_dir, f'production_{version}_scaler.pkl')
+        meta_path = os.path.join(self.model_dir, f'production_{version}_meta.json')
 
-    id = Column(Integer, primary_key=True, index=True)
-    prediction_id = Column(String, unique=True, index=True)
-    symbol = Column(String, index=True)
-    timestamp = Column(DateTime)
-    price = Column(Float)
-    decision = Column(String)
-    confidence = Column(Float)
-    entry_range = Column(String, nullable=True)
-    target = Column(Float, nullable=True)
-    stop_loss = Column(Float, nullable=True)
-    market_sentiment = Column(JSON)
-    features = Column(JSON)
-    created_at = Column(DateTime, default=datetime.now)
+        joblib.dump(model, model_path)
+        joblib.dump(scaler, scaler_path)
 
-class PredictionOutcome(Base):
-    __tablename__ = "prediction_outcomes"
+        metadata = {
+            'version': version,
+            'created_at': datetime.now().isoformat(),
+            'config': config,
+            'metrics': metrics,
+            'status': 'production'
+        }
 
-    id = Column(Integer, primary_key=True, index=True)
-    prediction_id = Column(String, index=True)
-    evaluation_period = Column(String)  # 'T+1', 'T+5'
-    evaluation_date = Column(DateTime)
-    open_price = Column(Float, nullable=True)
-    high_price = Column(Float, nullable=True)
-    low_price = Column(Float, nullable=True)
-    close_price = Column(Float, nullable=True)
-    max_favorable_excursion = Column(Float, nullable=True)
-    max_adverse_excursion = Column(Float, nullable=True)
-    return_pct = Column(Float, nullable=True)
-    entry_reached = Column(Integer, default=0)  # boolean
-    target_reached = Column(Integer, default=0)  # boolean
-    stop_loss_reached = Column(Integer, default=0)  # boolean
-    direction_correct = Column(Integer, default=0)  # boolean
-    success = Column(Integer, default=0)  # boolean
+        with open(meta_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
 
-class TrainingRun(Base):
-    __tablename__ = "training_runs"
+        # Update production pointer
+        with open(os.path.join(self.model_dir, 'production_pointer.json'), 'w') as f:
+            json.dump({'version': version, 'path': model_path}, f)
 
-    id = Column(Integer, primary_key=True, index=True)
-    run_date = Column(DateTime, default=datetime.now)
-    model_version = Column(String)
-    dataset_start = Column(DateTime)
-    dataset_end = Column(DateTime)
-    features_used = Column(JSON)
-    parameters = Column(JSON)
-    metrics = Column(JSON)
-    status = Column(String)  # 'running', 'completed', 'failed'
+        return version
 
-class ModelVersion(Base):
-    __tablename__ = "model_versions"
+    def save_candidate_model(self, model, scaler, config: Dict, metrics: Dict) -> str:
+        """Save candidate model for validation."""
+        version = f"candidate_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        model_path = os.path.join(self.model_dir, f'{version}.pkl')
+        scaler_path = os.path.join(self.model_dir, f'{version}_scaler.pkl')
+        meta_path = os.path.join(self.model_dir, f'{version}_meta.json')
 
-    id = Column(Integer, primary_key=True, index=True)
-    version = Column(String, unique=True)
-    training_run_id = Column(Integer)
-    status = Column(String)  # 'candidate', 'production', 'archived'
-    metrics = Column(JSON)
-    created_at = Column(DateTime, default=datetime.now)
-    promoted_at = Column(DateTime, nullable=True)
+        joblib.dump(model, model_path)
+        joblib.dump(scaler, scaler_path)
+
+        metadata = {
+            'version': version,
+            'created_at': datetime.now().isoformat(),
+            'config': config,
+            'metrics': metrics,
+            'status': 'candidate'
+        }
+
+        with open(meta_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        return version
+
+    def get_production_model(self):
+        """Load the current production model."""
+        pointer_path = os.path.join(self.model_dir, 'production_pointer.json')
+        if not os.path.exists(pointer_path):
+            return None, None
+
+        with open(pointer_path, 'r') as f:
+            pointer = json.load(f)
+
+        model_path = pointer.get('path')
+        if not model_path or not os.path.exists(model_path):
+            return None, None
+
+        model = joblib.load(model_path)
+        scaler_path = model_path.replace('.pkl', '_scaler.pkl')
+        scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+
+        return model, scaler
