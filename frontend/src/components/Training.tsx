@@ -1,7 +1,7 @@
 // frontend/src/components/Training.tsx
 
 import { useEffect, useState } from "react";
-import { api, TrainingModelStatus } from "../api";  // ← fixed import
+import { api, TrainingModelStatus } from "../api";
 
 export default function Training() {
   const [status, setStatus] = useState<TrainingModelStatus | null>(null);
@@ -37,6 +37,7 @@ export default function Training() {
 
     try {
       const response = await api.triggerTraining();
+      // response is { status: string }
       if (response.status === "success" || response.status === "started") {
         showToast("success", "✅ Training triggered successfully! The model will be updated shortly.");
         setTimeout(() => {
@@ -44,7 +45,7 @@ export default function Training() {
           setTraining(false);
         }, 3000);
       } else {
-        showToast("error", "⚠️ Training failed: " + (response.message || "Unknown error"));
+        showToast("error", `⚠️ Training failed with status: ${response.status}`);
         setTraining(false);
       }
     } catch (err) {
@@ -53,6 +54,7 @@ export default function Training() {
     }
   };
 
+  // ── FIX: Accept string | null | undefined ──
   const formatDate = (dateStr: string | null | undefined) => {
     if (!dateStr) return "Never";
     return new Date(dateStr).toLocaleString("en-IN", {
