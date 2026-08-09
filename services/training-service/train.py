@@ -68,13 +68,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("training-service")
 
 # ---------- Configuration ----------
+# Reduced symbol set and shorter period to avoid rate limits
 DEFAULT_SYMBOLS = [
-    "TCS", "INFY", "HDFCBANK", "ICICIBANK", "RELIANCE", "HCLTECH",
-    "WIPRO", "COFORGE", "ANGELONE", "ADANIPOWER", "BEL", "HAL",
-    "SBIN", "AXISBANK", "KOTAKBANK", "LT", "MARUTI", "SUNPHARMA",
-    "TITAN", "ITC", "BAJFINANCE", "ASIANPAINT", "NESTLEIND", "ULTRACEMCO",
-    "BHARTIARTL", "M&M", "SHRIRAMFIN", "DMART", "CHOLAFIN", "PHOENIXLTD",
-    "FORTIS", "CUMMINSIND", "SYRMA", "ADANIPORTS", "HINDALCO", "AUROPHARMA"
+    "TCS", "INFY", "RELIANCE", "HDFCBANK", "ICICIBANK",
+    "HCLTECH", "SBIN", "LT", "MARUTI", "SUNPHARMA"
 ]
 
 DEFAULT_TRAINING_CONFIG = {
@@ -82,9 +79,9 @@ DEFAULT_TRAINING_CONFIG = {
     "forecast_horizon_days": 5,
     "validation_strategy": {
         "method": "WalkForward",
-        "train_window_size": 252,
-        "validation_window_size": 63,
-        "step_size": 63,
+        "train_window_size": 126,    # reduced
+        "validation_window_size": 21,
+        "step_size": 21,
         "embargo_days": 5
     },
     "preprocessing": {
@@ -93,7 +90,7 @@ DEFAULT_TRAINING_CONFIG = {
     "model": {
         "max_depth": 4,
         "learning_rate": 0.05,
-        "n_estimators": 200,
+        "n_estimators": 150,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
         "reg_alpha": 0.5,
@@ -110,12 +107,12 @@ DEFAULT_TRAINING_CONFIG = {
     "random_seed": 42,
     "data": {
         "symbols": DEFAULT_SYMBOLS,
-        "period": "5y"
+        "period": "2y"   # only 2 years to reduce download
     }
 }
 
 # ---------- Helpers ----------
-def fetch_symbol_data(symbol, period="5y", max_retries=5):
+def fetch_symbol_data(symbol, period="2y", max_retries=5):
     """Fetch OHLCV data with exponential backoff for rate limits."""
     tickers = [f"{symbol}.NS", f"{symbol}.BO", symbol]
     for ticker in tickers:
@@ -129,7 +126,7 @@ def fetch_symbol_data(symbol, period="5y", max_retries=5):
                     break  # try next ticker
             except Exception as e:
                 if "Rate limit" in str(e) or "Too Many Requests" in str(e):
-                    wait = (2 ** attempt) * 5 + random.uniform(0, 5)
+                    wait = (2 ** attempt) * 10 + random.uniform(0, 10)
                     logger.warning(f"Rate limit for {ticker}, retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
                     time.sleep(wait)
                 else:
@@ -137,7 +134,7 @@ def fetch_symbol_data(symbol, period="5y", max_retries=5):
                     break
     return pd.DataFrame()
 
-def build_multi_symbol_dataset(symbols, period="5y"):
+def build_multi_symbol_dataset(symbols, period="2y"):
     """Build dataset with delays between symbols to avoid rate limits."""
     all_rows = []
     total = len(symbols)
@@ -153,14 +150,14 @@ def build_multi_symbol_dataset(symbols, period="5y"):
         df = df.dropna()
         feat = compute_feature_frame(df)
         feat = feat.dropna(subset=FEATURE_COLUMNS)
-        if len(feat) < 100:
+        if len(feat) < 50:
             logger.warning(f"Too few rows for {sym}: {len(feat)}")
             continue
         feat['symbol'] = sym
         feat['date'] = feat.index
         all_rows.append(feat)
-        # Polite delay between symbols
-        delay = 1.0 + random.uniform(0, 1.0)
+        # Longer delay between symbols (3-5 seconds)
+        delay = 3.0 + random.uniform(0, 2.0)
         time.sleep(delay)
     if not all_rows:
         raise ValueError("No data collected")

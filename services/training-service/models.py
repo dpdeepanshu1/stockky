@@ -9,7 +9,7 @@ Tables:
 """
 from datetime import datetime
 from sqlalchemy import (
-    Column, String, Float, Integer, Boolean, DateTime, JSON, Text, create_engine, inspect
+    Column, String, Float, Integer, Boolean, DateTime, JSON, Text, create_engine, inspect, text
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -127,44 +127,46 @@ def ensure_schema(engine):
     """Add missing columns to existing tables if needed."""
     inspector = inspect(engine)
     table_name = "prediction_snapshots"
-    if inspector.has_table(table_name):
-        existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
-        required_columns = {
-            'combined_score': 'FLOAT',
-            'technical_score': 'FLOAT',
-            'fundamental_score': 'FLOAT',
-            'news_score': 'FLOAT',
-            'prediction_score': 'FLOAT',
-            'market_score': 'FLOAT',
-            'market_sentiment_adjustment': 'FLOAT',
-            'training_score': 'FLOAT',
-            'entry_range_low': 'FLOAT',
-            'entry_range_high': 'FLOAT',
-            'support': 'FLOAT',
-            'resistance': 'FLOAT',
-            'market_mood': 'VARCHAR(20)',
-            'nifty_change_pct': 'FLOAT',
-            'sensex_change_pct': 'FLOAT',
-            'rsi': 'FLOAT',
-            'macd': 'VARCHAR(20)',
-            'ema': 'VARCHAR(20)',
-            'volume_ratio': 'FLOAT',
-            'debt_to_equity': 'FLOAT',
-            'roe': 'FLOAT',
-            'roce': 'FLOAT',
-            'feature_snapshot': 'JSON',
-            'model_version': 'VARCHAR(50)',
-            't1_success': 'INTEGER',
-            't5_success': 'INTEGER',
-            'overall_success': 'INTEGER',
-        }
-        with engine.connect() as conn:
-            for col_name, col_type in required_columns.items():
-                if col_name not in existing_columns:
-                    alter_sql = f'ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}'
-                    conn.execute(alter_sql)
-                    conn.commit()
-                    print(f"Added column {col_name} to {table_name}")
+    if not inspector.has_table(table_name):
+        return
+
+    existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
+    required_columns = {
+        'combined_score': 'FLOAT',
+        'technical_score': 'FLOAT',
+        'fundamental_score': 'FLOAT',
+        'news_score': 'FLOAT',
+        'prediction_score': 'FLOAT',
+        'market_score': 'FLOAT',
+        'market_sentiment_adjustment': 'FLOAT',
+        'training_score': 'FLOAT',
+        'entry_range_low': 'FLOAT',
+        'entry_range_high': 'FLOAT',
+        'support': 'FLOAT',
+        'resistance': 'FLOAT',
+        'market_mood': 'VARCHAR(20)',
+        'nifty_change_pct': 'FLOAT',
+        'sensex_change_pct': 'FLOAT',
+        'rsi': 'FLOAT',
+        'macd': 'VARCHAR(20)',
+        'ema': 'VARCHAR(20)',
+        'volume_ratio': 'FLOAT',
+        'debt_to_equity': 'FLOAT',
+        'roe': 'FLOAT',
+        'roce': 'FLOAT',
+        'feature_snapshot': 'JSON',
+        'model_version': 'VARCHAR(50)',
+        't1_success': 'INTEGER',
+        't5_success': 'INTEGER',
+        'overall_success': 'INTEGER',
+    }
+    with engine.connect() as conn:
+        for col_name, col_type in required_columns.items():
+            if col_name not in existing_columns:
+                alter_sql = f'ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}'
+                conn.execute(text(alter_sql))
+                conn.commit()
+                print(f"Added column {col_name} to {table_name}")
 
 
 # ---------- Database setup helpers ----------

@@ -33,6 +33,9 @@ try:
 except ImportError:
     HAS_INSIGHTS = False
 
+# Database is always available because we use SQLAlchemy
+HAS_DB = True
+
 app = FastAPI(title="Training Intelligence", version="1.0")
 
 # Setup logging
