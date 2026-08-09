@@ -131,16 +131,12 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
     ticker = yf.Ticker(sym)
     ticker._tz = "Asia/Kolkata"
 
-    # 1. Earnings calendar
+    # 1. Earnings calendar (FIXED: using get_earnings_dates as calendar is flaky)
     next_earnings = None
-    cal = _yf_call(lambda: ticker.calendar, "Earnings calendar", sym)
-    if cal is not None:
+    earnings_dates = _yf_call(lambda: ticker.get_earnings_dates(limit=1), "Earnings dates", sym)
+    if earnings_dates is not None and not earnings_dates.empty:
         try:
-            if isinstance(cal, dict) and cal.get("Earnings Date"):
-                dates = cal["Earnings Date"]
-                next_earnings = str(dates[0]) if isinstance(dates, list) else str(dates)
-            elif hasattr(cal, "empty") and not cal.empty and "Earnings Date" in cal.index:
-                next_earnings = str(cal.loc["Earnings Date"].iloc[0])
+            next_earnings = str(earnings_dates.index[0].date())
         except Exception:
             pass
 
