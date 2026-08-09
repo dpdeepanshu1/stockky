@@ -1,13 +1,12 @@
 """
-Decision Engine Service v0.3.1
+Decision Engine Service v0.3.2
 --------------------------------
 Combines Technical + Fundamental + News + Event + Prediction scores.
 
-v0.3.1 changes:
-  - Added `WAIT` decision state for newly listed / insufficient data stocks with positive news.
-  - Refined `data_insufficient` flag to strictly check for missing price data.
-  - Improved fallback messages for fundamental scores to clarify "default values".
-  - Added `fundamental_fallback` flag to the API response for UI visibility.
+v0.3.2 changes:
+  - Fixed int conversion errors when news_score or prediction_score is None.
+  - Wrapped entire /decide endpoint in try/except to always return 200 with fallback values.
+  - Improved error logging for debugging.
 """
 import os
 import asyncio
@@ -32,7 +31,7 @@ PREDICTION_URL  = os.getenv("PREDICTION_URL",   "https://prediction-service-wowb
 EARNINGS_RISK_DAYS   = 3
 EARNINGS_BOOST_DAYS  = 7
 
-app = FastAPI(title="Stockky Decision Engine", version="0.3.1")
+app = FastAPI(title="Stockky Decision Engine", version="0.3.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -57,7 +56,7 @@ class Decision(str, Enum):
 
 @app.get("/")
 def root():
-    return {"service": "Stockky Decision Engine", "version": "0.3.1", "status": "running"}
+    return {"service": "Stockky Decision Engine", "version": "0.3.2", "status": "running"}
 
 
 @app.get("/health")
@@ -168,8 +167,6 @@ def _extract_event_signals(events: dict | None) -> dict:
                 delta -= 3
                 reasons.append(f"📉 FII/DII net outflow negative")
 
-    # Recent news sentiment (already handled by news_score; but we can add events)
-    # Keep overall delta within bounds
     return {
         "event_score_delta": max(-15, min(15, delta)),
         "event_risk": event_risk,
@@ -282,7 +279,7 @@ async def decide(symbol: str, already_owned: bool = False):
         # ── Extract scores ─────────────────────────────────────────────────────
         data_insufficient = False
 
-        # FIX: If Technical service fails, default to Neutral (50)
+        # Technical – default to 50 if missing
         if not technical or not isinstance(technical, dict):
             technical = {
                 "technical_score": 50,
@@ -291,11 +288,10 @@ async def decide(symbol: str, already_owned: bool = False):
                 "close": None, "support": None, "resistance": None,
                 "reasons": ["Technical service temporarily unavailable"],
             }
-        # FIX: Only set insufficient to True if we explicitly lack price data
         if technical.get("close") is None:
             data_insufficient = True
 
-        # FIX: If Fundamental service fails, default to Neutral (50) and flag fallback
+        # Fundamental – default to 50 if missing
         if not fundamental or not isinstance(fundamental, dict):
             fundamental = {
                 "fundamental_score": 50,
@@ -308,8 +304,25 @@ async def decide(symbol: str, already_owned: bool = False):
 
         technical_score   = int(technical.get("technical_score", 50))
         fundamental_score = int(fundamental.get("fundamental_score", 50))
-        news_score        = int(news["news_score"]) if news and "news_score" in news else None
-        prediction_score  = int(prediction["prediction_score"]) if prediction and prediction.get("model_loaded") else None
+
+        # 🔥 SAFE CONVERSION: handle None values
+        news_score = None
+        if news and "news_score" in news:
+            val = news["news_score"]
+            if val is not None:
+                try:
+                    news_score = int(val)
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid news_score for {symbol}: {val}")
+
+        prediction_score = None
+        if prediction and prediction.get("model_loaded"):
+            val = prediction.get("prediction_score")
+            if val is not None:
+                try:
+                    prediction_score = int(val)
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid prediction_score for {symbol}: {val}")
 
         if technical.get("data_insufficient"):
             data_insufficient = True
@@ -400,7 +413,7 @@ async def decide(symbol: str, already_owned: bool = False):
             "valuation":        fundamental.get("valuation", "fair"),
             "sector":           fundamental.get("sector"),
             "data_insufficient": data_insufficient,
-            "fundamental_fallback": fundamental.get("fallback_used", False), # Signal to Frontend
+            "fundamental_fallback": fundamental.get("fallback_used", False),
         }
 
         if news and isinstance(news, dict):
@@ -418,8 +431,35 @@ async def decide(symbol: str, already_owned: bool = False):
         return response
 
     except Exception as e:
-        logger.error(f"Decision failed for {symbol}: {e}")
-        raise HTTPException(status_code=502, detail=f"Decision failed: {str(e)}")
+        logger.error(f"Decision failed for {symbol}: {e}", exc_info=True)
+        # 🛡️ Always return a 200 with fallback values, never crash
+        return {
+            "symbol": symbol.upper(),
+            "decision": "DO NOT BUY",
+            "confidence": "Low",
+            "combined_score": 0,
+            "technical_score": 50,
+            "fundamental_score": 50,
+            "news_score": None,
+            "prediction_score": None,
+            "event_risk": False,
+            "entry_range": None,
+            "target": None,
+            "stop_loss": None,
+            "holding_period": "N/A",
+            "close": None,
+            "support": None,
+            "resistance": None,
+            "reasons": {
+                "technical": ["Data unavailable"],
+                "fundamental": ["Data unavailable"]
+            },
+            "valuation": "fair",
+            "sector": None,
+            "data_insufficient": True,
+            "fundamental_metrics": {},
+            "fundamental_fallback": True,
+        }
 
 
 if __name__ == "__main__":
