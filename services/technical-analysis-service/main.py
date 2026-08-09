@@ -24,7 +24,7 @@ logger = logging.getLogger("technical-analysis-service")
 
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
 
-app = FastAPI(title="Stockky Technical Analysis Service", version="0.2.0")
+app = FastAPI(title="Stockky Technical Analysis Service", version="0.2.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -157,7 +157,7 @@ def health():
 
 @app.get("/")
 def root():
-    return {"service": "technical-analysis-service", "status": "ok",
+    return {"service": "technical-analysis-service", "version": "0.2.1", "status": "ok",
             "endpoints": ["/health", "/analyze/{symbol}"]}
 
 
