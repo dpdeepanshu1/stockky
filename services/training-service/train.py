@@ -371,6 +371,49 @@ def run_training_pipeline(config, config_path=None):
 
     return report
 
+# ============================================================
+# Entry point for FastAPI background task (FIX for ImportError)
+# ============================================================
+def train_model(db_session, model_store_path: str):
+    """
+    Training entry point called by main.py.
+    
+    Args:
+        db_session: SQLAlchemy session (optional, kept for compatibility)
+        model_store_path: Path to store trained models
+    """
+    logger.info("=" * 60)
+    logger.info("TRAINING STARTED (via train_model)")
+    logger.info("=" * 60)
+    
+    # Override model store path if provided
+    if model_store_path:
+        os.environ["MODEL_STORE_PATH"] = model_store_path
+    
+    # Run the existing training pipeline
+    config = DEFAULT_TRAINING_CONFIG.copy()
+    
+    # Optionally override config with environment variables
+    if os.getenv("TRAINING_CONFIG_PATH"):
+        try:
+            with open(os.getenv("TRAINING_CONFIG_PATH"), 'r') as f:
+                config.update(json.load(f))
+            logger.info(f"Loaded config from {os.getenv('TRAINING_CONFIG_PATH')}")
+        except Exception as e:
+            logger.warning(f"Could not load config file: {e}")
+    
+    try:
+        report = run_training_pipeline(config)
+        if report:
+            logger.info("Training completed successfully")
+            logger.info(f"Dataset size: {report.get('dataset_size', 0)}")
+            logger.info(f"Model version: {report.get('model_version', 'unknown')}")
+        else:
+            logger.error("Training pipeline returned no report")
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        raise
+
 # ---------- Entry point ----------
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run Stockky training pipeline')
