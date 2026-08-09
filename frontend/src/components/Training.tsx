@@ -1,20 +1,36 @@
 // frontend/src/components/Training.tsx
 
-import { useEffect, useState } from "react";
-import { api, TrainingModelStatus } from "../api";
+import { useEffect, useState, useRef } from "react";
+import { api, TrainingStatusResponse } from "../api";
 
 export default function Training() {
-  const [status, setStatus] = useState<any>(null); // we'll use a broader type
+  const [status, setStatus] = useState<TrainingStatusResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [training, setTraining] = useState(false);
+  const [trainingStartTime, setTrainingStartTime] = useState<Date | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [showFolds, setShowFolds] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
+  
+  const timerIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const ESTIMATED_TOTAL_SECONDS = 300; // 5 minutes
 
   const fetchStatus = async () => {
     try {
       setLoading(true);
       const data = await api.getTrainingStatus();
       setStatus(data);
+      
+      // If training was in progress and now model exists with recent timestamp, stop training state
+      if (training && data.production_model_exists && data.last_training) {
+        const lastTrainingDate = new Date(data.last_training);
+        const now = new Date();
+        if ((now.getTime() - lastTrainingDate.getTime()) < 120000) {
+          stopTraining(true);
+        }
+      }
     } catch (err) {
       showToast("error", "Failed to fetch training status. Please refresh.");
     } finally {
@@ -24,6 +40,10 @@ export default function Training() {
 
   useEffect(() => {
     fetchStatus();
+    return () => {
+      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    };
   }, []);
 
   const showToast = (type: "success" | "error" | "info", message: string) => {
@@ -31,27 +51,61 @@ export default function Training() {
     setTimeout(() => setToast(null), 5000);
   };
 
+  const startTraining = () => {
+    setTraining(true);
+    setTrainingStartTime(new Date());
+    setElapsedSeconds(0);
+    
+    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+    timerIntervalRef.current = setInterval(() => {
+      setElapsedSeconds(prev => prev + 1);
+    }, 1000);
+
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    pollIntervalRef.current = setInterval(() => {
+      fetchStatus();
+    }, 5000);
+  };
+
+  const stopTraining = (success: boolean) => {
+    setTraining(false);
+    setTrainingStartTime(null);
+    if (timerIntervalRef.current) {
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
+    }
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    if (success) {
+      showToast("success", "✅ Training completed successfully! Model is deployed.");
+      fetchStatus();
+    } else {
+      showToast("error", "❌ Training failed or was interrupted.");
+    }
+  };
+
   const handleTriggerTraining = async () => {
     if (training) return;
-    setTraining(true);
-    showToast("info", "⏳ Training started... This may take a few minutes.");
-
+    
+    showToast("info", "⏳ Starting training...");
+    
     try {
       const response = await api.triggerTraining();
-      if (response.status === "success" || response.status === "started") {
-        showToast("success", "✅ Training triggered successfully! The model will be updated shortly.");
-        // Poll for status update after a delay
-        setTimeout(() => {
-          fetchStatus();
-          setTraining(false);
-        }, 3000);
+      if (response.status === "started" || response.status === "Training started successfully") {
+        startTraining();
+        showToast("info", "⏳ Training started. This may take a few minutes.");
       } else {
-        showToast("error", `⚠️ Training failed with status: ${response.status}`);
-        setTraining(false);
+        showToast("error", `⚠️ Training failed: ${response.status}`);
       }
-    } catch (err) {
-      showToast("error", "❌ Failed to trigger training. Please try again.");
-      setTraining(false);
+    } catch (err: any) {
+      if (err?.status === 409 || err?.message?.includes("409")) {
+        showToast("info", "⏳ Training already in progress. Resuming monitoring...");
+        startTraining();
+      } else {
+        showToast("error", "❌ Failed to trigger training. Please try again.");
+      }
     }
   };
 
@@ -66,13 +120,23 @@ export default function Training() {
     });
   };
 
-  // Helper to render metrics as a table
-  const renderMetrics = (metrics: any) => {
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const getEstimatedRemaining = () => {
+    const remaining = Math.max(0, ESTIMATED_TOTAL_SECONDS - elapsedSeconds);
+    if (remaining <= 0) return "Almost done...";
+    return formatTime(remaining);
+  };
+
+  const renderMetrics = (metrics: Record<string, number>) => {
     if (!metrics || Object.keys(metrics).length === 0) {
       return <p className="text-mist/40 text-sm">No walk‑forward metrics available.</p>;
     }
 
-    // Define display order and formatting
     const metricLabels: Record<string, string> = {
       SharpeRatio: "Sharpe Ratio",
       SortinoRatio: "Sortino Ratio",
@@ -86,17 +150,14 @@ export default function Training() {
       MAE: "MAE",
     };
 
-    const formatValue = (key: string, value: any) => {
-      if (typeof value === "number") {
-        if (key === "MaximumDrawdown" || key === "CumulativeReturn" || key === "WinRate" || key === "DirectionalAccuracy") {
-          return (value * 100).toFixed(2) + "%";
-        }
-        if (key === "ProfitFactor" || key === "SharpeRatio" || key === "SortinoRatio") {
-          return value.toFixed(3);
-        }
-        return value.toFixed(4);
+    const formatValue = (key: string, value: number) => {
+      if (key === "MaximumDrawdown" || key === "CumulativeReturn" || key === "WinRate" || key === "DirectionalAccuracy") {
+        return (value * 100).toFixed(2) + "%";
       }
-      return value;
+      if (key === "ProfitFactor" || key === "SharpeRatio" || key === "SortinoRatio") {
+        return value.toFixed(3);
+      }
+      return value.toFixed(4);
     };
 
     return (
@@ -161,6 +222,31 @@ export default function Training() {
         </button>
       </div>
 
+      {/* Training in progress card */}
+      {training && (
+        <div className="bg-graphite border border-signal-prepare/30 rounded-xl p-5 animate-pulse">
+          <div className="flex items-center gap-4">
+            <Spinner size="lg" />
+            <div>
+              <h3 className="font-display text-lg text-signal-prepare">Training in progress...</h3>
+              <div className="flex flex-wrap gap-6 mt-2 text-sm">
+                <div>
+                  <span className="text-mist/60">Elapsed: </span>
+                  <span className="font-mono text-paper">{formatTime(elapsedSeconds)}</span>
+                </div>
+                <div>
+                  <span className="text-mist/60">Estimated remaining: </span>
+                  <span className="font-mono text-paper">{getEstimatedRemaining()}</span>
+                </div>
+              </div>
+              <div className="mt-2 text-xs text-mist/40">
+                This may take a few minutes. The page will auto‑update when done.
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Status Cards */}
       {loading ? (
         <div className="flex justify-center py-12">
@@ -178,6 +264,9 @@ export default function Training() {
                 <span className="font-mono text-sm text-signal-buy">✅ Deployed</span>
                 <div className="mt-2 text-xs text-mist/60">
                   Last training: {formatDate(status?.last_training)}
+                  {status?.model_version && (
+                    <span className="ml-4 text-mist/40">Version: {status.model_version}</span>
+                  )}
                 </div>
               </div>
             ) : (
@@ -197,10 +286,10 @@ export default function Training() {
             <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
               📉 Walk‑Forward Performance Metrics
             </h3>
-            {renderMetrics(status?.metrics)}
+            {renderMetrics(status?.metrics || {})}
           </div>
 
-          {/* Fold Details (collapsible) */}
+          {/* Fold Details */}
           {status?.fold_details && status.fold_details.length > 0 && (
             <div className="bg-graphite border border-slate/40 rounded-xl p-5">
               <button
@@ -225,7 +314,7 @@ export default function Training() {
                       </tr>
                     </thead>
                     <tbody>
-                      {status.fold_details.map((fold: any) => (
+                      {status.fold_details.map((fold) => (
                         <tr key={fold.fold} className="border-b border-slate/30">
                           <td className="py-1 pr-4 text-paper">{fold.fold}</td>
                           <td className="py-1 pr-4 text-mist/70">{fold.train_start}</td>

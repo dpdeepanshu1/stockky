@@ -140,7 +140,37 @@ export interface SystemHealth {
   services: Record<string, SystemServiceStatus>;
 }
 
-// --- Training Service types ---
+// ───────────────────────────────────────────────
+// Training Service types – updated to match actual responses
+// ───────────────────────────────────────────────
+
+/** The status response from the training service (matches /api/status) */
+export interface TrainingStatusResponse {
+  service_url: string;
+  production_model_exists: boolean;
+  last_training: string | null;
+  dataset_size: number;
+  num_symbols: number;
+  metrics: Record<string, number>;          // walk-forward metrics
+  fold_details: Array<{
+    fold: number;
+    train_start: string;
+    train_end: string;
+    val_start: string;
+    val_end: string;
+    train_samples: number;
+    val_samples: number;
+  }>;
+  model_version: string | null;
+}
+
+/** Response from triggering training */
+export interface TriggerTrainingResponse {
+  status: string;
+  service_url?: string;
+}
+
+// Keep the old type for backward compatibility (if still used elsewhere)
 export interface TrainingModelStatus {
   production_model: {
     version: string;
@@ -195,7 +225,10 @@ export interface TrainingScore {
   }>;
 }
 
-// ── NEW: Market Indices types ──
+// ───────────────────────────────────────────────
+// Market Indices types
+// ───────────────────────────────────────────────
+
 export interface IndexData {
   price: number;
   change: number;
@@ -208,6 +241,10 @@ export interface MarketIndicesResponse {
   market_mood: "BULLISH" | "BEARISH" | "NEUTRAL";
   market_score: number;
 }
+
+// ───────────────────────────────────────────────
+// Request helper
+// ───────────────────────────────────────────────
 
 async function request<T>(path: string, init?: RequestInit, retries = 2, timeoutMs = 60000): Promise<T> {
   const base = getApiUrl();
@@ -260,6 +297,10 @@ export async function wakeService(url: string): Promise<void> {
     // Ignore – request still wakes the service
   }
 }
+
+// ───────────────────────────────────────────────
+// API object
+// ───────────────────────────────────────────────
 
 export const api = {
   ping: () => request<{ status: string; service: string }>("/health", undefined, 2, 30000),
@@ -316,7 +357,7 @@ export const api = {
   marketMostActive: () => request<MarketResponse>("/market/most-active", undefined, 2, 30000),
   marketTrending: () => request<MarketResponse>("/market/trending", undefined, 2, 30000),
 
-  // ── NEW: Market Indices ──
+  // ── Market Indices ──
   marketIndices: () => request<MarketIndicesResponse>("/market/indices", undefined, 2, 10000),
 
   getNotificationConfig: () => request<NotificationConfig>("/notifications/config", undefined, 2, 30000),
@@ -362,19 +403,22 @@ export const api = {
       30000
     ),
 
-  // --- Training Service endpoints ---
-  getTrainingStatus: () => request<TrainingModelStatus>("/training/status", undefined, 2, 30000),
+  // ─── Training Service endpoints ───
 
+  /** Get the current training status (matches TrainingStatusResponse) */
+  getTrainingStatus: () =>
+    request<TrainingStatusResponse>("/training/status", undefined, 2, 30000),
+
+  /** Trigger a new training run. Returns { status: string, service_url?: string } */
   triggerTraining: () =>
-    request<{
-        message: string; status: string 
-}>(
+    request<TriggerTrainingResponse>(
       "/training/train",
       { method: "POST" },
       2,
       60000
     ),
 
+  /** Get training score for a specific symbol */
   getTrainingScore: (symbol: string) =>
     request<TrainingScore>(`/training/score/${symbol}`, undefined, 2, 30000),
 };
