@@ -203,9 +203,11 @@ def _get_all_nse_securities() -> List[str]:
             if isinstance(item, dict) and item.get("symbol"):
                 symbols.append(item["symbol"].upper())
     logger.info(f"Fetched {len(symbols)} securities from NSE")
-    # Fallback to a static list if API fails
+
+    # Enhanced fallback list (Nifty 50 + Next 50 + Midcap 100 + additional)
     if not symbols:
         symbols = [
+            # Nifty 50
             "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HCLTECH",
             "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "M&M", "MARUTI",
             "NESTLEIND", "NTPC", "ONGC", "POWERGRID", "SBILIFE", "SUNPHARMA",
@@ -213,11 +215,34 @@ def _get_all_nse_securities() -> List[str]:
             "ASIANPAINT", "AXISBANK", "BAJAJFINSV", "BRITANNIA", "CIPLA",
             "COALINDIA", "DIVISLAB", "DRREDDY", "EICHERMOT", "GRASIM",
             "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "INDUSINDBK",
-            "JSWSTEEL", "LTIM", "POWERGRID", "SBILIFE", "SHRIRAMFIN",
-            "TATACONSUM", "TRENT", "TITAN", "ULTRACEMCO", "BAJAJ-AUTO",
-            "BPCL", "APOLLOHOSP", "BAJFINANCE"
+            "JSWSTEEL", "LTIM", "SHRIRAMFIN", "TATACONSUM", "TRENT", "TITAN",
+            "ULTRACEMCO", "BAJAJ-AUTO", "BPCL", "APOLLOHOSP", "BAJFINANCE",
+            # Nifty Next 50
+            "BANDHANBNK", "BIOCON", "BOSCHLTD", "CHOLAFIN", "DABUR", "DALBHARAT",
+            "DIXON", "DMART", "ESCORTS", "FEDERALBNK", "GODREJCP", "GODREJPROP",
+            "HAVELLS", "HINDZINC", "IOC", "IRCTC", "LICHSGFIN", "MUTHOOTFIN",
+            "NAUKRI", "NMDC", "PAGEIND", "PETRONET", "PIIND", "PNB", "RBLBANK",
+            "SAIL", "SRTRANSFIN", "TATACOMM", "TECHM", "TORNTPHARM", "VEDL",
+            "ZOMATO", "IDEA", "ABFRL", "BANKBARODA", "BHEL", "CANBK", "HAL",
+            "IBULHSGFIN", "JINDALSTEL", "JUBLFOOD", "MCDOWELL-N", "MPHASIS",
+            "PIDILITIND", "SIEMENS", "UPL", "VBL", "YESBANK", "GAIL",
+            # Nifty Midcap 100 (subset)
+            "AARTIIND", "ABB", "ADANIGREEN", "ADANITRANS", "ALKEM", "AMBER",
+            "ASHOKLEY", "ASTRAZEN", "AUROPHARMA", "BALKRISIND", "BERGEPAINT",
+            "BLUESTARCO", "CARBORUNIV", "CENTRALBK", "CGPOWER", "CISCO", "COCHINSHIP",
+            "COROMANDEL", "CROMPTON", "CUMMINSIND", "DELTACORP", "DIVISLAB",
+            "DLF", "EIDPARRY", "EXIDEIND", "FORTIS", "GMRINFRA", "GODREJIND",
+            "GREENPLY", "HINDPETRO", "IDEA", "INDIAMART", "INDIGO", "JSWENERGY",
+            "JUBILANT", "KPITTECH", "KPRMILL", "LALPATHLAB", "LUPIN", "MCX",
+            "MINDACORP", "MOTHERSUMI", "NATCOPHARM", "NAVINFLUOR", "NEULANDLAB",
+            "NILKAMAL", "NLCINDIA", "OIL", "PERSISTENT", "PFC", "PHOENIXLTD",
+            "PRESTIGE", "RAYMOND", "RECLTD", "RENUKA", "RITES", "RVNL",
+            "SCHAEFFLER", "SHREECEM", "SONATSOFTW", "SUNTV", "SUPRAJIT",
+            "SYRMA", "TATAELXSI", "TATAMTRDVR", "TATAPOWER", "TATATECH",
+            "TIMKEN", "TORNTPHARM", "TRIDENT", "TVSMOTOR", "WELSPUNIND", "WHIRLPOOL",
+            "WOCKPHARMA", "ZEEL", "ZYDUSWELL"
         ]
-        logger.warning(f"Using static fallback list with {len(symbols)} symbols")
+        logger.warning(f"Using enhanced static fallback list with {len(symbols)} symbols")
     return symbols
 
 def _get_nifty_indices() -> List[str]:
@@ -777,7 +802,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.1.0",
+        "version": "2.1.1",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
