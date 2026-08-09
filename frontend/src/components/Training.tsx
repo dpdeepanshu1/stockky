@@ -7,7 +7,6 @@ export default function Training() {
   const [status, setStatus] = useState<TrainingStatusResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [training, setTraining] = useState(false);
-  const [trainingStartTime, setTrainingStartTime] = useState<Date | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [showFolds, setShowFolds] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
@@ -16,7 +15,7 @@ export default function Training() {
   const timerIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const ESTIMATED_TOTAL_SECONDS = 300; // 5 minutes
+  const ESTIMATED_TOTAL_SECONDS = 300;
 
   // ---------- API calls ----------
   const fetchStatus = async () => {
@@ -25,16 +24,12 @@ export default function Training() {
       const data = await api.getTrainingStatus();
       setStatus(data);
 
-      // Auto-detect training completion
+      // ✅ Stop training immediately if model exists
       if (training && data.production_model_exists && data.last_training) {
-        const lastTrainingDate = new Date(data.last_training);
-        const now = new Date();
-        if ((now.getTime() - lastTrainingDate.getTime()) < 120000) {
-          stopTraining(true);
-        }
+        stopTraining(true);
       }
     } catch (err) {
-      showToast("error", "Failed to fetch training status. Please refresh.");
+      showToast("error", "Failed to fetch training status.");
     } finally {
       setLoading(false);
     }
@@ -42,16 +37,21 @@ export default function Training() {
 
   const clearLock = async () => {
     try {
-      const response = await fetch(`${import.meta.env.VITE_API_URL}/lock`, {
+      // Use the service URL from status, or fallback to environment variable
+      const baseUrl = status?.service_url || import.meta.env.VITE_TRAINING_SERVICE_URL || "https://training-service-5e9v.onrender.com";
+      const response = await fetch(`${baseUrl}/lock`, {
         method: "DELETE",
       });
       if (response.ok) {
         showToast("success", "Training lock cleared.");
+        return true;
       } else {
         showToast("error", "Failed to clear lock.");
+        return false;
       }
-    } catch (err) {
+    } catch {
       showToast("error", "Error clearing lock.");
+      return false;
     }
   };
 
@@ -72,7 +72,6 @@ export default function Training() {
 
   const startTraining = () => {
     setTraining(true);
-    setTrainingStartTime(new Date());
     setElapsedSeconds(0);
 
     if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
@@ -88,7 +87,6 @@ export default function Training() {
 
   const stopTraining = (success: boolean) => {
     setTraining(false);
-    setTrainingStartTime(null);
     if (timerIntervalRef.current) {
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
@@ -135,15 +133,12 @@ export default function Training() {
       return;
     }
     setIsStopping(true);
-    try {
-      await clearLock();
+    const cleared = await clearLock();
+    if (cleared) {
       stopTraining(false);
       showToast("info", "Training stopped. Lock cleared.");
-    } catch (err) {
-      showToast("error", "Failed to stop training.");
-    } finally {
-      setIsStopping(false);
     }
+    setIsStopping(false);
   };
 
   const handleRefresh = () => {
