@@ -114,3 +114,26 @@ services:
       VITE_API_URL: https://api-gateway-wizr.onrender.com
     depends_on:
       - api-gateway
+
+  market-sentiment-service:
+    build: ./services/market-sentiment-service
+    ports:
+      - "8009:8009"
+    environment:
+      - REDIS_URL=${UPSTASH_REDIS_REST_URL}
+    depends_on:
+      - market-data-service
+
+  training-service:
+    build: ./services/training-service
+    ports:
+      - "8010:8010"
+    environment:
+      - DATABASE_URL=${TRAINING_DATABASE_URL:-sqlite:///./training.db}
+      - MODEL_STORE_PATH=/app/model-store
+    volumes:
+      - ./data/training-model:/app/model-store
+      - ./data/training-db:/app/data
+    depends_on:
+      - market-data-service
+      - decision-engine-service      

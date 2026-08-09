@@ -1,3 +1,5 @@
+// frontend/src/App.tsx
+
 import { useState, useEffect, useRef } from "react";
 import { api, getApiUrl, setApiUrl, Decision, ScanResult, wakeService } from "./api";
 import Pipeline from "./components/Pipeline";
@@ -8,6 +10,7 @@ import NotificationsPanel from "./components/NotificationsPanel";
 import SystemCheck from "./components/SystemCheck";
 import MarketMovers from "./components/MarketMovers";
 import ServiceManager from "./components/ServiceManager";
+import { Training } from "./components/Training"; // ADDED import for Training component
 
 type ViewState =
   | { mode: "idle" }
@@ -16,7 +19,7 @@ type ViewState =
   | { mode: "scan"; data: ScanResult }
   | { mode: "error"; message: string };
 
-type Tab = "dashboard" | "notifications";
+type Tab = "dashboard" | "notifications" | "training"; // ADDED training
 
 export default function App() {
   const [systemReady, setSystemReady] = useState(false);
@@ -165,13 +168,11 @@ export default function App() {
     setStatusMessage("⏳ Restarting services and retrying...");
 
     try {
-      // Step 1: Wake backend if it's down
       if (backendUp === "down") {
         await handleWakeBackend();
-        await new Promise(r => setTimeout(r, 3000)); // Give it time to spin up
+        await new Promise(r => setTimeout(r, 3000));
       }
       
-      // Step 2: Retry the last request
       if (lastRequestType.current === 'stock' && lastSymbol.current) {
         await handleSearch(lastSymbol.current);
       } else if (lastRequestType.current === 'scan') {
@@ -259,14 +260,12 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-ink text-paper relative">
-      {/* Floating Global Toast Notification */}
       {statusMessage && (
         <div className="fixed top-20 right-4 z-50 bg-graphite border border-signal-buy/40 rounded-xl px-5 py-3 shadow-2xl animate-fadeIn flex items-center gap-2">
           <p className="font-mono text-sm text-paper">{statusMessage}</p>
         </div>
       )}
 
-      {/* Nav */}
       <header className="sticky top-0 z-40 border-b border-slate/60 backdrop-blur-sm bg-ink/90">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-4">
@@ -282,6 +281,9 @@ export default function App() {
               </TabButton>
               <TabButton active={tab === "notifications"} onClick={() => setTab("notifications")}>
                 Notifications
+              </TabButton>
+              <TabButton active={tab === "training"} onClick={() => setTab("training")}>
+                Training
               </TabButton>
             </nav>
           </div>
@@ -322,7 +324,6 @@ export default function App() {
         <ServiceManager onClose={() => setShowServiceManager(false)} />
       )}
 
-      {/* Backend down banner with Wake button */}
       {backendUp === "down" && !showSettings && (
         <div className="border-b border-signal-sell/30 bg-signal-sell/5">
           <div className="max-w-6xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-3 flex-wrap">
@@ -351,7 +352,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Watchlist drawer with Scan Watchlist button */}
       {showWatchlist && tab === "dashboard" && (
         <div className="border-b border-slate/60 bg-graphite">
           <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6">
@@ -374,9 +374,11 @@ export default function App() {
       <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8 sm:py-10">
         {tab === "notifications" ? (
           <NotificationsPanel />
+        ) : tab === "training" ? (
+          <Training />
         ) : (
           <>
-            {/* Hero */}
+            {/* Dashboard content */}
             <section className="mb-8 sm:mb-10">
               <h1 className="font-display text-3xl sm:text-4xl md:text-[46px] leading-tight max-w-xl mb-2">
                 Know your next move. <span className="italic text-mist">In one call.</span>
@@ -414,12 +416,10 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Market Movers */}
               <div className="mt-8">
                 <MarketMovers onSelect={handleSearch} />
               </div>
 
-              {/* Quick watchlist chips */}
               {watchlist.length > 0 && view.mode === "idle" && (
                 <div className="flex flex-wrap gap-2 mt-4">
                   {watchlist.slice(0, 10).map((s) => (
@@ -440,7 +440,6 @@ export default function App() {
               )}
             </section>
 
-            {/* Results */}
             <section>
               {view.mode === "idle" && (
                 <div className="border border-dashed border-slate rounded-xl p-10 sm:p-16 text-center">

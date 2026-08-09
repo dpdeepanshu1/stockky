@@ -1,3 +1,5 @@
+// frontend/src/api/api.ts
+
 const STORAGE_KEY = "stockky:api_url";
 
 export function getApiUrl(): string {
@@ -57,7 +59,7 @@ export interface Decision {
   natural_language_summary?: string;
   fundamental_metrics?: FundamentalMetrics;
   data_insufficient?: boolean;
-  fundamental_fallback?: boolean; // <--- NEW: For showing fallback messaging
+  fundamental_fallback?: boolean;
   event_score_delta?: number;
 }
 
@@ -131,6 +133,61 @@ export interface SystemHealth {
   required_ok: boolean;
   all_ok: boolean;
   services: Record<string, SystemServiceStatus>;
+}
+
+// --- NEW: Training Service types ---
+export interface TrainingModelStatus {
+  production_model: {
+    version: string;
+    training_date: string;
+    features: string[];
+    metrics: {
+      accuracy: number;
+      precision: number;
+      recall: number;
+      f1: number;
+      roc_auc: number;
+      train_size: number;
+      val_size: number;
+    };
+    status: string;
+  } | null;
+  candidate_model: {
+    version: string;
+    training_date: string;
+    features: string[];
+    metrics: {
+      accuracy: number;
+      precision: number;
+      recall: number;
+      f1: number;
+      roc_auc: number;
+      train_size: number;
+      val_size: number;
+    };
+    status: string;
+  } | null;
+  last_training_date: string | null;
+  dataset_size: number;
+  performance: {
+    'T+1 Success': number;
+    'T+5 Success': number;
+    'Average T+1': number;
+    'Average T+5': number;
+  };
+}
+
+export interface TrainingScore {
+  symbol: string;
+  training_score: number;
+  t1_success_probability: number;
+  t5_success_probability: number;
+  historical_similarity: number;
+  similar_setups: Array<{
+    symbol: string;
+    similarity: number;
+    outcome: string;
+  }>;
 }
 
 async function request<T>(path: string, init?: RequestInit, retries = 2, timeoutMs = 60000): Promise<T> {
@@ -282,4 +339,18 @@ export const api = {
       2,
       30000
     ),
+
+  // --- NEW: Training Service endpoints ---
+  getTrainingStatus: () => request<TrainingModelStatus>("/training/status", undefined, 2, 30000),
+
+  triggerTraining: () =>
+    request<{ status: string }>(
+      "/training/train",
+      { method: "POST" },
+      2,
+      60000
+    ),
+
+  getTrainingScore: (symbol: string) =>
+    request<TrainingScore>(`/training/score/${symbol}`, undefined, 2, 30000),
 };

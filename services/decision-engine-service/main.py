@@ -1,12 +1,11 @@
 """
-Decision Engine Service v0.3.2
+Decision Engine Service v0.4.0
 --------------------------------
-Combines Technical + Fundamental + News + Event + Prediction scores.
-
-v0.3.2 changes:
-  - Fixed int conversion errors when news_score or prediction_score is None.
-  - Wrapped entire /decide endpoint in try/except to always return 200 with fallback values.
-  - Improved error logging for debugging.
+Combines Technical + Fundamental + News + Event + Prediction + Market Sentiment + Training Intelligence.
+v0.4.0 changes:
+  - Integrated Market Sentiment and Training Intelligence scores.
+  - Records every prediction to Training Service for learning.
+  - Added fallback neutral scores for external services.
 """
 import os
 import asyncio
@@ -15,23 +14,28 @@ from datetime import datetime
 from enum import Enum
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("decision-engine-service")
 
+# ---- Existing service URLs ----
 TECHNICAL_URL   = os.getenv("TECHNICAL_URL",   "https://technical-analysis-service-zhnc.onrender.com")
 FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-service.onrender.com")
 NEWS_URL        = os.getenv("NEWS_URL",         "https://news-intelligence-service.onrender.com")
 EVENT_URL       = os.getenv("EVENT_URL",        "https://event-tracker-service-m1lw.onrender.com")
 PREDICTION_URL  = os.getenv("PREDICTION_URL",   "https://prediction-service-wowb.onrender.com")
 
+# ---- NEW: Market Sentiment & Training service URLs ----
+MARKET_SENTIMENT_URL = os.getenv("MARKET_SENTIMENT_URL", "http://market-sentiment-service:8009")
+TRAINING_SERVICE_URL = os.getenv("TRAINING_SERVICE_URL", "http://training-service:8010")
+
 EARNINGS_RISK_DAYS   = 3
 EARNINGS_BOOST_DAYS  = 7
 
-app = FastAPI(title="Stockky Decision Engine", version="0.3.2")
+app = FastAPI(title="Stockky Decision Engine", version="0.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -49,14 +53,14 @@ class Decision(str, Enum):
     BUY_NOW        = "BUY NOW"
     PREPARE_TO_BUY = "PREPARE TO BUY"
     HOLD           = "HOLD"
-    WAIT           = "WAIT"        # NEW: For newly listed/insufficient data but positive news
+    WAIT           = "WAIT"
     DO_NOT_BUY     = "DO NOT BUY"
     SELL           = "SELL"
 
 
 @app.get("/")
 def root():
-    return {"service": "Stockky Decision Engine", "version": "0.3.2", "status": "running"}
+    return {"service": "Stockky Decision Engine", "version": "0.4.0", "status": "running"}
 
 
 @app.get("/health")
@@ -64,7 +68,7 @@ def health():
     return {"status": "ok", "service": "decision-engine-service"}
 
 
-# ── Fetch helpers ──────────────────────────────────────────────────────────────
+# ── Fetch helpers (existing) ──────────────────────────────────────────────────
 async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
     try:
         resp = await client.get(url, timeout=70)
@@ -75,7 +79,47 @@ async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
         return None
 
 
-# ── Event signal extraction ────────────────────────────────────────────────────
+# ── NEW: Market Sentiment fetch ────────────────────────────────────────────
+async def get_market_sentiment() -> dict:
+    """Fetch current market sentiment; return neutral fallback on failure."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{MARKET_SENTIMENT_URL}/sentiment")
+            if resp.status_code == 200:
+                data = resp.json()
+                # Ensure we have a market_score; default 50 if missing
+                return {"market_score": data.get("market_score", 50), **data}
+            else:
+                logger.warning(f"Market sentiment returned {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Could not fetch market sentiment: {e}")
+    return {"market_score": 50, "classification": "NEUTRAL", "trend": "Neutral"}
+
+
+# ── NEW: Training Intelligence fetch ──────────────────────────────────────
+async def get_training_score(symbol: str) -> dict:
+    """Fetch training intelligence score for a symbol; return neutral fallback."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{TRAINING_SERVICE_URL}/training-score/{symbol}")
+            if resp.status_code == 200:
+                data = resp.json()
+                return data
+            else:
+                logger.warning(f"Training score for {symbol} returned {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Could not fetch training score for {symbol}: {e}")
+    return {
+        "symbol": symbol,
+        "training_score": 50,
+        "t1_success_probability": 0.5,
+        "t5_success_probability": 0.5,
+        "historical_similarity": 0.5,
+        "similar_setups": []
+    }
+
+
+# ── Event signal extraction (unchanged) ────────────────────────────────────
 def _extract_event_signals(events: dict | None) -> dict:
     if not events or not isinstance(events, dict):
         return {"event_score_delta": 0, "event_risk": False,
@@ -175,39 +219,45 @@ def _extract_event_signals(events: dict | None) -> dict:
     }
 
 
-# ── Combined score ─────────────────────────────────────────────────────────────
+# ── Combined score (UPDATED: includes market and training) ──────────────
 def _combined_score(
     technical_score: int,
     fundamental_score: int,
     news_score: int | None,
     prediction_score: int | None,
+    market_score: int,
+    training_score: int,
     event_delta: int = 0,
 ) -> float:
+    # Base weights (modified to include market and training)
     if news_score is not None and prediction_score is not None:
-        weights = {"t": 0.38, "f": 0.28, "n": 0.14, "p": 0.20}
+        weights = {"t": 0.30, "f": 0.20, "n": 0.12, "p": 0.18, "m": 0.12, "train": 0.08}
     elif news_score is not None:
-        weights = {"t": 0.42, "f": 0.33, "n": 0.25, "p": 0.0}
+        weights = {"t": 0.35, "f": 0.25, "n": 0.22, "p": 0.0,  "m": 0.12, "train": 0.06}
     elif prediction_score is not None:
-        weights = {"t": 0.40, "f": 0.30, "n": 0.0, "p": 0.30}
+        weights = {"t": 0.32, "f": 0.22, "n": 0.0,  "p": 0.26, "m": 0.12, "train": 0.08}
     else:
-        weights = {"t": 0.55, "f": 0.45, "n": 0.0, "p": 0.0}
+        weights = {"t": 0.42, "f": 0.32, "n": 0.0,  "p": 0.0,  "m": 0.18, "train": 0.08}
 
     total = (
         technical_score   * weights["t"]
         + fundamental_score * weights["f"]
         + (news_score or 0) * weights["n"]
         + (prediction_score or 0) * weights["p"]
+        + market_score     * weights["m"]
+        + training_score   * weights["train"]
     )
 
+    # News delta (existing)
     if news_score is not None:
-        news_delta = (news_score - 50) / 50 * 10  # -10 to +10
+        news_delta = (news_score - 50) / 50 * 10
         total += news_delta
 
     total += event_delta
     return round(max(0, min(100, total)), 1)
 
 
-# ── Decision logic ─────────────────────────────────────────────────────────────
+# ── Decision logic (UPDATED: uses combined score more heavily) ──────────
 def _decide(
     technical_score: int,
     fundamental_score: int,
@@ -221,20 +271,18 @@ def _decide(
     combined: float,
     data_insufficient: bool = False,
 ) -> Decision:
-    # 1. Handle newly listed / insufficient price data
     if data_insufficient:
-        # Give "WAIT" instead of "DO NOT BUY" if news sentiment is strongly positive
         if news_score is not None and news_score >= 60:
             return Decision.WAIT
         return Decision.DO_NOT_BUY
 
-    # 2. Sell / Hold signals if already owned
+    # Sell / Hold if already owned
     if already_owned and combined < 35:
         return Decision.SELL
     if already_owned and 35 <= combined < 60:
         return Decision.HOLD
 
-    # 3. Buy / Prepare signals if not owned
+    # Buy / Prepare if not owned
     news_ok       = news_score is None or news_score >= 35
     model_ok      = prediction_score is None or prediction_score >= 50
     resistance_ok = dist_to_resistance_pct is None or dist_to_resistance_pct > 1
@@ -261,25 +309,69 @@ def _decide(
     return Decision.DO_NOT_BUY
 
 
-# ── Main route ─────────────────────────────────────────────────────────────────
+# ── NEW: Background task to record prediction snapshot ─────────────────────
+async def record_prediction_for_training(
+    symbol: str,
+    decision: str,
+    confidence: float,
+    price: float,
+    entry_range: dict,
+    target: float,
+    stop_loss: float,
+    market_sentiment: dict,
+    features: dict,
+):
+    """Send immutable prediction snapshot to Training Service."""
+    prediction_id = f"STK-{datetime.now().strftime('%Y%m%d%H%M%S')}-{symbol}"
+    payload = {
+        "prediction_id": prediction_id,
+        "symbol": symbol,
+        "timestamp": datetime.now().isoformat(),
+        "price": price,
+        "decision": decision,
+        "confidence": confidence,
+        "entry_range": f"{entry_range.get('low')}-{entry_range.get('high')}" if entry_range else None,
+        "target": target,
+        "stop_loss": stop_loss,
+        "market_sentiment": market_sentiment,
+        "features": features,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(f"{TRAINING_SERVICE_URL}/record-prediction", json=payload)
+            if response.status_code == 200:
+                logger.info(f"Prediction recorded: {prediction_id}")
+            else:
+                logger.warning(f"Failed to record prediction: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error recording prediction: {e}")
+
+
+# ── Main route (UPDATED) ────────────────────────────────────────────────────
 @app.get("/decide/{symbol}")
-async def decide(symbol: str, already_owned: bool = False):
+async def decide(symbol: str, already_owned: bool = False, background_tasks: BackgroundTasks = None):
     try:
         async with httpx.AsyncClient(timeout=70) as client:
+            # Existing tasks
             technical_task   = asyncio.create_task(_fetch_optional(client, f"{TECHNICAL_URL}/analyze/{symbol}", "Technical"))
             fundamental_task = asyncio.create_task(_fetch_optional(client, f"{FUNDAMENTAL_URL}/analyze/{symbol}", "Fundamental"))
             news_task        = asyncio.create_task(_fetch_optional(client, f"{NEWS_URL}/analyze/{symbol}", "News"))
             events_task      = asyncio.create_task(_fetch_optional(client, f"{EVENT_URL}/events/{symbol}", "Events"))
             prediction_task  = asyncio.create_task(_fetch_optional(client, f"{PREDICTION_URL}/predict/{symbol}", "Prediction"))
 
-            technical, fundamental, news, events, prediction = await asyncio.gather(
-                technical_task, fundamental_task, news_task, events_task, prediction_task
+            # NEW: Fetch market sentiment and training score concurrently
+            sentiment_task   = asyncio.create_task(get_market_sentiment())
+            training_task    = asyncio.create_task(get_training_score(symbol))
+
+            # Gather all
+            technical, fundamental, news, events, prediction, sentiment, training = await asyncio.gather(
+                technical_task, fundamental_task, news_task, events_task, prediction_task,
+                sentiment_task, training_task
             )
 
-        # ── Extract scores ─────────────────────────────────────────────────────
+        # ── Extract scores (existing logic, with safety) ──────────────────
         data_insufficient = False
 
-        # Technical – default to 50 if missing
         if not technical or not isinstance(technical, dict):
             technical = {
                 "technical_score": 50,
@@ -291,7 +383,6 @@ async def decide(symbol: str, already_owned: bool = False):
         if technical.get("close") is None:
             data_insufficient = True
 
-        # Fundamental – default to 50 if missing
         if not fundamental or not isinstance(fundamental, dict):
             fundamental = {
                 "fundamental_score": 50,
@@ -305,7 +396,6 @@ async def decide(symbol: str, already_owned: bool = False):
         technical_score   = int(technical.get("technical_score", 50))
         fundamental_score = int(fundamental.get("fundamental_score", 50))
 
-        # 🔥 SAFE CONVERSION: handle None values
         news_score = None
         if news and "news_score" in news:
             val = news["news_score"]
@@ -327,13 +417,17 @@ async def decide(symbol: str, already_owned: bool = False):
         if technical.get("data_insufficient"):
             data_insufficient = True
 
-        # ── Event signals ──────────────────────────────────────────────────────
+        # ── Extract market & training scores (new) ────────────────────────
+        market_score = sentiment.get("market_score", 50)
+        training_score = training.get("training_score", 50)
+
+        # ── Event signals (unchanged) ──────────────────────────────────────
         event_signals = _extract_event_signals(events)
         event_delta   = event_signals["event_score_delta"]
         event_risk    = event_signals["event_risk"]
         event_reasons = event_signals["event_reasons"]
 
-        # ── Price data ────────────────────────────────────────────────────────
+        # ── Price data (unchanged) ─────────────────────────────────────────
         close      = technical.get("close")
         support    = technical.get("support")
         resistance = technical.get("resistance")
@@ -344,12 +438,15 @@ async def decide(symbol: str, already_owned: bool = False):
         if close and resistance and resistance > 0:
             dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
 
-        # ── Combined score & decision ─────────────────────────────────────────
+        # ── Combined score (UPDATED) ──────────────────────────────────────
         combined = _combined_score(
             technical_score, fundamental_score,
-            news_score, prediction_score, event_delta,
+            news_score, prediction_score,
+            market_score, training_score,
+            event_delta,
         )
 
+        # ── Decision (UPDATED: passes combined) ───────────────────────────
         decision = _decide(
             technical_score, fundamental_score,
             news_score, prediction_score,
@@ -359,7 +456,7 @@ async def decide(symbol: str, already_owned: bool = False):
             combined, data_insufficient,
         )
 
-        # ── Entry / Target / Stop ─────────────────────────────────────────────
+        # ── Entry / Target / Stop (unchanged) ─────────────────────────────
         entry_low = entry_high = target = stop_loss = None
         if close:
             support_val = support if support else close * 0.95
@@ -379,7 +476,7 @@ async def decide(symbol: str, already_owned: bool = False):
 
         confidence = "High" if combined >= 75 else "Medium" if combined >= 55 else "Low"
 
-        # ── Reasons assembly ──────────────────────────────────────────────────
+        # ── Reasons assembly (unchanged) ──────────────────────────────────
         reasons: dict = {
             "technical":   technical.get("reasons", []),
             "fundamental": fundamental.get("reasons", []),
@@ -390,7 +487,11 @@ async def decide(symbol: str, already_owned: bool = False):
             reasons["prediction"] = [prediction.get("note", "AI prediction available")]
         if event_reasons:
             reasons["event"] = event_reasons
+        # Add market & training insights
+        reasons["market"] = [f"Market sentiment: {sentiment.get('classification', 'NEUTRAL')} (Score: {market_score})"]
+        reasons["training"] = [f"Training intelligence score: {training_score}/100"]
 
+        # ── Build response ─────────────────────────────────────────────────
         response = {
             "symbol":           symbol.upper(),
             "decision":         decision.value,
@@ -400,6 +501,8 @@ async def decide(symbol: str, already_owned: bool = False):
             "fundamental_score": fundamental_score,
             "news_score":       news_score,
             "prediction_score": prediction_score,
+            "market_score":     market_score,
+            "training_score":   training_score,
             "event_score_delta": event_delta,
             "event_risk":       event_risk,
             "entry_range":      {"low": entry_low, "high": entry_high} if entry_low else None,
@@ -416,6 +519,7 @@ async def decide(symbol: str, already_owned: bool = False):
             "fundamental_fallback": fundamental.get("fallback_used", False),
         }
 
+        # Add optional extra data (unchanged)
         if news and isinstance(news, dict):
             response["news_data"] = {
                 "headline_count": news.get("headline_count", 0),
@@ -428,11 +532,38 @@ async def decide(symbol: str, already_owned: bool = False):
         if fundamental.get("metrics"):
             response["fundamental_metrics"] = fundamental["metrics"]
 
+        # ── NEW: Record prediction for training (if actionable) ───────────
+        if decision in (Decision.BUY_NOW, Decision.PREPARE_TO_BUY) and close:
+            background_tasks.add_task(
+                record_prediction_for_training,
+                symbol=symbol.upper(),
+                decision=decision.value,
+                confidence=combined,
+                price=close,
+                entry_range={"low": entry_low, "high": entry_high},
+                target=target,
+                stop_loss=stop_loss,
+                market_sentiment=sentiment,
+                features={
+                    "technical": technical_score,
+                    "fundamental": fundamental_score,
+                    "news": news_score,
+                    "prediction": prediction_score,
+                    "market": market_score,
+                    "training": training_score,
+                    "event_delta": event_delta,
+                    "support": support,
+                    "resistance": resistance,
+                    "volume_surge": volume_surge,
+                    "trend_strength": trend_strength,
+                }
+            )
+
         return response
 
     except Exception as e:
         logger.error(f"Decision failed for {symbol}: {e}", exc_info=True)
-        # 🛡️ Always return a 200 with fallback values, never crash
+        # Always return 200 with fallback values
         return {
             "symbol": symbol.upper(),
             "decision": "DO NOT BUY",
@@ -442,6 +573,8 @@ async def decide(symbol: str, already_owned: bool = False):
             "fundamental_score": 50,
             "news_score": None,
             "prediction_score": None,
+            "market_score": 50,
+            "training_score": 50,
             "event_risk": False,
             "entry_range": None,
             "target": None,

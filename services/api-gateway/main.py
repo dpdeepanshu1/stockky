@@ -4,6 +4,7 @@ API Gateway
 Single entry point for the React frontend.
 Includes async scan with progress, symbol correction, Hinglish summaries,
 market movers, watchlist scan, Telegram notifications, and dynamic universe.
+v2.2.0 adds Training Service proxy routes.
 """
 import os
 import json
@@ -37,6 +38,9 @@ FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-ser
 EVENT_URL = os.getenv("EVENT_URL", "https://event-tracker-service-m1lw.onrender.com")
 PREDICTION_URL = os.getenv("PREDICTION_URL", "https://prediction-service-wowb.onrender.com")
 
+# ---- NEW: Training Service URL ----
+TRAINING_URL = os.getenv("TRAINING_URL", "http://training-service:8010")
+
 # Service definitions for system health
 SYSTEM_SERVICES = {
     "market-data": {"url": MARKET_DATA_URL, "required": True},
@@ -47,9 +51,11 @@ SYSTEM_SERVICES = {
     "event-tracker": {"url": EVENT_URL, "required": False},
     "prediction": {"url": PREDICTION_URL, "required": False},
     "notification": {"url": NOTIFICATION_URL, "required": False},
+    # NEW: Training service (optional for health)
+    "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.1.1")
+app = FastAPI(title="Stockky API Gateway", version="2.2.0")
 
 # --- CORS Middleware (explicit) ---
 app.add_middleware(
@@ -69,7 +75,7 @@ async def add_cors_header(request, call_next):
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
-# --- Global Exception Handler (ensures CORS headers on all errors) ---
+# --- Global Exception Handler ---
 @app.exception_handler(Exception)
 async def universal_exception_handler(request, exc):
     logger.error(f"Unhandled exception: {exc}")
@@ -101,9 +107,9 @@ SCAN_UNIVERSE_KEY   = "stockky:scan_universe"
 IPO_CACHE_KEY       = "stockky:ipos:recent"
 KNOWN_SYMBOLS_KEY   = "stockky:known_symbols"
 SCAN_TASK_PREFIX    = "stockky:scan_task:"
-MARKET_MOVERS_CACHE_PREFIX = "stockky:market_movers:"  # NEW: daily cache prefix
+MARKET_MOVERS_CACHE_PREFIX = "stockky:market_movers:"
 
-# ── Symbol Alias Mapping (old → new) ──────────────────────────────────────
+# ── Symbol Alias Mapping ──────────────────────────────────────────────────────
 SYMBOL_ALIASES: Dict[str, Union[str, List[str]]] = {
     "TATAMOTORS": "TMPV",
     "TATAMOTER": "TMPV",
@@ -154,7 +160,7 @@ def _add_searched(symbol: str):
         searched.append(sym)
         _redis_set(SEARCHED_KEY, searched[-200:])
 
-# ── Dynamic Universe Sources ──────────────────────────────────────────────
+# ── Dynamic Universe Sources (unchanged) ──────────────────────────────────
 _nse_client = None
 
 def _get_nse_client() -> httpx.Client:
@@ -169,7 +175,6 @@ def _get_nse_client() -> httpx.Client:
             "DNT": "1",
         }
         _nse_client = httpx.Client(headers=headers, timeout=15)
-        # First hit the homepage to get cookies
         _nse_client.get("https://www.nseindia.com")
     return _nse_client
 
@@ -192,7 +197,6 @@ def _fetch_from_nse_api(endpoint: str, cache_key: str, ttl: int = 21600):
     except Exception as e:
         logger.warning(f"Failed to fetch {endpoint}: {e}")
 
-    # If API fails, try to return stale cache if exists
     if cached:
         return cached
     return None
@@ -206,10 +210,8 @@ def _get_all_nse_securities() -> List[str]:
                 symbols.append(item["symbol"].upper())
     logger.info(f"Fetched {len(symbols)} securities from NSE")
 
-    # Enhanced fallback list (Nifty 50 + Next 50 + Midcap 100 + additional)
     if not symbols:
         symbols = [
-            # Nifty 50
             "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HCLTECH",
             "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "M&M", "MARUTI",
             "NESTLEIND", "NTPC", "ONGC", "POWERGRID", "SBILIFE", "SUNPHARMA",
@@ -219,7 +221,6 @@ def _get_all_nse_securities() -> List[str]:
             "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "INDUSINDBK",
             "JSWSTEEL", "LTIM", "SHRIRAMFIN", "TATACONSUM", "TRENT", "TITAN",
             "ULTRACEMCO", "BAJAJ-AUTO", "BPCL", "APOLLOHOSP", "BAJFINANCE",
-            # Nifty Next 50
             "BANDHANBNK", "BIOCON", "BOSCHLTD", "CHOLAFIN", "DABUR", "DALBHARAT",
             "DIXON", "DMART", "ESCORTS", "FEDERALBNK", "GODREJCP", "GODREJPROP",
             "HAVELLS", "HINDZINC", "IOC", "IRCTC", "LICHSGFIN", "MUTHOOTFIN",
@@ -228,7 +229,6 @@ def _get_all_nse_securities() -> List[str]:
             "ZOMATO", "IDEA", "ABFRL", "BANKBARODA", "BHEL", "CANBK", "HAL",
             "IBULHSGFIN", "JINDALSTEL", "JUBLFOOD", "MCDOWELL-N", "MPHASIS",
             "PIDILITIND", "SIEMENS", "UPL", "VBL", "YESBANK", "GAIL",
-            # Nifty Midcap 100 (subset)
             "AARTIIND", "ABB", "ADANIGREEN", "ADANITRANS", "ALKEM", "AMBER",
             "ASHOKLEY", "ASTRAZEN", "AUROPHARMA", "BALKRISIND", "BERGEPAINT",
             "BLUESTARCO", "CARBORUNIV", "CENTRALBK", "CGPOWER", "CISCO", "COCHINSHIP",
@@ -320,11 +320,9 @@ def _get_news_mentioned_symbols() -> List[str]:
         logger.warning("Could not parse news for symbols: %s", e)
     return mentioned[:15]
 
-# ── NEW: Fetch symbols with upcoming events from Event Tracker ───────────
 def _get_event_symbols() -> List[str]:
     """Fetch list of symbols that have upcoming corporate events from the Event Tracker service."""
     try:
-        # Assuming the Event Tracker exposes a new endpoint /symbols_with_events
         resp = httpx.get(f"{EVENT_URL}/symbols_with_events", timeout=10)
         if resp.status_code == 200:
             data = resp.json()
@@ -374,7 +372,7 @@ def _build_scan_universe() -> List[str]:
         logger.warning(f"Failed to fetch IPOs: {e}")
 
     try:
-        universe.update(_get_event_symbols())   # NEW: add upcoming event symbols
+        universe.update(_get_event_symbols())
     except Exception as e:
         logger.warning(f"Failed to fetch event symbols: {e}")
 
@@ -468,6 +466,8 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
         "news_score": None,
         "prediction_score": None,
         "prediction_note": None,
+        "market_score": 50,
+        "training_score": 50,
         "event_risk": False,
         "entry_range": None,
         "target": None,
@@ -489,7 +489,7 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
     merged = {**default, **raw}
     return merged
 
-# ── Fallback helpers ──────────────────────────────────────────────────────
+# ── Fallback helpers (unchanged) ──────────────────────────────────────────
 def _fetch_price_from_quote(symbol: str) -> Optional[float]:
     try:
         resp = httpx.get(f"{MARKET_DATA_URL}/quote/{symbol}", timeout=5)
@@ -558,7 +558,7 @@ def _wake_notification_service() -> bool:
     except Exception:
         return False
 
-# ── Hinglish & GenAI summary ──────────────────────────────────────────────
+# ── Hinglish & GenAI summary (unchanged) ──────────────────────────────────
 def _generate_summary(data) -> str:
     if not data or not isinstance(data, dict):
         return "Data unavailable"
@@ -651,7 +651,7 @@ def _send_scan_notification(recommendations: list, verdict: str, scanned: int, u
     except Exception as e:
         logger.warning("Failed to send scan notification: %s", e)
 
-# ── Async scan with progress ──────────────────────────────────────────────
+# ── Async scan with progress (unchanged) ──────────────────────────────────
 async def run_scan_async(task_id: str, universe: List[str]):
     start_time = time.time()
     results = []
@@ -704,7 +704,6 @@ async def run_scan_async(task_id: str, universe: List[str]):
                         reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
                         normalized["reasons"] = reasons
 
-                # --- NEW: Retrieve GenAI prediction note ---
                 if normalized.get("prediction_score") is None:
                     try:
                         pred_resp = await client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=60)
@@ -784,9 +783,8 @@ async def run_scan_async(task_id: str, universe: List[str]):
 
     _send_scan_notification(final_result.get("recommendations", []), final_result["verdict"], final_result["scanned"], final_result["universe_size"])
 
-# ── Cached Market Movers Data (daily cache in Redis) ────────────────────
+# ── Cached Market Movers Data ──────────────────────────────────────────────
 def _get_nifty50_data() -> List[dict]:
-    """Fetch top 50 Nifty symbols data. Cached in Redis for 24 hours, keyed by date."""
     today = datetime.now().strftime("%Y-%m-%d")
     cache_key = f"{MARKET_MOVERS_CACHE_PREFIX}{today}"
     cached = _redis_get(cache_key)
@@ -817,7 +815,6 @@ def _get_nifty50_data() -> List[dict]:
             })
         except Exception as e:
             logger.warning(f"Could not fetch {sym}: {e}")
-    # Cache for 24 hours (86400 seconds)
     _redis_set(cache_key, data, ttl=86400)
     return data
 
@@ -837,7 +834,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.1.1",
+        "version": "2.2.0",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
@@ -862,6 +859,9 @@ def root():
             "/notifications/config/{channel}": "DELETE – clear a channel",
             "/notifications/test": "POST – test notifications",
             "/notifications/send-picks": "POST – manually send picks to Telegram",
+            "/training/status": "GET – get training model status",
+            "/training/train": "POST – trigger a new training run",
+            "/training/score/{symbol}": "GET – get training intelligence score for a symbol",
             "/docs": "Swagger UI documentation",
         },
     }
@@ -909,7 +909,7 @@ async def system_health():
     all_ok = all(v["ok"] for v in services.values())
     return {"required_ok": required_ok, "all_ok": all_ok, "services": services}
 
-# ── Watchlist endpoints ────────────────────────────────────────────────────
+# ── Watchlist endpoints (unchanged) ──────────────────────────────────────────
 @app.get("/watchlist")
 def get_watchlist():
     return {"symbols": _load_watchlist()}
@@ -1303,7 +1303,7 @@ def scan_watchlist():
     _send_scan_notification(result.get("recommendations", []), result["verdict"], result["scanned"], result["universe_size"])
     return result
 
-# ── Market routes ──────────────────────────────────────────────────────────
+# ── Market routes (unchanged) ──────────────────────────────────────────────
 @app.get("/market/top-gainers")
 def market_top_gainers():
     data = _get_nifty50_data()
@@ -1368,7 +1368,7 @@ def clear_universe_cache():
             pass
     return {"message": "Scan universe cache cleared — will rebuild on next scan"}
 
-# ── Notification endpoints ──────────────────────────────────────────────────
+# ── Notification endpoints (unchanged) ──────────────────────────────────────
 @app.get("/notifications/health")
 def notifications_health():
     try:
@@ -1474,6 +1474,71 @@ def send_picks_to_telegram(payload: dict):
         return {"success": True, "sent": len(picks), "message": "Notification sent"}
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Notification service failed: {e}")
+
+# ============================================================================
+# NEW: Training Service Proxy Routes
+# ============================================================================
+
+@app.get("/training/status")
+async def training_status():
+    """Get the status of the Training Service model."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{TRAINING_URL}/model-status")
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Training service unreachable: {str(e)}")
+
+@app.post("/training/train")
+async def trigger_training():
+    """Trigger a new training run in the Training Service."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(f"{TRAINING_URL}/train")
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Training service unreachable: {str(e)}")
+
+@app.get("/training/score/{symbol}")
+async def get_training_score(symbol: str):
+    """Get the training intelligence score for a specific symbol."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{TRAINING_URL}/training-score/{symbol}")
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Training service unreachable: {str(e)}")
+
+# Catch-all for any other training endpoints (if needed)
+@app.api_route("/training/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def training_other_proxy(path: str, request: Request):
+    """Proxy all other training endpoints."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Build target URL
+            target_url = f"{TRAINING_URL}/{path}"
+            body = await request.body()
+            headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "connection")}
+            response = await client.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                content=body,
+                params=request.query_params,
+            )
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Training service unreachable: {str(e)}")
+
+# (Note: The Request and Response classes need to be imported)
+from fastapi import Request, Response
 
 if __name__ == "__main__":
     import uvicorn
