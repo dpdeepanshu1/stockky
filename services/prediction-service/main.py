@@ -73,7 +73,7 @@ if GEMINI_API_KEY:
 else:
     logger.warning("Gemini key is missing — no fallback provider if Groq fails")
 
-app = FastAPI(title="Stockky Prediction Service", version="0.6.0")
+app = FastAPI(title="Stockky Prediction Service", version="0.6.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _model = None
@@ -89,7 +89,7 @@ else:
 
 @app.get("/")
 async def root():
-    return {"service": "Stockky Prediction Service", "version": "0.6.0", "status": "running"}
+    return {"service": "Stockky Prediction Service", "version": "0.6.1", "status": "running"}
 
 
 @app.get("/health")
@@ -147,7 +147,7 @@ def _call_groq(system_prompt: str, user_prompt: str) -> str | None:
                     {"role": "user", "content": user_prompt},
                 ],
                 "temperature": 0.4,
-                "max_tokens": 350,  # Increased from 150 to allow richer explanations
+                "max_tokens": 100,  # Reduced from 350 to save tokens
             },
             headers={
                 "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -175,7 +175,7 @@ def _call_gemini(system_prompt: str, user_prompt: str) -> str | None:
             json={
                 "system_instruction": {"parts": [{"text": system_prompt}]},
                 "contents": [{"parts": [{"text": user_prompt}]}],
-                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 350},  # Increased
+                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 100},  # Reduced
             },
             headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
             timeout=20,
@@ -218,29 +218,16 @@ def _generate_llm_note(features: dict, probability: float, symbol: str) -> str:
     momentum_desc = "strengthening" if (ema20_vs_ema50 or 0) > 1 else "weakening"
     golden_cross_desc = "Yes" if golden_cross == 1 else "No"
 
+    # 🟢 NEW: Single concise sentence prompt
     system_prompt = (
-        "You are a highly experienced stock market analyst. Given the technical indicator readings, "
-        "explain in 4-5 detailed sentences why the XGBoost model estimates the probability it does. "
-        "Be specific about which indicators support or contradict the estimate. Mention the RSI, ADX, "
-        "MACD, EMAs, and volume ratios. Explain the trend context and what it means for the price action. "
-        "Plain English, no jargon dump, no financial advice disclaimers, and avoid generic statements."
+        "You are a concise stock analyst. Given the technical readings, "
+        "explain in exactly one clear, accurate sentence why the model estimates the probability it does. "
+        "No disclaimers, no jargon dump."
     )
     user_prompt = (
-        f"Technical snapshot for {symbol}:\n"
-        f"- RSI(14): {rsi} (overbought/oversold/neutral)\n"
-        f"- ADX(14): {adx} (trend strength)\n"
-        f"- MACD Histogram: {macd_hist}\n"
-        f"- Price vs 20-day EMA: {price_desc} ({close_vs_ema20:.2f})\n"
-        f"- Short-term momentum (20 EMA vs 50 EMA): {momentum_desc}\n"
-        f"- Long-term trend (Price vs 200 EMA): {trend_desc}\n"
-        f"- 20-day volume ratio: {vol_ratio}x average\n"
-        f"- Golden Cross: {golden_cross_desc}\n"
-        f"- Distance from 20d high: {dist_high}%\n"
-        f"- Distance from 20d low: {dist_low}%\n"
-        f"- ATR %: {atr_pct}%\n"
-        f"- Bollinger Band % position: {bb_pct}%\n"
-        f"XGBoost model's estimated probability of a 5%+ move in 10 trading days: {round(probability * 100)}%.\n"
-        "Provide a detailed breakdown of why this probability is high, moderate, or low, and what it implies for the trader."
+        f"{symbol}: RSI={rsi}, ADX={adx}, MACD hist={macd_hist}, Price {price_desc} 20 EMA, "
+        f"momentum {momentum_desc}, trend {trend_desc}, volume={vol_ratio}x avg, golden cross={golden_cross_desc}. "
+        f"Model says {round(probability * 100)}% chance of +5% in 10 days. Explain in one sentence."
     )
 
     # Try Gemini first, then Groq, then fallback.
@@ -267,38 +254,49 @@ def _align_features(features: dict, model) -> dict:
 
 @app.get("/predict/{symbol}")
 def predict(symbol: str):
-    if _model is None:
+    # 🛡️ Robust error handling – never return 502 or 500
+    try:
+        if _model is None:
+            return {
+                "symbol": symbol.upper(),
+                "model_loaded": False,
+                "probability": None,
+                "prediction_score": None,
+                "note": "No trained model yet.",
+            }
+        df = _fetch_history(symbol)
+        features = latest_feature_vector(df)
+        missing = [c for c in FEATURE_COLUMNS if c not in features]
+        if missing:
+            logger.warning(f"Missing features: {missing}")
+
+        aligned = _align_features(features, _model)
+        X = pd.DataFrame([aligned])
+        if hasattr(_model, 'feature_names_in_'):
+            X = X[_model.feature_names_in_]
+
+        probability = float(_model.predict_proba(X)[0, 1])
+        prediction_score = round(probability * 100)
+        llm_note = _generate_llm_note(features, probability, symbol)
         return {
             "symbol": symbol.upper(),
-            "model_loaded": False,
+            "model_loaded": True,
+            "probability": round(probability, 3),
+            "prediction_score": prediction_score,
+            "note": llm_note,
+        }
+    except Exception as e:
+        # Log the error, but always return a 200 with a fallback note
+        logger.error(f"Prediction failed for {symbol}: {e}", exc_info=True)
+        return {
+            "symbol": symbol.upper(),
+            "model_loaded": True,
             "probability": None,
             "prediction_score": None,
-            "note": "No trained model yet.",
+            "note": "AI prediction temporarily unavailable due to data or model issue. Please try again later.",
         }
-    df = _fetch_history(symbol)
-    features = latest_feature_vector(df)
-    missing = [c for c in FEATURE_COLUMNS if c not in features]
-    if missing:
-        logger.warning(f"Missing features: {missing}")
-
-    aligned = _align_features(features, _model)
-    X = pd.DataFrame([aligned])
-    if hasattr(_model, 'feature_names_in_'):
-        X = X[_model.feature_names_in_]
-
-    probability = float(_model.predict_proba(X)[0, 1])
-    prediction_score = round(probability * 100)
-    llm_note = _generate_llm_note(features, probability, symbol)
-    return {
-        "symbol": symbol.upper(),
-        "model_loaded": True,
-        "probability": round(probability, 3),
-        "prediction_score": prediction_score,
-        "note": llm_note,
-    }
 
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8007)), reload=True)
