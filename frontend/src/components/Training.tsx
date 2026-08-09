@@ -1,37 +1,23 @@
 // frontend/src/components/Training.tsx
-import React, { useState, useEffect } from "react";
-import { api, TrainingModelStatus } from "../api";
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 
-const Training: React.FC = () => {
+import { useEffect, useState } from "react";
+import { api, TrainingModelStatus } from "../api";  // ← fixed import
+
+export default function Training() {
   const [status, setStatus] = useState<TrainingModelStatus | null>(null);
   const [loading, setLoading] = useState(true);
-  const [trainingInProgress, setTrainingInProgress] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [training, setTraining] = useState(false);
+  const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
 
   const fetchStatus = async () => {
-    setLoading(true);
-    setError(null);
     try {
+      setLoading(true);
       const data = await api.getTrainingStatus();
       setStatus(data);
     } catch (err) {
-      setError((err as Error).message);
+      showToast("error", "Failed to fetch training status. Please refresh.");
     } finally {
       setLoading(false);
-    }
-  };
-
-  const handleTrain = async () => {
-    setTrainingInProgress(true);
-    setError(null);
-    try {
-      await api.triggerTraining();
-      setTimeout(fetchStatus, 3000);
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setTrainingInProgress(false);
     }
   };
 
@@ -39,135 +25,209 @@ const Training: React.FC = () => {
     fetchStatus();
   }, []);
 
-  if (loading) {
+  const showToast = (type: "success" | "error" | "info", message: string) => {
+    setToast({ type, message });
+    setTimeout(() => setToast(null), 5000);
+  };
+
+  const handleTriggerTraining = async () => {
+    if (training) return;
+    setTraining(true);
+    showToast("info", "⏳ Training started... This may take a minute.");
+
+    try {
+      const response = await api.triggerTraining();
+      if (response.status === "success" || response.status === "started") {
+        showToast("success", "✅ Training triggered successfully! The model will be updated shortly.");
+        setTimeout(() => {
+          fetchStatus();
+          setTraining(false);
+        }, 3000);
+      } else {
+        showToast("error", "⚠️ Training failed: " + (response.message || "Unknown error"));
+        setTraining(false);
+      }
+    } catch (err) {
+      showToast("error", "❌ Failed to trigger training. Please try again.");
+      setTraining(false);
+    }
+  };
+
+  const formatDate = (dateStr: string | null | undefined) => {
+    if (!dateStr) return "Never";
+    return new Date(dateStr).toLocaleString("en-IN", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
+
+  const renderMetrics = (metrics: any) => {
+    if (!metrics) return <p className="text-mist/40 text-sm">No model trained yet.</p>;
     return (
-      <div className="flex items-center justify-center h-64">
-        <p className="font-mono text-mist">Loading training data...</p>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-2">
+        <MetricCard label="Accuracy" value={metrics.accuracy} />
+        <MetricCard label="Precision" value={metrics.precision} />
+        <MetricCard label="Recall" value={metrics.recall} />
+        <MetricCard label="F1 Score" value={metrics.f1} />
+        <MetricCard label="ROC AUC" value={metrics.roc_auc} />
+        <MetricCard label="Train Size" value={metrics.train_size} />
+        <MetricCard label="Val Size" value={metrics.val_size} />
       </div>
     );
-  }
-
-  if (error) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <p className="font-mono text-signal-sell">Error: {error}</p>
-      </div>
-    );
-  }
-
-  const t1Success = status?.performance?.['T+1 Success'] ?? 0;
-  const t5Success = status?.performance?.['T+5 Success'] ?? 0;
-
-  const prodModel = status?.production_model;
-  const candModel = status?.candidate_model;
-
-  const chartData = [
-    { name: 'T+1 Success', value: t1Success },
-    { name: 'T+5 Success', value: t5Success },
-  ];
+  };
 
   return (
-    <div className="container mx-auto p-6">
-      <div className="flex justify-between items-center mb-6">
-        <h1 className="text-3xl font-bold text-paper">Training Intelligence</h1>
-        <button
-          onClick={handleTrain}
-          disabled={trainingInProgress}
-          className="font-mono text-xs uppercase tracking-widest bg-signal-prepare/10 text-signal-prepare border border-signal-prepare/30 rounded-lg px-4 py-2 hover:bg-signal-prepare/20 transition disabled:opacity-50"
+    <div className="space-y-6">
+      {/* Toast Alert */}
+      {toast && (
+        <div
+          className={`fixed top-20 right-4 z-50 px-5 py-3 rounded-xl shadow-2xl font-mono text-sm flex items-center gap-3 transition-all duration-300 transform ${
+            toast.type === "success"
+              ? "bg-green-500/20 border border-green-400/40 text-green-400"
+              : toast.type === "error"
+              ? "bg-red-500/20 border border-red-400/40 text-red-400"
+              : "bg-blue-500/20 border border-blue-400/40 text-blue-400"
+          } animate-slideIn`}
         >
-          {trainingInProgress ? 'Training...' : 'Trigger Training'}
+          <span>{toast.message}</span>
+          <button
+            onClick={() => setToast(null)}
+            className="ml-2 text-mist/60 hover:text-paper transition"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <h2 className="font-display text-2xl text-paper">🧠 Training Intelligence</h2>
+        <button
+          onClick={handleTriggerTraining}
+          disabled={training}
+          className={`font-mono text-sm px-5 py-2 rounded-lg transition-all ${
+            training
+              ? "bg-slate/30 text-mist/50 cursor-not-allowed"
+              : "bg-signal-prepare/20 text-signal-prepare border border-signal-prepare/30 hover:bg-signal-prepare/30"
+          }`}
+        >
+          {training ? (
+            <span className="flex items-center gap-2">
+              <Spinner />
+              Training...
+            </span>
+          ) : (
+            "⚡ Trigger Training"
+          )}
         </button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-        <div className="bg-graphite border border-slate/60 rounded-xl p-4">
-          <div className="text-sm text-mist">T+1 Success</div>
-          <div className="text-2xl font-bold text-paper">{t1Success}%</div>
+      {/* Model Status */}
+      {loading ? (
+        <div className="flex justify-center py-12">
+          <Spinner size="lg" />
         </div>
-        <div className="bg-graphite border border-slate/60 rounded-xl p-4">
-          <div className="text-sm text-mist">T+5 Success</div>
-          <div className="text-2xl font-bold text-paper">{t5Success}%</div>
-        </div>
-        <div className="bg-graphite border border-slate/60 rounded-xl p-4">
-          <div className="text-sm text-mist">Dataset Size</div>
-          <div className="text-2xl font-bold text-paper">{status?.dataset_size ?? 0}</div>
-        </div>
-        <div className="bg-graphite border border-slate/60 rounded-xl p-4">
-          <div className="text-sm text-mist">Model Version</div>
-          <div className="text-2xl font-bold text-paper">{prodModel?.version || 'None'}</div>
-        </div>
-      </div>
+      ) : (
+        <div className="space-y-6">
+          {/* Production Model */}
+          <div className="bg-graphite border border-slate rounded-xl p-5">
+            <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
+              📦 Production Model
+            </h3>
+            {status?.production_model ? (
+              <div>
+                <div className="flex items-center gap-4 flex-wrap">
+                  <span className="font-mono text-sm text-paper">
+                    Version: {status.production_model.version}
+                  </span>
+                  <span className="font-mono text-xs text-mist/60">
+                    Trained: {formatDate(status.production_model.training_date)}
+                  </span>
+                  <span
+                    className={`font-mono text-xs px-2 py-0.5 rounded-full ${
+                      status.production_model.status === "active"
+                        ? "bg-signal-buy/20 text-signal-buy"
+                        : "bg-signal-hold/20 text-signal-hold"
+                    }`}
+                  >
+                    {status.production_model.status}
+                  </span>
+                </div>
+                {renderMetrics(status.production_model.metrics)}
+              </div>
+            ) : (
+              <p className="text-mist/40 text-sm">No production model deployed.</p>
+            )}
+          </div>
 
-      <div className="bg-graphite border border-slate/60 rounded-xl p-4 mb-6">
-        <div className="text-paper font-bold mb-4">Model Performance</div>
-        <div className="h-64">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={chartData}>
-              <XAxis dataKey="name" stroke="#888" fontSize={12} />
-              <YAxis stroke="#888" fontSize={12} />
-              <Tooltip
-                contentStyle={{ backgroundColor: '#1a1a2e', border: '1px solid #333' }}
-                labelStyle={{ color: '#e0e0e0' }}
-              />
-              <Bar dataKey="value" fill="#4f46e5" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div className="bg-graphite border border-slate/60 rounded-xl p-4">
-          <div className="text-sm text-mist mb-2">Production Model</div>
-          {prodModel ? (
-            <div className="space-y-1 font-mono text-xs text-mist">
-              <p>Version: <span className="text-paper">{prodModel.version}</span></p>
-              <p>Trained: <span className="text-paper">
-                {prodModel.training_date ? new Date(prodModel.training_date).toLocaleString() : 'Unknown'}
-              </span></p>
-              {prodModel.metrics ? (
-                <>
-                  <p>Accuracy: <span className="text-paper">{prodModel.metrics.accuracy.toFixed(2)}</span></p>
-                  <p>Precision: <span className="text-paper">{prodModel.metrics.precision.toFixed(2)}</span></p>
-                  <p>Recall: <span className="text-paper">{prodModel.metrics.recall.toFixed(2)}</span></p>
-                  <p>F1: <span className="text-paper">{prodModel.metrics.f1.toFixed(2)}</span></p>
-                  <p>ROC AUC: <span className="text-paper">{prodModel.metrics.roc_auc.toFixed(2)}</span></p>
-                </>
-              ) : (
-                <p className="text-mist/60">Metrics not available</p>
-              )}
+          {/* Candidate Model */}
+          {status?.candidate_model && (
+            <div className="bg-graphite border border-slate/60 rounded-xl p-5">
+              <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
+                🧪 Candidate Model
+              </h3>
+              <div>
+                <div className="flex items-center gap-4 flex-wrap">
+                  <span className="font-mono text-sm text-paper">
+                    Version: {status.candidate_model.version}
+                  </span>
+                  <span className="font-mono text-xs text-mist/60">
+                    Trained: {formatDate(status.candidate_model.training_date)}
+                  </span>
+                  <span
+                    className={`font-mono text-xs px-2 py-0.5 rounded-full ${
+                      status.candidate_model.status === "candidate"
+                        ? "bg-signal-prepare/20 text-signal-prepare"
+                        : "bg-signal-hold/20 text-signal-hold"
+                    }`}
+                  >
+                    {status.candidate_model.status}
+                  </span>
+                </div>
+                {renderMetrics(status.candidate_model.metrics)}
+              </div>
             </div>
-          ) : (
-            <p className="text-mist/60 text-sm">No production model yet.</p>
           )}
-        </div>
 
-        <div className="bg-graphite border border-slate/60 rounded-xl p-4">
-          <div className="text-sm text-mist mb-2">Candidate Model</div>
-          {candModel ? (
-            <div className="space-y-1 font-mono text-xs text-mist">
-              <p>Version: <span className="text-paper">{candModel.version}</span></p>
-              <p>Trained: <span className="text-paper">
-                {candModel.training_date ? new Date(candModel.training_date).toLocaleString() : 'Unknown'}
-              </span></p>
-              {candModel.metrics ? (
-                <>
-                  <p>Accuracy: <span className="text-paper">{candModel.metrics.accuracy.toFixed(2)}</span></p>
-                  <p>Precision: <span className="text-paper">{candModel.metrics.precision.toFixed(2)}</span></p>
-                  <p>Recall: <span className="text-paper">{candModel.metrics.recall.toFixed(2)}</span></p>
-                  <p>F1: <span className="text-paper">{candModel.metrics.f1.toFixed(2)}</span></p>
-                  <p>ROC AUC: <span className="text-paper">{candModel.metrics.roc_auc.toFixed(2)}</span></p>
-                </>
-              ) : (
-                <p className="text-mist/60">Metrics not available</p>
-              )}
-            </div>
-          ) : (
-            <p className="text-mist/60 text-sm">No candidate model yet. Run training to create one.</p>
-          )}
+          {/* Overall stats */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <StatCard label="Last Training" value={formatDate(status?.last_training_date)} />
+            <StatCard label="Dataset Size" value={status?.dataset_size ?? 0} />
+            <StatCard label="T+1 Success" value={(status?.performance?.['T+1 Success'] ?? 0) + "%"} />
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
-};
+}
 
-export default Training;
+// ── Helper Components ──
+
+function Spinner({ size = "sm" }: { size?: "sm" | "lg" }) {
+  const dimension = size === "lg" ? "w-8 h-8" : "w-4 h-4";
+  return (
+    <div className={`${dimension} border-2 border-current border-t-transparent rounded-full animate-spin`} />
+  );
+}
+
+function MetricCard({ label, value }: { label: string; value: number | string }) {
+  const num = typeof value === "number" ? (value * 100).toFixed(1) + "%" : value;
+  return (
+    <div className="bg-ink/40 border border-slate/40 rounded-lg px-3 py-2">
+      <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider">{label}</div>
+      <div className="font-mono text-sm text-paper mt-0.5">{num}</div>
+    </div>
+  );
+}
+
+function StatCard({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="bg-ink/40 border border-slate/40 rounded-xl px-4 py-3">
+      <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider">{label}</div>
+      <div className="font-mono text-lg text-paper mt-1">{value}</div>
+    </div>
+  );
+}
