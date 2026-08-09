@@ -88,6 +88,7 @@ def _extract_event_signals(events: dict | None) -> dict:
     earnings_days_out = None
     now = datetime.utcnow()
 
+    # Earnings proximity
     next_earnings = events.get("next_earnings_date")
     if next_earnings:
         try:
@@ -107,24 +108,39 @@ def _extract_event_signals(events: dict | None) -> dict:
         except (ValueError, TypeError):
             pass
 
+    # Earnings surprise
+    earnings_surprise = events.get("earnings_surprise")
+    if earnings_surprise and isinstance(earnings_surprise, dict):
+        surprise_pct = earnings_surprise.get("surprise_pct")
+        if surprise_pct is not None:
+            if surprise_pct > 5:
+                delta += 6
+                reasons.append(f"📈 Earnings surprise: +{surprise_pct:.1f}% beat")
+            elif surprise_pct < -5:
+                delta -= 6
+                reasons.append(f"📉 Earnings surprise: {surprise_pct:.1f}% miss")
+
+    # Analyst upgrades/downgrades
     analyst_actions = events.get("recent_analyst_actions") or []
     for action in analyst_actions[:2]:
         act = str(action.get("action", "")).lower()
         grade = str(action.get("to_grade", "")).lower()
+        firm = action.get("firm", "")
         if act in ("upgrade", "upgraded") or grade in ("buy", "strong buy", "outperform", "overweight"):
             delta += 6
-            reasons.append(f"📈 Analyst upgrade: {action.get('firm')} → {action.get('to_grade')}")
+            reasons.append(f"📈 Analyst upgrade: {firm} → {grade}")
             break
         elif act in ("downgrade", "downgraded") or grade in ("sell", "underperform", "underweight"):
             delta -= 6
-            reasons.append(f"📉 Analyst downgrade: {action.get('firm')} → {action.get('to_grade')}")
+            reasons.append(f"📉 Analyst downgrade: {firm} → {grade}")
             break
 
+    # Insider transactions
     insider_txns = events.get("recent_insider_transactions") or []
     for txn in insider_txns[:2]:
         txn_type = str(txn.get("transaction", "")).lower()
+        shares = txn.get("shares") or 0
         if "buy" in txn_type or "purchase" in txn_type:
-            shares = txn.get("shares") or 0
             if shares and shares > 1000:
                 delta += 5
                 reasons.append(f"🟢 Insider buying: {txn.get('insider', 'insider')} bought {shares:,} shares")
@@ -134,26 +150,26 @@ def _extract_event_signals(events: dict | None) -> dict:
             reasons.append(f"🔴 Insider selling: {txn.get('insider', 'insider')} sold shares")
             break
 
-    recent_news = events.get("recent_news") or []
-    positive_keywords = ["beats", "record", "upgrade", "wins contract", "buyback", "bonus", "expansion", "profit"]
-    negative_keywords = ["fraud", "probe", "penalty", "fine", "raid", "downgrade", "loss", "default"]
-
-    pos_news_count = 0
-    neg_news_count = 0
-    for item in recent_news[:5]:
-        title_lower = str(item.get("title", "")).lower()
-        if any(k in title_lower for k in positive_keywords):
-            pos_news_count += 1
-        if any(k in title_lower for k in negative_keywords):
-            neg_news_count += 1
-
-    if pos_news_count >= 2:
+    # Bulk/Block deals
+    bulk_deals = events.get("bulk_deals") or []
+    if bulk_deals:
         delta += 4
-        reasons.append(f"📰 {pos_news_count} positive recent news items")
-    elif neg_news_count >= 2:
-        delta -= 4
-        reasons.append(f"📰 {neg_news_count} negative recent news items")
+        reasons.append(f"📊 Bulk/Block deal detected")
 
+    # FII/DII net flow
+    fii_flow = events.get("fii_dii_net_flow")
+    if fii_flow and isinstance(fii_flow, dict):
+        net = fii_flow.get("net")
+        if net is not None:
+            if net > 0:
+                delta += 3
+                reasons.append(f"📈 FII/DII net inflow positive")
+            elif net < 0:
+                delta -= 3
+                reasons.append(f"📉 FII/DII net outflow negative")
+
+    # Recent news sentiment (already handled by news_score; but we can add events)
+    # Keep overall delta within bounds
     return {
         "event_score_delta": max(-15, min(15, delta)),
         "event_risk": event_risk,

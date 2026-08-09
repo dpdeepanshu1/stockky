@@ -1,8 +1,7 @@
 """
-News Intelligence Service - 512MB Stable
+News Intelligence Service - GenAI Enhanced
 ---------------------------
-Replaced heavy DistilBERT with VADER to guarantee deployment
-success on Render's 512MB free tier containers.
+Uses Hugging Face Inference API for sentiment scoring.
 """
 import os
 import logging
@@ -11,30 +10,18 @@ from typing import List
 from urllib.parse import quote
 
 import feedparser
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("news-intelligence-service")
 
-app = FastAPI(title="Stockky News Intelligence Service", version="0.2.0-stable")
+app = FastAPI(title="Stockky News Intelligence Service", version="0.3.0-genai")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Lightweight VADER analyzer uses less than 30MB of RAM
-analyzer = SentimentIntensityAnalyzer()
-logger.info("VADER sentiment analyzer loaded successfully!")
-
-HIGH_IMPACT_NEGATIVE = [
-    "fraud", "scam", "raid", "probe", "sebi action", "resignation", "resigns",
-    "downgrade", "default", "insolvency", "bankruptcy", "lawsuit", "penalty",
-    "fine imposed", "accounting irregularities", "auditor resigns", "ban",
-]
-HIGH_IMPACT_POSITIVE = [
-    "beats estimates", "record profit", "record revenue", "upgrade", "bags order",
-    "wins contract", "expansion", "buyback", "bonus issue", "stake acquisition",
-    "partnership", "new plant", "capacity expansion",
-]
+HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+HF_API_KEY = os.getenv("HF_API_KEY")
 
 NAME_HINTS = {
     "TCS": "Tata Consultancy Services",
@@ -56,17 +43,6 @@ NAME_HINTS = {
 def _company_query(symbol: str) -> str:
     base = symbol.replace(".NS", "").replace(".BO", "").upper()
     return NAME_HINTS.get(base, base) + " NSE stock"
-
-
-def _score_headline(title: str) -> float:
-    # Use VADER's compound score (-1 to +1) and apply domain-specific tweaks
-    base = analyzer.polarity_scores(title)["compound"]
-    lowered = title.lower()
-    if any(term in lowered for term in HIGH_IMPACT_NEGATIVE):
-        base -= 0.6
-    if any(term in lowered for term in HIGH_IMPACT_POSITIVE):
-        base += 0.4
-    return max(-1.0, min(1.0, base))
 
 
 def _fetch_headlines(symbol: str, max_items: int = 12) -> List[dict]:
@@ -94,13 +70,50 @@ def _fetch_headlines(symbol: str, max_items: int = 12) -> List[dict]:
     return items
 
 
+def _score_headline(title: str) -> float:
+    """
+    Call Hugging Face Inference API to get sentiment score.
+    Returns a float between -1 (negative) and +1 (positive).
+    Falls back to 0 if API fails.
+    """
+    if not HF_API_KEY:
+        logger.warning("HF_API_KEY not set; using neutral fallback")
+        return 0.0
+    try:
+        payload = {
+            "inputs": f"Classify the sentiment of this stock news headline as positive, negative, or neutral: {title}",
+            "parameters": {"max_new_tokens": 10, "temperature": 0.1}
+        }
+        headers = {
+            "Authorization": f"Bearer {HF_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        resp = httpx.post(HF_API_URL, json=payload, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Hugging Face returns a list of generated texts; we parse sentiment
+            result = data[0]['generated_text'].strip().lower()
+            if "positive" in result:
+                return 0.8
+            elif "negative" in result:
+                return -0.8
+            else:
+                return 0.0
+        else:
+            logger.warning(f"HF API error: {resp.status_code}")
+            return 0.0
+    except Exception as e:
+        logger.warning(f"HF API call failed: {e}")
+        return 0.0
+
+
 @app.get("/")
 def root():
     return {
         "service": "Stockky News Intelligence Service",
-        "version": "0.2.0-stable",
+        "version": "0.3.0-genai",
         "status": "running",
-        "model": "vaderSentiment",
+        "model": "Mistral-7B",
     }
 
 

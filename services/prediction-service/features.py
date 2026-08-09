@@ -14,6 +14,7 @@ FEATURE_COLUMNS = [
     "rsi_14", "macd_hist", "ema20_over_ema50", "ema50_over_ema200",
     "close_over_ema20", "adx_14", "bb_pct", "volume_ratio_20",
     "dist_from_20d_high_pct", "dist_from_20d_low_pct", "atr_pct",
+    "golden_cross",  # NEW: Golden cross signal
 ]
 
 
@@ -47,6 +48,12 @@ def compute_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     df["dist_from_20d_high_pct"] = (high.rolling(20).max() - close) / close * 100
     df["dist_from_20d_low_pct"]  = (close - low.rolling(20).min()) / close * 100
     df["atr_pct"]              = df["ATR_14"] / close * 100
+
+    # --- NEW: Golden Cross – 1 if EMA50 crossed above EMA200 within last 5 days ---
+    ema50 = df["EMA_50"]
+    ema200 = df["EMA_200"]
+    cross = ((ema50 > ema200) & (ema50.shift(1) <= ema200.shift(1))).astype(int)
+    df["golden_cross"] = cross.rolling(5).max().fillna(0).astype(int)
 
     return df
 

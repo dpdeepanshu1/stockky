@@ -230,6 +230,31 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
+    # --- NEW: Earnings Surprise ---
+    earnings_surprise = None
+    earnings_history = _yf_call(lambda: ticker.earnings_history, "Earnings history", sym)
+    if earnings_history is not None and not earnings_history.empty:
+        try:
+            latest = earnings_history.iloc[0]
+            actual = latest.get("actual")
+            estimate = latest.get("estimate")
+            if actual is not None and estimate is not None and estimate != 0:
+                surprise_pct = ((actual - estimate) / estimate) * 100
+                earnings_surprise = {
+                    "date": str(latest.name),
+                    "actual": _safe_float(actual),
+                    "estimate": _safe_float(estimate),
+                    "surprise_pct": round(surprise_pct, 2)
+                }
+        except Exception:
+            pass
+
+    # --- NEW: Bulk/Block Deals (placeholder) ---
+    bulk_deals = []
+
+    # --- NEW: FII/DII Net Flow (placeholder) ---
+    fii_dii_net_flow = None
+
     result = {
         "symbol": sym,
         "next_earnings_date": next_earnings,
@@ -239,6 +264,9 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         "recent_analyst_actions": recent_analyst,
         "institutional_holders": institutional_holders,
         "recent_news": recent_news,
+        "earnings_surprise": earnings_surprise,
+        "bulk_deals": bulk_deals,
+        "fii_dii_net_flow": fii_dii_net_flow,
         "checked_at": datetime.utcnow().isoformat(),
         "cached": False,
     }
@@ -352,6 +380,20 @@ def check_for_changes():
                 diff_reasons.append(
                     f"Insider {txn.get('transaction')}: {txn.get('insider')} — {txn.get('shares')} shares"
                 )
+
+        # --- NEW: Earnings surprise changes ---
+        prev_surprise = previous.get("earnings_surprise") or {}
+        cur_surprise = current.get("earnings_surprise") or {}
+        if prev_surprise.get("surprise_pct") != cur_surprise.get("surprise_pct"):
+            diff_reasons.append(
+                f"Earnings surprise: {cur_surprise.get('surprise_pct')}%"
+            )
+
+        # --- NEW: Bulk/Block deals ---
+        prev_bulk = previous.get("bulk_deals") or []
+        cur_bulk = current.get("bulk_deals") or []
+        if len(cur_bulk) != len(prev_bulk):
+            diff_reasons.append(f"Bulk/Block deal detected")
 
         if diff_reasons:
             changes.append({"symbol": symbol, "changes": diff_reasons, "current": current})

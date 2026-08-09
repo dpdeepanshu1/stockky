@@ -499,17 +499,68 @@ def get_fundamentals_raw(symbol: str):
         elif "institutionalPercent" in info:
             held_percent_institutions = _safe_info("institutionalPercent") * 100
 
-        # PE Ratio
-        pe_ratio = None
-        if "trailingPE" in info:
-            pe_ratio = _safe_info("trailingPE")
-        elif "peRatio" in info:
-            pe_ratio = _safe_info("peRatio")
+        # --- NEW METRICS ---
+        # PEG (P/E to Growth)
+        pe_growth = None
+        if pe_ratio is not None and earnings_growth is not None and earnings_growth != 0:
+            pe_growth = pe_ratio / earnings_growth
 
-        # Forward PE
-        forward_pe = None
-        if "forwardPE" in info:
-            forward_pe = _safe_info("forwardPE")
+        # EV/EBITDA
+        ev_ebitda = None
+        if "enterpriseToEbitda" in info:
+            ev_ebitda = _safe_info("enterpriseToEbitda")
+
+        # Price to Book
+        price_to_book = None
+        if "priceToBook" in info:
+            price_to_book = _safe_info("priceToBook")
+
+        # ROCE (Return on Capital Employed)
+        roce = None
+        if "returnOnCapitalEmployed" in info:
+            roce = _safe_info("returnOnCapitalEmployed") * 100
+
+        # Operating Profit Margin (OPM)
+        opm = None
+        if "operatingMargins" in info:
+            opm = _safe_info("operatingMargins") * 100
+        elif financials_available and "Operating Income" in financials.index and "Total Revenue" in financials.index:
+            op_income = financials.loc["Operating Income"].iloc[0]
+            revenue = financials.loc["Total Revenue"].iloc[0]
+            opm = (op_income / revenue) * 100 if revenue != 0 else None
+
+        # Current Ratio
+        current_ratio = None
+        if balance_available and "Total Current Assets" in balance.index and "Total Current Liabilities" in balance.index:
+            ca = balance.loc["Total Current Assets"].iloc[0]
+            cl = balance.loc["Total Current Liabilities"].iloc[0]
+            current_ratio = ca / cl if cl != 0 else None
+
+        # Interest Coverage Ratio (EBIT / Interest Expense)
+        interest_coverage = None
+        if financials_available:
+            if "EBIT" in financials.index and "Interest Expense" in financials.index:
+                ebit = financials.loc["EBIT"].iloc[0]
+                interest = financials.loc["Interest Expense"].iloc[0]
+                interest_coverage = ebit / interest if interest != 0 else None
+            elif "Operating Income" in financials.index and "Interest Expense" in financials.index:
+                ebit = financials.loc["Operating Income"].iloc[0]
+                interest = financials.loc["Interest Expense"].iloc[0]
+                interest_coverage = ebit / interest if interest != 0 else None
+
+        # Promoter Holding (often not available in yfinance)
+        promoter_holding = None
+        if "promoterHolding" in info:
+            promoter_holding = _safe_info("promoterHolding") * 100
+
+        # Promoter Pledging
+        promoter_pledging = None
+        if "promoterPledging" in info:
+            promoter_pledging = _safe_info("promoterPledging") * 100
+
+        # PE Ratio (already extracted)
+        pe_ratio = _safe_info("trailingPE") if "trailingPE" in info else _safe_info("peRatio")
+        forward_pe = _safe_info("forwardPE")
 
         # EPS
         eps = None
@@ -517,11 +568,6 @@ def get_fundamentals_raw(symbol: str):
             eps = _safe_info("trailingEps")
         elif "eps" in info:
             eps = _safe_info("eps")
-
-        # Price to Book
-        price_to_book = None
-        if "priceToBook" in info:
-            price_to_book = _safe_info("priceToBook")
 
         # Market Cap
         market_cap = _safe_info("marketCap")
@@ -550,13 +596,6 @@ def get_fundamentals_raw(symbol: str):
         if year_change_pct is not None:
             year_change_pct = year_change_pct * 100
 
-        # Range position
-        range_position = None
-        if year_high and year_low:
-            last_price = _safe_info("regularMarketPrice") or _safe_info("last_price")
-            if last_price and year_high != year_low:
-                range_position = round((last_price - year_low) / (year_high - year_low) * 100, 1)
-
         sector = info.get("sector")
         industry = info.get("industry")
 
@@ -571,17 +610,24 @@ def get_fundamentals_raw(symbol: str):
             "year_low": year_low,
             "fifty_day_average": fifty_day_average,
             "two_hundred_day_average": two_hundred_day_average,
-            "range_position_pct": range_position,
             "revenue_growth": revenue_growth,
             "earnings_growth": earnings_growth,
             "eps": eps,
             "roe": roe,
+            "roce": roce,
             "debt_to_equity": debt_to_equity,
             "free_cashflow": free_cashflow,
             "profit_margins": profit_margins,
+            "opm": opm,
+            "current_ratio": current_ratio,
+            "interest_coverage": interest_coverage,
             "held_percent_insiders": _safe_info("heldPercentInsiders") * 100 if _safe_info("heldPercentInsiders") else None,
             "held_percent_institutions": held_percent_institutions,
             "price_to_book": price_to_book,
+            "pe_growth": pe_growth,
+            "ev_ebitda": ev_ebitda,
+            "promoter_holding": promoter_holding,
+            "promoter_pledging": promoter_pledging,
             "sector": sector,
             "industry": industry,
         }
@@ -605,17 +651,24 @@ def get_fundamentals_raw(symbol: str):
                 "year_low": None,
                 "fifty_day_average": None,
                 "two_hundred_day_average": None,
-                "range_position_pct": None,
                 "revenue_growth": None,
                 "earnings_growth": None,
                 "eps": None,
                 "roe": _safe(sec_info.get("roe")),
+                "roce": None,
                 "debt_to_equity": _safe(sec_info.get("debtToEquity")),
                 "free_cashflow": None,
                 "profit_margins": None,
+                "opm": None,
+                "current_ratio": None,
+                "interest_coverage": None,
                 "held_percent_insiders": None,
                 "held_percent_institutions": None,
                 "price_to_book": None,
+                "pe_growth": None,
+                "ev_ebitda": None,
+                "promoter_holding": None,
+                "promoter_pledging": None,
                 "sector": sec_info.get("sector"),
                 "industry": sec_info.get("industry"),
             }

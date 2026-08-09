@@ -67,57 +67,127 @@ def analyze(symbol: str):
     if not f or not isinstance(f, dict):
         f = {}
 
-    # Extract metrics
-    rev_growth = f.get("revenue_growth")
+    # Extract metrics (including new ones)
+    pe_ratio = f.get("pe_ratio")
+    forward_pe = f.get("forward_pe")
+    revenue_growth = f.get("revenue_growth")
     earnings_growth = f.get("earnings_growth")
     roe = f.get("roe")
-    d2e = f.get("debt_to_equity")
-    fcf = f.get("free_cashflow")
-    margins = f.get("profit_margins")
-    inst_holding = f.get("held_percent_institutions")
-    pe = f.get("pe_ratio")
-    forward_pe = f.get("forward_pe")
+    roce = f.get("roce")
+    debt_to_equity = f.get("debt_to_equity")
+    free_cashflow = f.get("free_cashflow")
+    profit_margins = f.get("profit_margins")
+    opm = f.get("opm")
+    current_ratio = f.get("current_ratio")
+    interest_coverage = f.get("interest_coverage")
+    held_percent_institutions = f.get("held_percent_institutions")
+    price_to_book = f.get("price_to_book")
+    pe_growth = f.get("pe_growth")
+    ev_ebitda = f.get("ev_ebitda")
+    promoter_holding = f.get("promoter_holding")
+    promoter_pledging = f.get("promoter_pledging")
+    sector = f.get("sector")
+    market_cap = f.get("market_cap")
 
     metrics = {
-        "revenue_growth": rev_growth,
+        "pe_ratio": pe_ratio,
+        "forward_pe": forward_pe,
+        "revenue_growth": revenue_growth,
         "earnings_growth": earnings_growth,
         "roe": roe,
-        "debt_to_equity": d2e,
-        "free_cashflow": fcf,
-        "profit_margins": margins,
-        "institutional_holding": inst_holding,
-        "pe_ratio": pe,
-        "forward_pe": forward_pe,
+        "roce": roce,
+        "debt_to_equity": debt_to_equity,
+        "free_cashflow": free_cashflow,
+        "profit_margins": profit_margins,
+        "opm": opm,
+        "current_ratio": current_ratio,
+        "interest_coverage": interest_coverage,
+        "institutional_holding": held_percent_institutions,
+        "price_to_book": price_to_book,
+        "pe_growth": pe_growth,
+        "ev_ebitda": ev_ebitda,
+        "promoter_holding": promoter_holding,
+        "promoter_pledging": promoter_pledging,
     }
 
-    # --- FIXED: Correct Fallback Logic ---
-    # If we have a P/E, Sector, or Market Cap, then data is NOT a fallback!
+    # --- Determine fallback ---
     has_any_data = False
-    if any(v is not None for v in [pe, f.get("sector"), f.get("market_cap")]):
+    if any(v is not None for v in [pe_ratio, sector, market_cap, revenue_growth, roe]):
         has_any_data = True
-        
-    # Only force fallback mode if we have ZERO useful data.
-    if not has_any_data and not any(v is not None for v in [rev_growth, earnings_growth, roe, d2e, fcf, margins]):
+    if not has_any_data and not any(v is not None for v in [revenue_growth, earnings_growth, roe, debt_to_equity, free_cashflow, profit_margins]):
         fallback_used = True
     else:
         fallback_used = False
 
     score = 50
     reasons = []
+    valuation_note = "fair"
 
-    # Scoring logic (same as before)
-    if rev_growth is not None:
-        if rev_growth > 15:
-            score += 12
-            reasons.append(f"Revenue growing {rev_growth:.1f}% YoY — strong expansion")
-        elif rev_growth > 5:
-            score += 5
-            reasons.append(f"Revenue growing {rev_growth:.1f}% YoY — steady growth")
-        elif rev_growth < 0:
-            score -= 12
-            reasons.append(f"Revenue declining {rev_growth:.1f}% YoY — red flag")
+    # --- Valuation Multiples ---
+    if pe_ratio is not None:
+        if pe_ratio < 0:
+            score -= 10
+            valuation_note = "unprofitable (negative P/E)"
+            reasons.append("Negative P/E — company currently unprofitable")
+        elif pe_ratio > 60:
+            score -= 8
+            valuation_note = "expensive"
+            reasons.append(f"P/E at {pe_ratio:.1f} — richly valued, needs strong growth to justify")
+        elif pe_ratio < 15:
+            score += 6
+            valuation_note = "attractive"
+            reasons.append(f"P/E at {pe_ratio:.1f} — attractively valued vs typical large-cap range")
         else:
-            reasons.append(f"Revenue growth flat at {rev_growth:.1f}%")
+            valuation_note = "fair"
+            reasons.append(f"P/E at {pe_ratio:.1f} — fair valuation")
+
+        if forward_pe and pe_ratio and forward_pe < pe_ratio:
+            score += 4
+            reasons.append("Forward P/E lower than trailing P/E — earnings expected to grow into valuation")
+
+    # PEG (P/E to Growth)
+    if pe_growth is not None:
+        if pe_growth < 1.0:
+            score += 6
+            reasons.append(f"PEG at {pe_growth:.2f} (<1.0) — undervalued relative to growth")
+        elif pe_growth < 2.0:
+            score += 2
+            reasons.append(f"PEG at {pe_growth:.2f} — reasonably valued")
+        else:
+            score -= 2
+            reasons.append(f"PEG at {pe_growth:.2f} (>2.0) — overvalued relative to growth")
+
+    # EV/EBITDA
+    if ev_ebitda is not None:
+        if ev_ebitda < 10:
+            score += 4
+            reasons.append(f"EV/EBITDA at {ev_ebitda:.1f} — attractively valued")
+        elif ev_ebitda > 20:
+            score -= 4
+            reasons.append(f"EV/EBITDA at {ev_ebitda:.1f} — richly valued")
+
+    # P/B
+    if price_to_book is not None:
+        if price_to_book < 1.5:
+            score += 3
+            reasons.append(f"P/B at {price_to_book:.2f} — low relative to book value")
+        elif price_to_book > 5:
+            score -= 3
+            reasons.append(f"P/B at {price_to_book:.2f} — high relative to book value")
+
+    # --- Profitability ---
+    if revenue_growth is not None:
+        if revenue_growth > 15:
+            score += 12
+            reasons.append(f"Revenue growing {revenue_growth:.1f}% YoY — strong expansion")
+        elif revenue_growth > 5:
+            score += 5
+            reasons.append(f"Revenue growing {revenue_growth:.1f}% YoY — steady growth")
+        elif revenue_growth < 0:
+            score -= 12
+            reasons.append(f"Revenue declining {revenue_growth:.1f}% YoY — red flag")
+        else:
+            reasons.append(f"Revenue growth flat at {revenue_growth:.1f}%")
 
     if earnings_growth is not None:
         if earnings_growth > 15:
@@ -138,53 +208,89 @@ def analyze(symbol: str):
             score -= 8
             reasons.append(f"ROE at {roe:.1f}% — weak returns on equity")
 
-    if d2e is not None:
-        if d2e < 50:
+    if roce is not None:
+        if roce > 20:
             score += 8
-            reasons.append(f"Debt/Equity at {d2e:.0f} — low leverage, low risk")
-        elif d2e > 150:
-            score -= 12
-            reasons.append(f"Debt/Equity at {d2e:.0f} — high leverage, elevated risk")
+            reasons.append(f"ROCE at {roce:.1f}% — excellent return on capital employed")
+        elif roce > 12:
+            score += 4
+            reasons.append(f"ROCE at {roce:.1f}% — healthy capital efficiency")
         else:
-            reasons.append(f"Debt/Equity at {d2e:.0f} — moderate leverage")
+            score -= 4
+            reasons.append(f"ROCE at {roce:.1f}% — weak return on capital")
 
-    if fcf is not None:
-        if fcf > 0:
+    if profit_margins is not None:
+        if profit_margins > 15:
+            score += 8
+            reasons.append(f"Net margin at {profit_margins:.1f}% — strong pricing power/efficiency")
+        elif profit_margins < 5:
+            score -= 8
+            reasons.append(f"Net margin at {profit_margins:.1f}% — thin profitability")
+
+    if opm is not None:
+        if opm > 20:
+            score += 6
+            reasons.append(f"Operating margin at {opm:.1f}% — strong operational efficiency")
+        elif opm < 8:
+            score -= 6
+            reasons.append(f"Operating margin at {opm:.1f}% — low operational efficiency")
+
+    # --- Solvency & Liquidity ---
+    if debt_to_equity is not None:
+        if debt_to_equity < 0.5:
+            score += 8
+            reasons.append(f"Debt/Equity at {debt_to_equity:.2f} — low leverage, low risk")
+        elif debt_to_equity > 1.5:
+            score -= 12
+            reasons.append(f"Debt/Equity at {debt_to_equity:.2f} — high leverage, elevated risk")
+        else:
+            reasons.append(f"Debt/Equity at {debt_to_equity:.2f} — moderate leverage")
+
+    if current_ratio is not None:
+        if current_ratio > 1.5:
+            score += 4
+            reasons.append(f"Current ratio at {current_ratio:.2f} — good short-term liquidity")
+        elif current_ratio < 1.0:
+            score -= 6
+            reasons.append(f"Current ratio at {current_ratio:.2f} — poor short-term liquidity")
+
+    if interest_coverage is not None:
+        if interest_coverage > 3:
+            score += 5
+            reasons.append(f"Interest coverage at {interest_coverage:.1f} — healthy ability to service debt")
+        elif interest_coverage < 1.5:
+            score -= 8
+            reasons.append(f"Interest coverage at {interest_coverage:.1f} — risky debt servicing")
+
+    # --- Cash Flow ---
+    if free_cashflow is not None:
+        if free_cashflow > 0:
             score += 8
             reasons.append("Positive free cash flow — self-funding operations and growth")
         else:
             score -= 10
             reasons.append("Negative free cash flow — relies on external financing")
 
-    if margins is not None:
-        if margins > 15:
-            score += 8
-            reasons.append(f"Net margin at {margins:.1f}% — strong pricing power/efficiency")
-        elif margins < 5:
-            score -= 8
-            reasons.append(f"Net margin at {margins:.1f}% — thin profitability")
-
-    if inst_holding is not None and inst_holding > 40:
+    # --- Institutional / Promoter Holding ---
+    if held_percent_institutions is not None and held_percent_institutions > 40:
         score += 6
-        reasons.append(f"Institutions hold {inst_holding:.1f}% — strong smart-money confidence")
+        reasons.append(f"Institutions hold {held_percent_institutions:.1f}% — strong smart-money confidence")
 
-    valuation_note = "fair"
-    if pe is not None:
-        if pe < 0:
-            score -= 10
-            valuation_note = "unprofitable (negative P/E)"
-            reasons.append("Negative P/E — company currently unprofitable")
-        elif pe > 60:
-            score -= 8
-            valuation_note = "expensive"
-            reasons.append(f"P/E at {pe:.1f} — richly valued, needs strong growth to justify")
-        elif pe < 15:
-            score += 6
-            valuation_note = "attractive"
-            reasons.append(f"P/E at {pe:.1f} — attractively valued vs typical large-cap range")
-        if forward_pe and pe and forward_pe < pe:
+    if promoter_holding is not None:
+        if promoter_holding > 50:
             score += 4
-            reasons.append("Forward P/E lower than trailing P/E — earnings expected to grow into valuation")
+            reasons.append(f"Promoter holding at {promoter_holding:.1f}% — strong management conviction")
+        elif promoter_holding < 25:
+            score -= 4
+            reasons.append(f"Promoter holding at {promoter_holding:.1f}% — low management ownership")
+
+    if promoter_pledging is not None:
+        if promoter_pledging > 20:
+            score -= 10
+            reasons.append(f"Promoter pledging at {promoter_pledging:.1f}% — high risk of margin calls")
+        elif promoter_pledging > 10:
+            score -= 5
+            reasons.append(f"Promoter pledging at {promoter_pledging:.1f}% — moderate risk")
 
     if fallback_used:
         reasons.append("Live data temporarily unavailable — score is based on last known or default values")
