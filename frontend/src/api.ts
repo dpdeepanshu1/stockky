@@ -162,6 +162,7 @@ export interface TrainingStatusResponse {
     val_samples: number;
   }>;
   model_version: string | null;
+  training_in_progress: boolean;   // <-- ADDED THIS
 }
 
 /** Response from triggering training */

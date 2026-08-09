@@ -12,6 +12,13 @@ export default function Training() {
   const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
   const [isStopping, setIsStopping] = useState(false);
 
+  // NEW: prediction history and insights
+  const [predictions, setPredictions] = useState<any[]>([]);
+  const [insights, setInsights] = useState<any[]>([]);
+  const [summaryMetrics, setSummaryMetrics] = useState<any>(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [loadingInsights, setLoadingInsights] = useState(false);
+
   const timerIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -24,9 +31,13 @@ export default function Training() {
       const data = await api.getTrainingStatus();
       setStatus(data);
 
-      // ✅ Stop training immediately if model exists
-      if (training && data.production_model_exists && data.last_training) {
-        stopTraining(true);
+      if (data.production_model_exists && data.last_training) {
+        if (training) {
+          stopTraining(true);
+        }
+      }
+      if (training && data.training_in_progress === false) {
+        stopTraining(false);
       }
     } catch (err) {
       showToast("error", "Failed to fetch training status.");
@@ -35,13 +46,62 @@ export default function Training() {
     }
   };
 
+  const fetchPredictionHistory = async () => {
+    setLoadingHistory(true);
+    try {
+      // We'll fetch via the API gateway, which routes to /api/predictions/history
+      const response = await fetch(
+        `${import.meta.env.VITE_API_URL}/training/api/predictions/history?limit=20`,
+        { headers: { "Content-Type": "application/json" } }
+      );
+      if (response.ok) {
+        const data = await response.json();
+        setPredictions(data.predictions || []);
+      }
+    } catch (err) {
+      console.error("Failed to fetch prediction history:", err);
+    } finally {
+      setLoadingHistory(false);
+    }
+  };
+
+  const fetchInsights = async () => {
+    setLoadingInsights(true);
+    try {
+      const response = await fetch(
+        `${import.meta.env.VITE_API_URL}/training/api/insights`,
+        { headers: { "Content-Type": "application/json" } }
+      );
+      if (response.ok) {
+        const data = await response.json();
+        setInsights(data.insights || []);
+      }
+    } catch (err) {
+      console.error("Failed to fetch insights:", err);
+    } finally {
+      setLoadingInsights(false);
+    }
+  };
+
+  const fetchSummaryMetrics = async () => {
+    try {
+      const response = await fetch(
+        `${import.meta.env.VITE_API_URL}/training/api/metrics/summary`,
+        { headers: { "Content-Type": "application/json" } }
+      );
+      if (response.ok) {
+        const data = await response.json();
+        setSummaryMetrics(data.latest_run || null);
+      }
+    } catch (err) {
+      console.error("Failed to fetch summary metrics:", err);
+    }
+  };
+
   const clearLock = async () => {
     try {
-      // Use the service URL from status, or fallback to environment variable
       const baseUrl = status?.service_url || import.meta.env.VITE_TRAINING_SERVICE_URL || "https://training-service-5e9v.onrender.com";
-      const response = await fetch(`${baseUrl}/lock`, {
-        method: "DELETE",
-      });
+      const response = await fetch(`${baseUrl}/lock`, { method: "DELETE" });
       if (response.ok) {
         showToast("success", "Training lock cleared.");
         return true;
@@ -58,6 +118,9 @@ export default function Training() {
   // ---------- Lifecycle ----------
   useEffect(() => {
     fetchStatus();
+    fetchPredictionHistory();
+    fetchInsights();
+    fetchSummaryMetrics();
     return () => {
       if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
@@ -97,7 +160,7 @@ export default function Training() {
     }
     if (success) {
       showToast("success", "✅ Training completed successfully! Model is deployed.");
-      fetchStatus(); // refresh immediately
+      fetchStatus();
     } else {
       showToast("error", "❌ Training stopped or interrupted.");
     }
@@ -106,6 +169,12 @@ export default function Training() {
   // ---------- Handlers ----------
   const handleTriggerTraining = async () => {
     if (training) return;
+
+    if (status?.training_in_progress) {
+      showToast("info", "⏳ Training is already running. Monitoring...");
+      startTraining();
+      return;
+    }
 
     showToast("info", "⏳ Starting training...");
 
@@ -143,7 +212,10 @@ export default function Training() {
 
   const handleRefresh = () => {
     fetchStatus();
-    showToast("info", "Refreshing status...");
+    fetchPredictionHistory();
+    fetchInsights();
+    fetchSummaryMetrics();
+    showToast("info", "Refreshing all data...");
   };
 
   const handleRestart = () => {
@@ -218,6 +290,80 @@ export default function Training() {
     );
   };
 
+  // Render prediction history table
+  const renderPredictionHistory = () => {
+    if (loadingHistory) return <Spinner />;
+    if (!predictions.length) return <p className="text-mist/40 text-sm">No predictions recorded yet.</p>;
+
+    return (
+      <div className="overflow-x-auto mt-2">
+        <table className="w-full text-xs font-mono">
+          <thead>
+            <tr className="text-mist/50 border-b border-slate/40">
+              <th className="text-left py-1 pr-4">Symbol</th>
+              <th className="text-left py-1 pr-4">Decision</th>
+              <th className="text-left py-1 pr-4">Price</th>
+              <th className="text-left py-1 pr-4">Date</th>
+              <th className="text-left py-1 pr-4">T+1 Success</th>
+              <th className="text-left py-1 pr-4">T+5 Success</th>
+              <th className="text-left py-1">Outcome</th>
+            </tr>
+          </thead>
+          <tbody>
+            {predictions.map((p) => (
+              <tr key={p.prediction_id} className="border-b border-slate/30">
+                <td className="py-1 pr-4 text-paper">{p.symbol}</td>
+                <td className="py-1 pr-4 text-mist/80">{p.decision}</td>
+                <td className="py-1 pr-4 text-mist/80">₹{p.price?.toFixed(2) || "—"}</td>
+                <td className="py-1 pr-4 text-mist/60">{formatDate(p.timestamp)}</td>
+                <td className="py-1 pr-4">
+                  <span className={p.t1_success === 1 ? "text-signal-buy" : p.t1_success === 0 ? "text-mist/40" : "text-red-400"}>
+                    {p.t1_success === 1 ? "✅" : p.t1_success === 0 ? "⏳" : "❌"}
+                  </span>
+                </td>
+                <td className="py-1 pr-4">
+                  <span className={p.t5_success === 1 ? "text-signal-buy" : p.t5_success === 0 ? "text-mist/40" : "text-red-400"}>
+                    {p.t5_success === 1 ? "✅" : p.t5_success === 0 ? "⏳" : "❌"}
+                  </span>
+                </td>
+                <td className="py-1">
+                  {p.outcomes?.length ? (
+                    <span className="text-mist/60">
+                      {p.outcomes.map((o: any) => `${o.period}: ${o.return_pct?.toFixed(2) || "—"}%`).join(" | ")}
+                    </span>
+                  ) : "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  // Render insights
+  const renderInsights = () => {
+    if (loadingInsights) return <Spinner />;
+    if (!insights.length) return <p className="text-mist/40 text-sm">No insights available yet.</p>;
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+        {insights.map((insight, idx) => (
+          <div key={idx} className="bg-ink/40 border border-slate/40 rounded-lg px-3 py-2">
+            <div className="font-mono text-xs text-paper">{insight.insight}</div>
+            <div className="flex gap-3 mt-1 text-xs text-mist/60">
+              <span>📊 {insight.sample_size} samples</span>
+              <span className={insight.confidence === "high" ? "text-signal-buy" : "text-yellow-400"}>
+                {insight.confidence} confidence
+              </span>
+              {insight.active && <span className="text-green-400">• active</span>}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-6">
       {/* Toast Alert */}
@@ -247,17 +393,17 @@ export default function Training() {
         <div className="flex flex-wrap gap-3">
           <button
             onClick={handleTriggerTraining}
-            disabled={training}
+            disabled={training || status?.training_in_progress}
             className={`font-mono text-sm px-5 py-2 rounded-lg transition-all ${
-              training
+              training || status?.training_in_progress
                 ? "bg-slate/30 text-mist/50 cursor-not-allowed"
                 : "bg-signal-prepare/20 text-signal-prepare border border-signal-prepare/30 hover:bg-signal-prepare/30"
             }`}
           >
-            {training ? (
+            {training || status?.training_in_progress ? (
               <span className="flex items-center gap-2">
                 <Spinner />
-                Training...
+                {training ? "Training..." : "Running..."}
               </span>
             ) : (
               "⚡ Trigger Training"
@@ -289,12 +435,14 @@ export default function Training() {
       </div>
 
       {/* Training in progress card */}
-      {training && (
+      {(training || status?.training_in_progress) && (
         <div className="bg-graphite border border-signal-prepare/30 rounded-xl p-5 animate-pulse">
           <div className="flex items-center gap-4">
             <Spinner size="lg" />
             <div>
-              <h3 className="font-display text-lg text-signal-prepare">Training in progress...</h3>
+              <h3 className="font-display text-lg text-signal-prepare">
+                {training ? "Training in progress..." : "Training is running in background..."}
+              </h3>
               <div className="flex flex-wrap gap-6 mt-2 text-sm">
                 <div>
                   <span className="text-mist/60">Elapsed: </span>
@@ -397,6 +545,37 @@ export default function Training() {
               )}
             </div>
           )}
+
+          {/* ----- NEW: Prediction History ----- */}
+          <div className="bg-graphite border border-slate/60 rounded-xl p-5">
+            <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
+              📋 Prediction History (T+1 / T+5 tracking)
+            </h3>
+            {renderPredictionHistory()}
+          </div>
+
+          {/* ----- NEW: Summary Metrics (from training runs) ----- */}
+          {summaryMetrics && (
+            <div className="bg-graphite border border-slate/60 rounded-xl p-5">
+              <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
+                📊 Training Run Summary
+              </h3>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-2">
+                <StatCard label="Run Date" value={formatDate(summaryMetrics.timestamp)} />
+                <StatCard label="Dataset Size" value={summaryMetrics.dataset_size || 0} />
+                <StatCard label="Symbols" value={summaryMetrics.num_symbols || 0} />
+                <StatCard label="Sharpe" value={summaryMetrics.metrics?.SharpeRatio?.toFixed(3) || "—"} />
+              </div>
+            </div>
+          )}
+
+          {/* ----- NEW: Learning Insights ----- */}
+          <div className="bg-graphite border border-slate/60 rounded-xl p-5">
+            <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
+              💡 Learning Insights
+            </h3>
+            {renderInsights()}
+          </div>
         </div>
       )}
     </div>
