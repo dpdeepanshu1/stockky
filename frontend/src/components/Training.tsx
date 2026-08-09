@@ -11,19 +11,21 @@ export default function Training() {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [showFolds, setShowFolds] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
-  
+  const [isStopping, setIsStopping] = useState(false);
+
   const timerIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const ESTIMATED_TOTAL_SECONDS = 300; // 5 minutes
 
+  // ---------- API calls ----------
   const fetchStatus = async () => {
     try {
       setLoading(true);
       const data = await api.getTrainingStatus();
       setStatus(data);
-      
-      // If training was in progress and now model exists with recent timestamp, stop training state
+
+      // Auto-detect training completion
       if (training && data.production_model_exists && data.last_training) {
         const lastTrainingDate = new Date(data.last_training);
         const now = new Date();
@@ -38,6 +40,22 @@ export default function Training() {
     }
   };
 
+  const clearLock = async () => {
+    try {
+      const response = await fetch(`${import.meta.env.VITE_API_URL}/lock`, {
+        method: "DELETE",
+      });
+      if (response.ok) {
+        showToast("success", "Training lock cleared.");
+      } else {
+        showToast("error", "Failed to clear lock.");
+      }
+    } catch (err) {
+      showToast("error", "Error clearing lock.");
+    }
+  };
+
+  // ---------- Lifecycle ----------
   useEffect(() => {
     fetchStatus();
     return () => {
@@ -46,6 +64,7 @@ export default function Training() {
     };
   }, []);
 
+  // ---------- UI helpers ----------
   const showToast = (type: "success" | "error" | "info", message: string) => {
     setToast({ type, message });
     setTimeout(() => setToast(null), 5000);
@@ -55,10 +74,10 @@ export default function Training() {
     setTraining(true);
     setTrainingStartTime(new Date());
     setElapsedSeconds(0);
-    
+
     if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
     timerIntervalRef.current = setInterval(() => {
-      setElapsedSeconds(prev => prev + 1);
+      setElapsedSeconds((prev) => prev + 1);
     }, 1000);
 
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
@@ -80,17 +99,18 @@ export default function Training() {
     }
     if (success) {
       showToast("success", "✅ Training completed successfully! Model is deployed.");
-      fetchStatus();
+      fetchStatus(); // refresh immediately
     } else {
-      showToast("error", "❌ Training failed or was interrupted.");
+      showToast("error", "❌ Training stopped or interrupted.");
     }
   };
 
+  // ---------- Handlers ----------
   const handleTriggerTraining = async () => {
     if (training) return;
-    
+
     showToast("info", "⏳ Starting training...");
-    
+
     try {
       const response = await api.triggerTraining();
       if (response.status === "started" || response.status === "Training started successfully") {
@@ -109,6 +129,33 @@ export default function Training() {
     }
   };
 
+  const handleStopTraining = async () => {
+    if (!training) {
+      showToast("info", "No training in progress.");
+      return;
+    }
+    setIsStopping(true);
+    try {
+      await clearLock();
+      stopTraining(false);
+      showToast("info", "Training stopped. Lock cleared.");
+    } catch (err) {
+      showToast("error", "Failed to stop training.");
+    } finally {
+      setIsStopping(false);
+    }
+  };
+
+  const handleRefresh = () => {
+    fetchStatus();
+    showToast("info", "Refreshing status...");
+  };
+
+  const handleRestart = () => {
+    window.location.reload();
+  };
+
+  // ---------- Render helpers ----------
   const formatDate = (dateStr: string | null | undefined) => {
     if (!dateStr) return "Never";
     return new Date(dateStr).toLocaleString("en-IN", {
@@ -123,7 +170,7 @@ export default function Training() {
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
   };
 
   const getEstimatedRemaining = () => {
@@ -200,26 +247,50 @@ export default function Training() {
       )}
 
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-4">
         <h2 className="font-display text-2xl text-paper">🧠 Training Intelligence</h2>
-        <button
-          onClick={handleTriggerTraining}
-          disabled={training}
-          className={`font-mono text-sm px-5 py-2 rounded-lg transition-all ${
-            training
-              ? "bg-slate/30 text-mist/50 cursor-not-allowed"
-              : "bg-signal-prepare/20 text-signal-prepare border border-signal-prepare/30 hover:bg-signal-prepare/30"
-          }`}
-        >
-          {training ? (
-            <span className="flex items-center gap-2">
-              <Spinner />
-              Training...
-            </span>
-          ) : (
-            "⚡ Trigger Training"
-          )}
-        </button>
+        <div className="flex flex-wrap gap-3">
+          <button
+            onClick={handleTriggerTraining}
+            disabled={training}
+            className={`font-mono text-sm px-5 py-2 rounded-lg transition-all ${
+              training
+                ? "bg-slate/30 text-mist/50 cursor-not-allowed"
+                : "bg-signal-prepare/20 text-signal-prepare border border-signal-prepare/30 hover:bg-signal-prepare/30"
+            }`}
+          >
+            {training ? (
+              <span className="flex items-center gap-2">
+                <Spinner />
+                Training...
+              </span>
+            ) : (
+              "⚡ Trigger Training"
+            )}
+          </button>
+
+          <button
+            onClick={handleStopTraining}
+            disabled={!training || isStopping}
+            className="font-mono text-sm px-4 py-2 rounded-lg bg-red-500/20 text-red-400 border border-red-400/30 hover:bg-red-500/30 transition disabled:opacity-50"
+          >
+            {isStopping ? "Stopping..." : "⏹ Stop Training"}
+          </button>
+
+          <button
+            onClick={handleRefresh}
+            className="font-mono text-sm px-4 py-2 rounded-lg bg-blue-500/20 text-blue-400 border border-blue-400/30 hover:bg-blue-500/30 transition"
+          >
+            🔄 Refresh
+          </button>
+
+          <button
+            onClick={handleRestart}
+            className="font-mono text-sm px-4 py-2 rounded-lg bg-yellow-500/20 text-yellow-400 border border-yellow-400/30 hover:bg-yellow-500/30 transition"
+          >
+            🔁 Restart Page
+          </button>
+        </div>
       </div>
 
       {/* Training in progress card */}
@@ -240,7 +311,7 @@ export default function Training() {
                 </div>
               </div>
               <div className="mt-2 text-xs text-mist/40">
-                This may take a few minutes. The page will auto‑update when done.
+                The page auto‑updates when done. You can also click Refresh or Stop.
               </div>
             </div>
           </div>
