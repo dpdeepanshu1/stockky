@@ -1,83 +1,140 @@
 """
-Model registry for production and candidate models.
-[reference:28]
+SQLAlchemy models for the training service.
+
+Tables:
+- PredictionSnapshot: stores the feature snapshot at prediction time (immutable).
+- PredictionOutcome: stores T+1 and T+5 evaluation results.
+- TrainingRun: tracks each training pipeline run (for auditing and metrics).
 """
-import joblib
-import os
-import json
 from datetime import datetime
-from typing import Dict, Optional
+from sqlalchemy import (
+    Column, String, Float, Integer, Boolean, DateTime, JSON, Text, create_engine
+)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
-class ModelRegistry:
-    def __init__(self, model_dir: str = './models'):
-        self.model_dir = model_dir
-        os.makedirs(model_dir, exist_ok=True)
+# ---------- Base ----------
+Base = declarative_base()
 
-    def save_production_model(self, model, scaler, config: Dict, metrics: Dict) -> str:
-        """Save production model with versioning."""
-        version = f"v{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        model_path = os.path.join(self.model_dir, f'production_{version}.pkl')
-        scaler_path = os.path.join(self.model_dir, f'production_{version}_scaler.pkl')
-        meta_path = os.path.join(self.model_dir, f'production_{version}_meta.json')
 
-        joblib.dump(model, model_path)
-        joblib.dump(scaler, scaler_path)
+# ---------- Models ----------
+class PredictionSnapshot(Base):
+    """Immutable snapshot of a prediction at the time it was made."""
+    __tablename__ = "prediction_snapshots"
 
-        metadata = {
-            'version': version,
-            'created_at': datetime.now().isoformat(),
-            'config': config,
-            'metrics': metrics,
-            'status': 'production'
-        }
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    prediction_id = Column(String(50), unique=True, nullable=False, index=True)  # e.g., STK-20260810-001
+    symbol = Column(String(20), nullable=False, index=True)
+    timestamp = Column(DateTime, nullable=False, index=True)  # when prediction was made
+    price = Column(Float, nullable=False)                     # entry price
+    decision = Column(String(20), nullable=False)             # BUY, PREPARE_TO_BUY, etc.
+    confidence = Column(String(20))                           # High/Medium/Low
+    combined_score = Column(Float)
+    technical_score = Column(Float)
+    fundamental_score = Column(Float)
+    news_score = Column(Float, nullable=True)
+    prediction_score = Column(Float, nullable=True)
+    market_score = Column(Float)
+    market_sentiment_adjustment = Column(Float)
+    training_score = Column(Float)
+    event_risk = Column(Boolean, default=False)
+    entry_range_low = Column(Float, nullable=True)
+    entry_range_high = Column(Float, nullable=True)
+    target = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    holding_period = Column(String(50), nullable=True)
+    support = Column(Float, nullable=True)
+    resistance = Column(Float, nullable=True)
+    sector = Column(String(50), nullable=True)
+    valuation = Column(Text, nullable=True)
 
-        with open(meta_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
+    # Market sentiment at prediction time
+    market_mood = Column(String(20), nullable=True)           # BULLISH, BEARISH, NEUTRAL
+    market_score = Column(Float, nullable=True)
+    nifty_change_pct = Column(Float, nullable=True)
+    sensex_change_pct = Column(Float, nullable=True)
 
-        # Update production pointer
-        with open(os.path.join(self.model_dir, 'production_pointer.json'), 'w') as f:
-            json.dump({'version': version, 'path': model_path}, f)
+    # Technical features (snapshot of key indicators)
+    rsi = Column(Float, nullable=True)
+    macd = Column(String(20), nullable=True)
+    ema = Column(String(20), nullable=True)
+    volume_ratio = Column(Float, nullable=True)
 
-        return version
+    # Fundamental features (snapshot)
+    debt_to_equity = Column(Float, nullable=True)
+    roe = Column(Float, nullable=True)
+    roce = Column(Float, nullable=True)
 
-    def save_candidate_model(self, model, scaler, config: Dict, metrics: Dict) -> str:
-        """Save candidate model for validation."""
-        version = f"candidate_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        model_path = os.path.join(self.model_dir, f'{version}.pkl')
-        scaler_path = os.path.join(self.model_dir, f'{version}_scaler.pkl')
-        meta_path = os.path.join(self.model_dir, f'{version}_meta.json')
+    # Additional feature snapshot as JSON (for flexibility)
+    feature_snapshot = Column(JSON, nullable=True)
 
-        joblib.dump(model, model_path)
-        joblib.dump(scaler, scaler_path)
+    # Metadata
+    model_version = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-        metadata = {
-            'version': version,
-            'created_at': datetime.now().isoformat(),
-            'config': config,
-            'metrics': metrics,
-            'status': 'candidate'
-        }
+    # Outcome flags (updated after evaluation)
+    t1_success = Column(Integer, default=0)   # 0 = pending, 1 = success, 2 = failed
+    t5_success = Column(Integer, default=0)
+    overall_success = Column(Integer, default=0)
 
-        with open(meta_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
 
-        return version
+class PredictionOutcome(Base):
+    """Evaluation outcomes for a prediction (T+1, T+5)."""
+    __tablename__ = "prediction_outcomes"
 
-    def get_production_model(self):
-        """Load the current production model."""
-        pointer_path = os.path.join(self.model_dir, 'production_pointer.json')
-        if not os.path.exists(pointer_path):
-            return None, None
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    prediction_id = Column(String(50), nullable=False, index=True)
+    evaluation_period = Column(String(10), nullable=False, index=True)  # 'T+1' or 'T+5'
+    evaluation_date = Column(DateTime, nullable=False)
 
-        with open(pointer_path, 'r') as f:
-            pointer = json.load(f)
+    # Price data for the evaluation day
+    open_price = Column(Float, nullable=True)
+    high_price = Column(Float, nullable=True)
+    low_price = Column(Float, nullable=True)
+    close_price = Column(Float, nullable=True)
 
-        model_path = pointer.get('path')
-        if not model_path or not os.path.exists(model_path):
-            return None, None
+    # Metrics
+    max_favorable_excursion = Column(Float, nullable=True)   # percentage
+    max_adverse_excursion = Column(Float, nullable=True)    # percentage
+    return_pct = Column(Float, nullable=True)
 
-        model = joblib.load(model_path)
-        scaler_path = model_path.replace('.pkl', '_scaler.pkl')
-        scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+    # Flags
+    entry_reached = Column(Integer, default=0)
+    target_reached = Column(Integer, default=0)
+    stop_loss_reached = Column(Integer, default=0)
+    direction_correct = Column(Integer, default=0)
+    success = Column(Integer, default=0)   # 1 = success, 0 = failure
 
-        return model, scaler
+    # Additional information
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TrainingRun(Base):
+    """Tracks each training pipeline run with configuration and performance."""
+    __tablename__ = "training_runs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_timestamp = Column(DateTime, nullable=False, index=True)
+    config = Column(JSON, nullable=False)                     # full config JSON
+    dataset_size = Column(Integer)
+    num_symbols = Column(Integer)
+    model_version = Column(String(50), nullable=True)
+    walk_forward_metrics = Column(JSON, nullable=True)        # metrics from evaluation
+    fold_details = Column(JSON, nullable=True)                # list of fold info
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ---------- Database setup helpers ----------
+def get_engine(database_url="sqlite:///./training.db"):
+    """Return a SQLAlchemy engine."""
+    return create_engine(database_url, echo=False)
+
+def create_tables(engine):
+    """Create all tables if they don't exist."""
+    Base.metadata.create_all(engine)
+
+def get_session(engine):
+    """Return a new session."""
+    Session = sessionmaker(bind=engine)
+    return Session()
