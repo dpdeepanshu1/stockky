@@ -40,9 +40,12 @@ jobs:
           EVENT_TRACKER_URL: ${{ secrets.EVENT_TRACKER_URL }}
           PREDICTION_URL: ${{ secrets.PREDICTION_URL }}
           NOTIFICATION_URL: ${{ secrets.NOTIFICATION_URL }}
+          MARKET_SENTIMENT_URL: ${{ secrets.MARKET_SENTIMENT_URL }}
+          TRAINING_URL: ${{ secrets.TRAINING_URL }}
           SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
         run: |
           echo "Pinging all services to wake them up (preventing cold starts)..."
+          # Individual pings to ensure each service is woken
           curl -I $API_GATEWAY_URL/health || true
           curl -I $MARKET_DATA_URL/health || true
           curl -I $TECHNICAL_URL/health || true
@@ -52,7 +55,13 @@ jobs:
           curl -I $EVENT_TRACKER_URL/health || true
           curl -I $PREDICTION_URL/health || true
           curl -I $NOTIFICATION_URL/health || true
+          curl -I $MARKET_SENTIMENT_URL/health || true
+          curl -I $TRAINING_URL/health || true
           curl -I $SCHEDULER_URL/health || true
+
+          # Also call the API Gateway's /wake/all endpoint (new) to wake all via one call
+          curl -X POST $API_GATEWAY_URL/wake/all || true
+
           echo "Waiting 60 seconds for services to fully spin up..."
           sleep 60
 

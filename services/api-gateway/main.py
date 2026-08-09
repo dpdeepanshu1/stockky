@@ -6,6 +6,7 @@ Includes async scan with progress, symbol correction, Hinglish summaries,
 market movers, watchlist scan, Telegram notifications, and dynamic universe.
 v2.2.0 adds Training Service proxy routes.
 v2.3.0 adds /market/indices endpoint for live NIFTY & SENSEX.
+v2.4.0 adds Market Sentiment to system health and /wake/all endpoint.
 """
 import os
 import json
@@ -39,8 +40,9 @@ FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-ser
 EVENT_URL = os.getenv("EVENT_URL", "https://event-tracker-service-m1lw.onrender.com")
 PREDICTION_URL = os.getenv("PREDICTION_URL", "https://prediction-service-wowb.onrender.com")
 
-# ---- Training Service URL ----
-TRAINING_URL = os.getenv("TRAINING_URL", "http://training-service:8010")
+# ---- NEW: Market Sentiment & Training URLs ----
+MARKET_SENTIMENT_URL = os.getenv("MARKET_SENTIMENT_URL", "https://market-sentiment-service.onrender.com")
+TRAINING_URL = os.getenv("TRAINING_URL", "https://training-service-5e9v.onrender.com")
 
 # Service definitions for system health
 SYSTEM_SERVICES = {
@@ -52,10 +54,11 @@ SYSTEM_SERVICES = {
     "event-tracker": {"url": EVENT_URL, "required": False},
     "prediction": {"url": PREDICTION_URL, "required": False},
     "notification": {"url": NOTIFICATION_URL, "required": False},
-    "training": {"url": TRAINING_URL, "required": False},
+    "market-sentiment": {"url": MARKET_SENTIMENT_URL, "required": False},  # NEW
+    "training": {"url": TRAINING_URL, "required": False},                   # NEW
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.3.0")
+app = FastAPI(title="Stockky API Gateway", version="2.4.0")
 
 # --- CORS Middleware (explicit) ---
 app.add_middleware(
@@ -834,11 +837,12 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
             "/system/health": "GET – health of all downstream services",
+            "/wake/all": "POST – wake all services",
             "/watchlist": "GET/POST – manage watchlist",
             "/watchlist/add": "POST – add symbols",
             "/watchlist/{symbol}": "DELETE – remove symbol",
@@ -909,6 +913,24 @@ async def system_health():
     required_ok = all(v["ok"] for v in services.values() if v["required"])
     all_ok = all(v["ok"] for v in services.values())
     return {"required_ok": required_ok, "all_ok": all_ok, "services": services}
+
+# ── NEW: Wake all services ──────────────────────────────────────────────────
+@app.post("/wake/all")
+async def wake_all_services():
+    """Ping all services to wake them from cold start."""
+    results = {}
+    async with httpx.AsyncClient(timeout=5) as client:
+        for name, svc in SYSTEM_SERVICES.items():
+            url = svc["url"]
+            if not url:
+                results[name] = {"ok": False, "error": "no url"}
+                continue
+            try:
+                resp = await client.get(f"{url}/health")
+                results[name] = {"ok": resp.status_code == 200, "status": resp.status_code}
+            except Exception as e:
+                results[name] = {"ok": False, "error": str(e)}
+    return {"results": results}
 
 # ── Watchlist endpoints (unchanged) ──────────────────────────────────────────
 @app.get("/watchlist")
