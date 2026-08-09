@@ -46,7 +46,7 @@ engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine)
 
 LOCK_FILE = 'training.lock'
-LOCK_TIMEOUT_SECONDS = 300
+LOCK_TIMEOUT_SECONDS = 300  # 5 minutes
 
 # ---------- Pydantic models for prediction recording ----------
 class PredictionSnapshotCreate(BaseModel):
@@ -135,6 +135,10 @@ def acquire_lock():
 def release_lock():
     if os.path.exists(LOCK_FILE):
         os.remove(LOCK_FILE)
+        logger.info("Lock released")
+
+def is_training_running():
+    return os.path.exists(LOCK_FILE)
 
 # ----------------------------------------------------------------------
 # Helper functions
@@ -150,7 +154,8 @@ def get_training_status():
         'num_symbols': 0,
         'metrics': {},
         'fold_details': [],
-        'model_version': None
+        'model_version': None,
+        'training_in_progress': is_training_running()  # NEW: tell frontend if lock exists
     }
     if os.path.exists(report_path):
         try:
@@ -287,6 +292,11 @@ async def root():
 async def health():
     return JSONResponse(content={"status": "ok"})
 
+@app.get("/lock-status")
+async def lock_status():
+    """Return whether training lock exists (training in progress)."""
+    return JSONResponse(content={"training_in_progress": is_training_running()})
+
 @app.delete("/lock")
 async def clear_lock():
     if os.path.exists(LOCK_FILE):
@@ -310,6 +320,7 @@ async def api_trigger_training(background_tasks: BackgroundTasks):
             logger.error(f"Training failed: {e}")
         finally:
             release_lock()
+            logger.info("Training completed and lock released.")
     background_tasks.add_task(run_training)
     return JSONResponse(content={"status": "Training started successfully", "service_url": SERVICE_URL}, status_code=202)
 
@@ -472,7 +483,6 @@ async def prediction_history(limit: int = 50, offset: int = 0):
             .limit(limit)
             .all()
         )
-        # For each, also get the outcomes
         out = []
         for r in results:
             outcomes = db.query(PredictionOutcome).filter(
