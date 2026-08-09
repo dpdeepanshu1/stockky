@@ -92,7 +92,7 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 
-app = FastAPI(title="Stockky Market Data Service", version="0.1.2")
+app = FastAPI(title="Stockky Market Data Service", version="0.1.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -169,7 +169,7 @@ class QuoteResponse(BaseModel):
 async def root():
     return {
         "service": "Stockky Market Data Service",
-        "version": "0.1.2",
+        "version": "0.1.3",
         "status": "running",
         "cache_enabled": bool(cache),
         "endpoints": {
@@ -214,14 +214,11 @@ _nse_headers = {
 }
 
 def _fetch_nse_quote(symbol: str) -> Optional[dict]:
-    """Fetch quote from NSE India official API with robust cookie handling."""
     try:
         clean_sym = symbol.replace(".NS", "").replace(".BO", "")
-        # Use a persistent client with cookie handling
         with httpx.Client(headers=_nse_headers, timeout=15) as client:
-            # Fetch cookies from main page
-            client.get("https://www.nseindia.com")
-            time.sleep(0.5)  # Allow cookies to settle
+            client.get("https://www.nseindia.com") # Fetch cookies
+            time.sleep(0.5) # Pause to ensure cookies are set
             url = f"https://www.nseindia.com/api/quote-equity?symbol={clean_sym}"
             resp = client.get(url)
             if resp.status_code == 200:
@@ -279,7 +276,6 @@ def get_quote(symbol: str):
     # 2. Secondary: Alpha Vantage
     price = None
     if ALPHA_VANTAGE_API_KEY:
-        # Try with the exact sym (e.g., MVELECTRO.NS) then without .NS
         possible_symbols = [sym, sym.replace(".NS", "")]
         for alpha_sym in possible_symbols:
             try:
@@ -332,24 +328,23 @@ def get_quote(symbol: str):
             _cache_set(cache_key, result)
             return result
 
-    if price is not None:
-        result = {
-            "symbol": sym,
-            "name": sym,
-            "price": price,
-            "previous_close": None,
-            "day_change_pct": None,
-            "day_high": None,
-            "day_low": None,
-            "volume": None,
-            "market_cap": None,
-            "pe_ratio": None,
-            "fetched_at": datetime.utcnow().isoformat(),
-        }
-        _cache_set(cache_key, result, ttl=300)
-        return result
-
-    raise HTTPException(status_code=404, detail=f"Could not fetch quote for {sym}")
+    # 🔥 CRITICAL FIX: Instead of raising a 404 error, return a 200 response with price: None.
+    logger.warning(f"Could not fetch price for {sym} from any source. Returning fallback quote with price: None.")
+    result = {
+        "symbol": sym,
+        "name": sym,
+        "price": None,
+        "previous_close": None,
+        "day_change_pct": None,
+        "day_high": None,
+        "day_low": None,
+        "volume": None,
+        "market_cap": None,
+        "pe_ratio": None,
+        "fetched_at": datetime.utcnow().isoformat(),
+    }
+    _cache_set(cache_key, result, ttl=300)
+    return result
 
 @app.get("/history/{symbol}")
 def get_history(
