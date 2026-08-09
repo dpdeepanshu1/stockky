@@ -346,7 +346,11 @@ def get_history(
     try:
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
-        df = ticker.history(period=period, interval=interval, auto_adjust=True)
+        df = _with_retry(
+            lambda: ticker.history(period=period, interval=interval, auto_adjust=True),
+            max_retries=4,
+            base_delay=2,
+        )
         if df.empty:
             raise HTTPException(status_code=404, detail=f"No history found for {sym}")
 

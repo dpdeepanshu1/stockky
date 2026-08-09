@@ -31,7 +31,8 @@ import sys
 import pandas as pd
 import yfinance as yf
 from xgboost import XGBClassifier
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import classification_report, roc_auc_score, brier_score_loss
+from sklearn.calibration import CalibratedClassifierCV
 import joblib
 
 from features import compute_feature_frame, FEATURE_COLUMNS
@@ -237,24 +238,38 @@ def main():
     # the model generalizes to genuinely unseen future periods — which is
     # the only way it'll ever actually be used in production.
     #
-    # Instead: pick one calendar cutoff shared across every stock. Train on
-    # everything before it, test only on what comes after — mirroring
-    # exactly how the trained model gets used later (trained once on
-    # history, then scored against dates it has never seen).
-    cutoff_date = dataset["date"].quantile(0.8, interpolation="lower")
-    train_mask = dataset["date"] < cutoff_date
-    test_mask = ~train_mask
+    # Instead: pick calendar cutoffs shared across every stock. Train on
+    # everything before the first cutoff, test only on what comes after the
+    # second — mirroring exactly how the trained model gets used later
+    # (trained once on history, then scored against dates it has never
+    # seen). The middle slice is reserved for probability calibration
+    # (below) — kept time-respecting too, so calibration doesn't quietly
+    # reintroduce the same leakage this split was built to eliminate.
+    cutoff_calib = dataset["date"].quantile(0.64, interpolation="lower")
+    cutoff_test = dataset["date"].quantile(0.8, interpolation="lower")
+    fit_mask = dataset["date"] < cutoff_calib
+    calib_mask = (dataset["date"] >= cutoff_calib) & (dataset["date"] < cutoff_test)
+    test_mask = dataset["date"] >= cutoff_test
 
-    X_train, y_train = X[train_mask], y[train_mask]
+    X_fit, y_fit = X[fit_mask], y[fit_mask]
+    X_calib, y_calib = X[calib_mask], y[calib_mask]
     X_test, y_test = X[test_mask], y[test_mask]
 
-    logger.info("Time-based split — cutoff date: %s", cutoff_date.date())
+    logger.info("Time-based 3-way split — calibration cutoff: %s, test cutoff: %s",
+                cutoff_calib.date(), cutoff_test.date())
     logger.info(
-        "Train: %d rows (%s to %s), positive rate %.1f%%",
-        len(X_train),
-        dataset.loc[train_mask, "date"].min().date(),
-        dataset.loc[train_mask, "date"].max().date(),
-        y_train.mean() * 100,
+        "Fit:   %d rows (%s to %s), positive rate %.1f%%",
+        len(X_fit),
+        dataset.loc[fit_mask, "date"].min().date(),
+        dataset.loc[fit_mask, "date"].max().date(),
+        y_fit.mean() * 100,
+    )
+    logger.info(
+        "Calib: %d rows (%s to %s), positive rate %.1f%%",
+        len(X_calib),
+        dataset.loc[calib_mask, "date"].min().date(),
+        dataset.loc[calib_mask, "date"].max().date(),
+        y_calib.mean() * 100,
     )
     logger.info(
         "Test:  %d rows (%s to %s), positive rate %.1f%%",
@@ -271,33 +286,66 @@ def main():
             len(X_test),
         )
         return
+    if len(X_calib) < 50 or y_calib.nunique() < 2:
+        logger.error(
+            "Calibration set too small or single-class (%d rows) — can't safely "
+            "calibrate. Need a longer training history.",
+            len(X_calib),
+        )
+        return
 
     # Compute scale_pos_weight to handle class imbalance
-    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+    scale_pos_weight = (y_fit == 0).sum() / (y_fit == 1).sum()
     logger.info("Scale pos weight: %.2f", scale_pos_weight)
 
-    model = XGBClassifier(
+    base_model = XGBClassifier(
         n_estimators=300,          # Slightly more trees
         max_depth=4,
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
-        scale_pos_weight=scale_pos_weight,   # <-- NEW: penalises false negatives
+        scale_pos_weight=scale_pos_weight,   # <-- penalises false negatives
         eval_metric="logloss",
         random_state=42,
         use_label_encoder=False,
     )
-    model.fit(X_train, y_train)
+    base_model.fit(X_fit, y_fit)
 
-    preds = model.predict(X_test)
-    probs = model.predict_proba(X_test)[:, 1]
+    raw_probs_test = base_model.predict_proba(X_test)[:, 1]
+
+    # XGBoost's raw predict_proba output is not a well-calibrated
+    # probability out of the box — e.g. among rows it scores at "70%",
+    # the true positive rate is often meaningfully different from 70%.
+    # Since the app displays this number directly to users as "estimated
+    # probability", that gap matters. Fitting an isotonic/sigmoid mapping
+    # on a held-out (but still pre-test, time-respecting) calibration
+    # slice corrects for it without touching the underlying model.
+    #
+    # method="sigmoid" (Platt scaling) rather than "isotonic": isotonic
+    # is more flexible but needs more calibration data to avoid overfitting
+    # the calibration curve itself — sigmoid is the safer default at the
+    # dataset sizes a free-tier training run like this one produces.
+    calibrated_model = CalibratedClassifierCV(base_model, method="sigmoid", cv="prefit")
+    calibrated_model.fit(X_calib, y_calib)
+
+    preds = calibrated_model.predict(X_test)
+    probs = calibrated_model.predict_proba(X_test)[:, 1]
+
+    raw_brier = brier_score_loss(y_test, raw_probs_test)
+    calibrated_brier = brier_score_loss(y_test, probs)
 
     logger.info("\nOut-of-time test performance (dates the model never trained on):")
     logger.info("\n%s", classification_report(y_test, preds))
-    logger.info("ROC-AUC: %.3f", roc_auc_score(y_test, probs))
+    logger.info("ROC-AUC: %.3f (ranking ability — calibration doesn't change this)", roc_auc_score(y_test, probs))
+    logger.info(
+        "Brier score (lower is better; measures how trustworthy the probability "
+        "number itself is, not just the ranking): raw=%.4f -> calibrated=%.4f (%s)",
+        raw_brier, calibrated_brier,
+        "improved" if calibrated_brier < raw_brier else "no improvement — check calibration set size",
+    )
 
-    joblib.dump(model, "model.pkl")
-    logger.info("Model saved to model.pkl")
+    joblib.dump(calibrated_model, "model.pkl")
+    logger.info("Calibrated model saved to model.pkl")
 
     logger.info("=" * 80)
     logger.info("Training completed successfully")
