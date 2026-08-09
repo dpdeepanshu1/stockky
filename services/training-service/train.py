@@ -18,7 +18,7 @@ import gc
 import time
 import random
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 # Import our modules
 from targets import TargetGenerator
@@ -181,11 +181,11 @@ def build_multi_symbol_dataset(symbols, period="2y"):
     full = full.sort_values(['symbol','date']).reset_index(drop=True)
     return full
 
-def save_training_run_to_db(config, metrics, fold_details, model_version, dataset_size, num_symbols):
+def save_training_run_to_db(session, config, metrics, fold_details, model_version, dataset_size, num_symbols):
+    """Save training run details using the provided session."""
     if not HAS_DB:
         return
     try:
-        db = Session()
         run = db_models.TrainingRun(
             run_timestamp=datetime.now(),
             config=json.dumps(convert_numpy(config)),
@@ -195,16 +195,15 @@ def save_training_run_to_db(config, metrics, fold_details, model_version, datase
             walk_forward_metrics=json.dumps(convert_numpy(metrics)),
             fold_details=json.dumps(convert_numpy(fold_details))
         )
-        db.add(run)
-        db.commit()
+        session.add(run)
+        session.commit()
         logger.info("Training run logged to database")
     except Exception as e:
         logger.error(f"Failed to log training run to DB: {e}")
-    finally:
-        db.close()
+        session.rollback()
 
 # ---------- Main Training Pipeline ----------
-def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
+def run_training_pipeline(config: Dict[str, Any], db_session: Optional[Session] = None) -> Dict[str, Any]:
     np.random.seed(config['random_seed'])
     random.seed(config['random_seed'])
 
@@ -359,8 +358,17 @@ def run_training_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     joblib.dump(report, 'training_report.joblib')
     logger.info("Training report saved to training_report.joblib")
 
-    if HAS_DB:
-        save_training_run_to_db(config, metrics, fold_reports, model_version, len(df), len(df['symbol'].unique()))
+    # Log training run to DB if session provided
+    if HAS_DB and db_session is not None:
+        save_training_run_to_db(
+            db_session,
+            config,
+            metrics,
+            fold_reports,
+            model_version,
+            len(df),
+            len(df['symbol'].unique())
+        )
 
     return report
 
@@ -372,7 +380,7 @@ def train_model(db_session, model_store_path: str):
     Training entry point called by main.py.
     
     Args:
-        db_session: SQLAlchemy session (optional, kept for compatibility)
+        db_session: SQLAlchemy session to use for logging
         model_store_path: Path to store trained models
     """
     logger.info("=" * 60)
@@ -397,7 +405,8 @@ def train_model(db_session, model_store_path: str):
             logger.warning(f"Could not load config file: {e}")
     
     try:
-        report = run_training_pipeline(config)
+        # Pass the session to run_training_pipeline
+        report = run_training_pipeline(config, db_session=db_session)
         if report:
             logger.info("Training completed successfully")
             logger.info(f"Dataset size: {report.get('dataset_size', 0)}")
@@ -406,6 +415,9 @@ def train_model(db_session, model_store_path: str):
             logger.error("Training pipeline returned no report")
     except Exception as e:
         logger.error(f"Training failed: {e}")
+        # Rollback session on error if provided
+        if db_session is not None:
+            db_session.rollback()
         raise
 
 # ---------- Entry point ----------
@@ -427,4 +439,5 @@ if __name__ == '__main__':
     if args.no_db:
         HAS_DB = False
 
-    run_training_pipeline(config)
+    # When running standalone, we don't have a db_session, so pass None
+    run_training_pipeline(config, db_session=None)
