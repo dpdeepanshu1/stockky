@@ -29,35 +29,75 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 import uvicorn
 
+try:
+    from upstash_redis import Redis
+except ImportError:
+    Redis = None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scheduler-service")
 
-API_GATEWAY_URL   = os.getenv("API_GATEWAY_URL",   "https://api-gateway-wizr.onrender.com")
-EVENT_TRACKER_URL = os.getenv("EVENT_TRACKER_URL", "https://event-tracker-service-m1lw.onrender.com")
-NOTIFICATION_URL  = os.getenv("NOTIFICATION_URL",  "https://notification-service-36py.onrender.com")
+API_GATEWAY_URL   = os.getenv("API_GATEWAY_URL",   "https://api-gateway-wizr.onrender.com").rstrip("/")
+EVENT_TRACKER_URL = os.getenv("EVENT_TRACKER_URL", "https://event-tracker-service-m1lw.onrender.com").rstrip("/")
+NOTIFICATION_URL  = os.getenv("NOTIFICATION_URL",  "https://notification-service-36py.onrender.com").rstrip("/")
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
 REPORTS_DIR  = os.getenv("REPORTS_DIR", "/tmp/reports")
-STATE_PATH   = os.getenv("SCHEDULER_STATE_PATH", "/tmp/reports/last_decisions.json")
 IST = ZoneInfo("Asia/Kolkata")
 
 SCAN_WINDOW_START = dtime(8, 15)   # 1hr before market open (09:15 IST)
 SCAN_WINDOW_END   = dtime(16, 30)  # 1hr after market close (15:30 IST)
 
+# Same Redis keys run_once.py (the GitHub Actions path) uses. This service
+# and run_once.py are two independent triggers that can both fire a scan —
+# without sharing state, each would think it's the first to see a decision
+# change and notify separately, duplicating every alert. Sharing storage
+# means whichever one runs first "claims" the notification and the other
+# sees it's already been sent.
+STATE_KEY = "stockky:scheduler:last_decisions"
+EOD_KEY_PREFIX = "stockky:scheduler:eod:"
+
+_redis = None
+if Redis is not None:
+    try:
+        _redis = Redis(
+            url=os.getenv("UPSTASH_REDIS_REST_URL"),
+            token=os.getenv("UPSTASH_REDIS_REST_TOKEN"),
+        )
+        _redis.ping()
+        logger.info("Connected to Upstash Redis — decision state is shared with the GitHub Actions scheduler")
+    except Exception as e:
+        logger.warning(
+            "Redis unavailable (%s) — falling back to a local file. This means decision "
+            "state will NOT be shared with run_once.py/GitHub Actions, and will reset on "
+            "every restart, which risks duplicate notifications.", e
+        )
+        _redis = None
+
+STATE_PATH = os.getenv("SCHEDULER_STATE_PATH", "/tmp/reports/last_decisions.json")
+
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
 BUY_FAMILY = {"BUY NOW", "PREPARE TO BUY", "HOLD"}
 
-# All services that need to stay warm on Render free tier
+# These aren't called directly by this service (api-gateway proxies to all
+# of them) — they exist here purely so the keep-alive loop can ping every
+# service individually. Built from env vars (with the same defaults used
+# elsewhere in the repo) instead of as a second hardcoded URL list, so
+# there's exactly one place to update a URL, not two that can drift apart.
+MARKET_DATA_URL     = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com").rstrip("/")
+TECHNICAL_URL       = os.getenv("TECHNICAL_URL", "https://technical-analysis-service-zhnc.onrender.com").rstrip("/")
+FUNDAMENTAL_URL     = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-service.onrender.com").rstrip("/")
+DECISION_URL        = os.getenv("DECISION_URL", "https://decision-engine-service-0hg6.onrender.com").rstrip("/")
+PREDICTION_URL      = os.getenv("PREDICTION_URL", "https://prediction-service-wowb.onrender.com").rstrip("/")
+NEWS_URL            = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com").rstrip("/")
+
 KEEPALIVE_ENDPOINTS = [
-    "https://stockky-market-data.onrender.com/health",
-    "https://technical-analysis-service-zhnc.onrender.com/health",
-    "https://api-gateway-wizr.onrender.com/health",
-    "https://decision-engine-service-0hg6.onrender.com/health",
-    "https://event-tracker-service-m1lw.onrender.com/health",
-    "https://prediction-service-wowb.onrender.com/health",
-    "https://notification-service-36py.onrender.com/health",
-    "https://fundamental-analysis-service.onrender.com/health",
-    "https://news-intelligence-service.onrender.com/health",
+    f"{url}/health"
+    for url in (
+        MARKET_DATA_URL, TECHNICAL_URL, API_GATEWAY_URL, DECISION_URL,
+        EVENT_TRACKER_URL, PREDICTION_URL, NOTIFICATION_URL,
+        FUNDAMENTAL_URL, NEWS_URL,
+    )
 ]
 
 
@@ -86,6 +126,13 @@ def within_market_window(now: datetime) -> bool:
 
 
 def _load_last_decisions() -> dict:
+    if _redis:
+        try:
+            val = _redis.get(STATE_KEY)
+            return json.loads(val) if val else {}
+        except Exception as e:
+            logger.warning("Could not load previous decisions from Redis: %s", e)
+            return {}
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH) as f:
             return json.load(f)
@@ -93,6 +140,12 @@ def _load_last_decisions() -> dict:
 
 
 def _save_last_decisions(decisions: dict):
+    if _redis:
+        try:
+            _redis.set(STATE_KEY, json.dumps(decisions))
+            return
+        except Exception as e:
+            logger.warning("Could not persist decisions to Redis: %s", e)
     with open(STATE_PATH, "w") as f:
         json.dump(decisions, f, indent=2)
 
@@ -203,6 +256,15 @@ def run_end_of_day_report():
     if now.weekday() >= 5:
         return
 
+    date_key = EOD_KEY_PREFIX + now.strftime("%Y-%m-%d")
+    if _redis:
+        try:
+            if _redis.get(date_key):
+                logger.info("End-of-day report already sent today (by this service or run_once.py) — skipping")
+                return
+        except Exception as e:
+            logger.warning("Could not check EOD-sent flag, proceeding anyway: %s", e)
+
     try:
         resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=90)
         resp.raise_for_status()
@@ -231,6 +293,12 @@ def run_end_of_day_report():
         "📊 End-of-day report ready",
         f"{report['market_summary']} — {report['scanned_count']} stocks scanned.",
     )
+
+    if _redis:
+        try:
+            _redis.set(date_key, "1")
+        except Exception as e:
+            logger.warning("Could not mark EOD report as sent: %s", e)
 
 
 # ---------- Scheduler startup in background thread ----------

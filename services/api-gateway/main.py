@@ -933,7 +933,7 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
         if result.get("prediction_score") is None:
             # Attempt to fetch prediction to get the LLM note
             try:
-                pred_resp = httpx.get(f"{PREDICTION_URL}/predict/{symbol_to_use}", timeout=15)
+                pred_resp = httpx.get(f"{PREDICTION_URL}/predict/{symbol_to_use}", timeout=60)
                 if pred_resp.status_code == 200:
                     pred_data = pred_resp.json()
                     if pred_data.get("model_loaded"):
@@ -1012,7 +1012,7 @@ def run_scan(force_refresh: bool = False):
                 # --- NEW: Retrieve GenAI prediction note ---
                 if normalized.get("prediction_score") is None:
                     try:
-                        pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=15)
+                        pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=25)
                         if pred_resp.status_code == 200:
                             pred_data = pred_resp.json()
                             if pred_data.get("model_loaded"):
@@ -1171,7 +1171,7 @@ def scan_watchlist():
                 # --- NEW: Retrieve GenAI prediction note ---
                 if normalized.get("prediction_score") is None:
                     try:
-                        pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=15)
+                        pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=25)
                         if pred_resp.status_code == 200:
                             pred_data = pred_resp.json()
                             if pred_data.get("model_loaded"):

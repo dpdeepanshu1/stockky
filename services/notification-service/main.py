@@ -86,8 +86,7 @@ def root():
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
-            "/config": "GET – current notification configuration",
-            "/config": "POST – update notification configuration",
+            "/config": "GET – current config / POST – update config",
             "/config/{channel}": "DELETE – clear a channel",
             "/notify": "POST – send a notification",
             "/test": "POST – test notification delivery",
