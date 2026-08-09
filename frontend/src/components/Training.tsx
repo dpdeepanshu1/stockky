@@ -4,9 +4,10 @@ import { useEffect, useState } from "react";
 import { api, TrainingModelStatus } from "../api";
 
 export default function Training() {
-  const [status, setStatus] = useState<TrainingModelStatus | null>(null);
+  const [status, setStatus] = useState<any>(null); // we'll use a broader type
   const [loading, setLoading] = useState(true);
   const [training, setTraining] = useState(false);
+  const [showFolds, setShowFolds] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
 
   const fetchStatus = async () => {
@@ -33,13 +34,13 @@ export default function Training() {
   const handleTriggerTraining = async () => {
     if (training) return;
     setTraining(true);
-    showToast("info", "⏳ Training started... This may take a minute.");
+    showToast("info", "⏳ Training started... This may take a few minutes.");
 
     try {
       const response = await api.triggerTraining();
-      // response is { status: string }
       if (response.status === "success" || response.status === "started") {
         showToast("success", "✅ Training triggered successfully! The model will be updated shortly.");
+        // Poll for status update after a delay
         setTimeout(() => {
           fetchStatus();
           setTraining(false);
@@ -54,7 +55,6 @@ export default function Training() {
     }
   };
 
-  // ── FIX: Accept string | null | undefined ──
   const formatDate = (dateStr: string | null | undefined) => {
     if (!dateStr) return "Never";
     return new Date(dateStr).toLocaleString("en-IN", {
@@ -66,17 +66,51 @@ export default function Training() {
     });
   };
 
+  // Helper to render metrics as a table
   const renderMetrics = (metrics: any) => {
-    if (!metrics) return <p className="text-mist/40 text-sm">No model trained yet.</p>;
+    if (!metrics || Object.keys(metrics).length === 0) {
+      return <p className="text-mist/40 text-sm">No walk‑forward metrics available.</p>;
+    }
+
+    // Define display order and formatting
+    const metricLabels: Record<string, string> = {
+      SharpeRatio: "Sharpe Ratio",
+      SortinoRatio: "Sortino Ratio",
+      MaximumDrawdown: "Max Drawdown",
+      MaximumDrawdownDuration: "Max Drawdown Duration (days)",
+      WinRate: "Win Rate",
+      ProfitFactor: "Profit Factor",
+      CumulativeReturn: "Cumulative Return",
+      DirectionalAccuracy: "Directional Accuracy",
+      RMSE: "RMSE",
+      MAE: "MAE",
+    };
+
+    const formatValue = (key: string, value: any) => {
+      if (typeof value === "number") {
+        if (key === "MaximumDrawdown" || key === "CumulativeReturn" || key === "WinRate" || key === "DirectionalAccuracy") {
+          return (value * 100).toFixed(2) + "%";
+        }
+        if (key === "ProfitFactor" || key === "SharpeRatio" || key === "SortinoRatio") {
+          return value.toFixed(3);
+        }
+        return value.toFixed(4);
+      }
+      return value;
+    };
+
     return (
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-2">
-        <MetricCard label="Accuracy" value={metrics.accuracy} />
-        <MetricCard label="Precision" value={metrics.precision} />
-        <MetricCard label="Recall" value={metrics.recall} />
-        <MetricCard label="F1 Score" value={metrics.f1} />
-        <MetricCard label="ROC AUC" value={metrics.roc_auc} />
-        <MetricCard label="Train Size" value={metrics.train_size} />
-        <MetricCard label="Val Size" value={metrics.val_size} />
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mt-2">
+        {Object.entries(metricLabels).map(([key, label]) => {
+          const val = metrics[key];
+          if (val === undefined || val === null) return null;
+          return (
+            <div key={key} className="bg-ink/40 border border-slate/40 rounded-lg px-3 py-2">
+              <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider">{label}</div>
+              <div className="font-mono text-sm text-paper mt-0.5">{formatValue(key, val)}</div>
+            </div>
+          );
+        })}
       </div>
     );
   };
@@ -127,7 +161,7 @@ export default function Training() {
         </button>
       </div>
 
-      {/* Model Status */}
+      {/* Status Cards */}
       {loading ? (
         <div className="flex justify-center py-12">
           <Spinner size="lg" />
@@ -139,67 +173,75 @@ export default function Training() {
             <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
               📦 Production Model
             </h3>
-            {status?.production_model ? (
+            {status?.production_model_exists ? (
               <div>
-                <div className="flex items-center gap-4 flex-wrap">
-                  <span className="font-mono text-sm text-paper">
-                    Version: {status.production_model.version}
-                  </span>
-                  <span className="font-mono text-xs text-mist/60">
-                    Trained: {formatDate(status.production_model.training_date)}
-                  </span>
-                  <span
-                    className={`font-mono text-xs px-2 py-0.5 rounded-full ${
-                      status.production_model.status === "active"
-                        ? "bg-signal-buy/20 text-signal-buy"
-                        : "bg-signal-hold/20 text-signal-hold"
-                    }`}
-                  >
-                    {status.production_model.status}
-                  </span>
+                <span className="font-mono text-sm text-signal-buy">✅ Deployed</span>
+                <div className="mt-2 text-xs text-mist/60">
+                  Last training: {formatDate(status?.last_training)}
                 </div>
-                {renderMetrics(status.production_model.metrics)}
               </div>
             ) : (
               <p className="text-mist/40 text-sm">No production model deployed.</p>
             )}
           </div>
 
-          {/* Candidate Model */}
-          {status?.candidate_model && (
-            <div className="bg-graphite border border-slate/60 rounded-xl p-5">
-              <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
-                🧪 Candidate Model
-              </h3>
-              <div>
-                <div className="flex items-center gap-4 flex-wrap">
-                  <span className="font-mono text-sm text-paper">
-                    Version: {status.candidate_model.version}
-                  </span>
-                  <span className="font-mono text-xs text-mist/60">
-                    Trained: {formatDate(status.candidate_model.training_date)}
-                  </span>
-                  <span
-                    className={`font-mono text-xs px-2 py-0.5 rounded-full ${
-                      status.candidate_model.status === "candidate"
-                        ? "bg-signal-prepare/20 text-signal-prepare"
-                        : "bg-signal-hold/20 text-signal-hold"
-                    }`}
-                  >
-                    {status.candidate_model.status}
-                  </span>
+          {/* Overall Stats */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <StatCard label="Last Training" value={formatDate(status?.last_training)} />
+            <StatCard label="Dataset Size" value={status?.dataset_size ?? 0} />
+            <StatCard label="Symbols" value={status?.num_symbols ?? 0} />
+          </div>
+
+          {/* Walk‑Forward Metrics */}
+          <div className="bg-graphite border border-slate/60 rounded-xl p-5">
+            <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
+              📉 Walk‑Forward Performance Metrics
+            </h3>
+            {renderMetrics(status?.metrics)}
+          </div>
+
+          {/* Fold Details (collapsible) */}
+          {status?.fold_details && status.fold_details.length > 0 && (
+            <div className="bg-graphite border border-slate/40 rounded-xl p-5">
+              <button
+                onClick={() => setShowFolds(!showFolds)}
+                className="font-mono text-xs text-mist uppercase tracking-widest flex items-center gap-2 hover:text-paper transition"
+              >
+                📋 Fold Details
+                <span className="text-xs">{showFolds ? "▲" : "▼"}</span>
+              </button>
+              {showFolds && (
+                <div className="mt-3 overflow-x-auto">
+                  <table className="w-full text-xs font-mono">
+                    <thead>
+                      <tr className="text-mist/50 border-b border-slate/40">
+                        <th className="text-left py-1 pr-4">Fold</th>
+                        <th className="text-left py-1 pr-4">Train Start</th>
+                        <th className="text-left py-1 pr-4">Train End</th>
+                        <th className="text-left py-1 pr-4">Val Start</th>
+                        <th className="text-left py-1 pr-4">Val End</th>
+                        <th className="text-left py-1 pr-4">Train Samples</th>
+                        <th className="text-left py-1">Val Samples</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {status.fold_details.map((fold: any) => (
+                        <tr key={fold.fold} className="border-b border-slate/30">
+                          <td className="py-1 pr-4 text-paper">{fold.fold}</td>
+                          <td className="py-1 pr-4 text-mist/70">{fold.train_start}</td>
+                          <td className="py-1 pr-4 text-mist/70">{fold.train_end}</td>
+                          <td className="py-1 pr-4 text-mist/70">{fold.val_start}</td>
+                          <td className="py-1 pr-4 text-mist/70">{fold.val_end}</td>
+                          <td className="py-1 pr-4 text-mist/70">{fold.train_samples}</td>
+                          <td className="py-1 text-mist/70">{fold.val_samples}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
-                {renderMetrics(status.candidate_model.metrics)}
-              </div>
+              )}
             </div>
           )}
-
-          {/* Overall stats */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <StatCard label="Last Training" value={formatDate(status?.last_training_date)} />
-            <StatCard label="Dataset Size" value={status?.dataset_size ?? 0} />
-            <StatCard label="T+1 Success" value={(status?.performance?.['T+1 Success'] ?? 0) + "%"} />
-          </div>
         </div>
       )}
     </div>
@@ -212,16 +254,6 @@ function Spinner({ size = "sm" }: { size?: "sm" | "lg" }) {
   const dimension = size === "lg" ? "w-8 h-8" : "w-4 h-4";
   return (
     <div className={`${dimension} border-2 border-current border-t-transparent rounded-full animate-spin`} />
-  );
-}
-
-function MetricCard({ label, value }: { label: string; value: number | string }) {
-  const num = typeof value === "number" ? (value * 100).toFixed(1) + "%" : value;
-  return (
-    <div className="bg-ink/40 border border-slate/40 rounded-lg px-3 py-2">
-      <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider">{label}</div>
-      <div className="font-mono text-sm text-paper mt-0.5">{num}</div>
-    </div>
   );
 }
 
