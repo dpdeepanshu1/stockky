@@ -1,11 +1,11 @@
 # services/training-service/app.py
 """
 Training-service FastAPI application.
-Exposes REST API endpoints for training intelligence.
 """
 import os
 import logging
 import json
+import time
 from datetime import datetime
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
@@ -13,10 +13,8 @@ import joblib
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-# Import our models and helpers
 from models import Base, ensure_schema, PredictionSnapshot, PredictionOutcome, TrainingRun
 
-# Optional imports
 try:
     from models import ModelRegistry
     HAS_MODEL_REGISTRY = True
@@ -37,18 +35,53 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SERVICE_URL = os.environ.get('SERVICE_URL', "https://training-service-5e9v.onrender.com")
-
-# ----------------------------------------------------------------------
-# Database setup
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./training.db')
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine)
+
+LOCK_FILE = 'training.lock'
+LOCK_TIMEOUT_SECONDS = 300  # 5 minutes
 
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
     ensure_schema(engine)
     logger.info("Database schema initialized.")
+    # Clean up any stale lock on startup
+    if os.path.exists(LOCK_FILE):
+        try:
+            os.remove(LOCK_FILE)
+            logger.info("Removed stale lock file on startup")
+        except Exception as e:
+            logger.warning(f"Could not remove lock file: {e}")
+
+# ----------------------------------------------------------------------
+# Lock helpers
+# ----------------------------------------------------------------------
+def is_lock_stale():
+    if not os.path.exists(LOCK_FILE):
+        return False
+    try:
+        mtime = os.path.getmtime(LOCK_FILE)
+        if time.time() - mtime > LOCK_TIMEOUT_SECONDS:
+            return True
+        return False
+    except Exception:
+        return False
+
+def acquire_lock():
+    if is_lock_stale():
+        os.remove(LOCK_FILE)
+        logger.info("Removed stale lock file")
+    if os.path.exists(LOCK_FILE):
+        return False
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    return True
+
+def release_lock():
+    if os.path.exists(LOCK_FILE):
+        os.remove(LOCK_FILE)
 
 # ----------------------------------------------------------------------
 # Helper functions (same as before)
@@ -187,7 +220,7 @@ def get_summary_metrics():
         db.close()
 
 # ----------------------------------------------------------------------
-# Main Routes
+# Routes
 # ----------------------------------------------------------------------
 @app.get("/")
 async def root():
@@ -201,16 +234,31 @@ async def root():
 async def health():
     return JSONResponse(content={"status": "ok"})
 
-# ----------------------------------------------------------------------
-# API routes (with /api prefix) – used by frontend via gateway
-# ----------------------------------------------------------------------
+@app.delete("/lock")
+async def clear_lock():
+    if os.path.exists(LOCK_FILE):
+        os.remove(LOCK_FILE)
+        return JSONResponse(content={"status": "Lock cleared"})
+    return JSONResponse(content={"status": "No lock found"})
+
 @app.get("/api/status")
 async def api_status():
     return JSONResponse(content=get_training_status())
 
 @app.post("/api/train")
 async def api_trigger_training(background_tasks: BackgroundTasks):
-    return await trigger_training_impl(background_tasks)
+    if not acquire_lock():
+        raise HTTPException(status_code=409, detail="Training already in progress (or stale lock)")
+    def run_training():
+        try:
+            from train import train_model
+            train_model(SessionLocal(), os.environ.get('MODEL_STORE_PATH', './model-store'))
+        except Exception as e:
+            logger.error(f"Training failed: {e}")
+        finally:
+            release_lock()
+    background_tasks.add_task(run_training)
+    return JSONResponse(content={"status": "Training started successfully", "service_url": SERVICE_URL}, status_code=202)
 
 @app.get("/api/report")
 async def api_report():
@@ -274,44 +322,17 @@ async def api_summary():
         logger.error(f"Error getting summary metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ----------------------------------------------------------------------
-# Aliases for frontend compatibility (without /api prefix)
-# ----------------------------------------------------------------------
+# Aliases for frontend (no /api prefix)
 @app.get("/model-status")
 async def model_status():
-    """Alias for /api/status – used by frontend health checks."""
     return JSONResponse(content=get_training_status())
 
 @app.post("/train")
 async def trigger_train(background_tasks: BackgroundTasks):
-    """Alias for /api/train – used by frontend trigger."""
-    return await trigger_training_impl(background_tasks)
+    return await api_trigger_training(background_tasks)
 
 # ----------------------------------------------------------------------
-# Shared training trigger logic
-# ----------------------------------------------------------------------
-async def trigger_training_impl(background_tasks: BackgroundTasks):
-    lock_file = 'training.lock'
-    if os.path.exists(lock_file):
-        raise HTTPException(status_code=409, detail="Training already in progress")
-    with open(lock_file, 'w') as f:
-        f.write(str(os.getpid()))
-
-    def run_training():
-        try:
-            from train import train_model
-            train_model(SessionLocal(), os.environ.get('MODEL_STORE_PATH', './model-store'))
-        except Exception as e:
-            logger.error(f"Training failed: {e}")
-        finally:
-            if os.path.exists(lock_file):
-                os.remove(lock_file)
-
-    background_tasks.add_task(run_training)
-    return JSONResponse(content={"status": "Training started successfully", "service_url": SERVICE_URL}, status_code=202)
-
-# ----------------------------------------------------------------------
-# Run with uvicorn
+# Run
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
