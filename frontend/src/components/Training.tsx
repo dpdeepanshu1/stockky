@@ -12,7 +12,6 @@ export default function Training() {
   const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
   const [isStopping, setIsStopping] = useState(false);
 
-  // Prediction history and insights
   const [predictions, setPredictions] = useState<any[]>([]);
   const [insights, setInsights] = useState<any[]>([]);
   const [summaryMetrics, setSummaryMetrics] = useState<any>(null);
@@ -21,7 +20,6 @@ export default function Training() {
 
   const timerIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const ESTIMATED_TOTAL_SECONDS = 300;
 
   // ---------- API calls ----------
   const fetchStatus = async () => {
@@ -30,8 +28,8 @@ export default function Training() {
       const data = await api.getTrainingStatus();
       setStatus(data);
 
-      // If training is active in the UI and backend says it's not running anymore
-      if (training && data.training_in_progress === false) {
+      // If training is active in UI and backend says it's not running anymore
+      if (training && !data.training_in_progress) {
         const succeeded = Boolean(data.production_model_exists && data.last_training);
         stopTraining(succeeded);
       }
@@ -147,6 +145,8 @@ export default function Training() {
 
   const stopTraining = (success: boolean) => {
     setTraining(false);
+    // Update status so the "running" card disappears
+    setStatus((prev) => prev ? { ...prev, training_in_progress: false } : prev);
     if (timerIntervalRef.current) {
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
@@ -157,7 +157,7 @@ export default function Training() {
     }
     if (success) {
       showToast("success", "✅ Training completed successfully! Model is deployed.");
-      fetchStatus();
+      fetchStatus(); // refresh to get latest metrics
     } else {
       // Only show error if we were actually training and it failed
       if (training) {
@@ -203,7 +203,6 @@ export default function Training() {
     }
     setIsStopping(true);
 
-    // Try to clear the lock, but even if it fails, we stop the UI
     const cleared = await clearLock();
     // Always stop the UI regardless of lock status
     stopTraining(false);
@@ -241,12 +240,6 @@ export default function Training() {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
-  };
-
-  const getEstimatedRemaining = () => {
-    const remaining = Math.max(0, ESTIMATED_TOTAL_SECONDS - elapsedSeconds);
-    if (remaining <= 0) return "Almost done...";
-    return formatTime(remaining);
   };
 
   const renderMetrics = (metrics: Record<string, number>) => {
@@ -448,10 +441,6 @@ export default function Training() {
                 <div>
                   <span className="text-mist/60">Elapsed: </span>
                   <span className="font-mono text-paper">{formatTime(elapsedSeconds)}</span>
-                </div>
-                <div>
-                  <span className="text-mist/60">Estimated remaining: </span>
-                  <span className="font-mono text-paper">{getEstimatedRemaining()}</span>
                 </div>
               </div>
               <div className="mt-2 text-xs text-mist/40">
