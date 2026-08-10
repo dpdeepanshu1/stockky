@@ -25,7 +25,7 @@ calls POST /notify with a pre-built message. Keeping that decision in the
 Scheduler avoids a circular dependency and keeps this service a dumb,
 reliable delivery pipe — same design principle as Market Data Service.
 
-v0.3.0 – added MarkdownV2 support for Telegram, improved logging.
+v0.5.0 – respects the 'channel' parameter: "telegram", "discord", "slack", or "all".
 """
 import os
 import json
@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - optional dep during local dev
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("notification-service")
 
-app = FastAPI(title="Stockky Notification Service", version="0.3.0")
+app = FastAPI(title="Stockky Notification Service", version="0.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 CONFIG_KEY = "stockky:notification_config"
@@ -85,7 +85,7 @@ _memory_config: Optional[dict] = None
 def root():
     return {
         "service": "Stockky Notification Service",
-        "version": "0.3.0",
+        "version": "0.5.0",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
@@ -147,6 +147,7 @@ class NotifyRequest(BaseModel):
     title: str
     message: str
     urgency: str = "normal"  # "normal" | "high" — high could map to @here/@channel later
+    channel: str = "all"     # "all", "telegram", "discord", "slack"
 
 
 def _public_config(cfg: dict) -> dict:
@@ -274,14 +275,6 @@ def _send_telegram(cfg: dict, title: str, message: str):
         return "not sent (disabled)"
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    # Telegram MarkdownV2 requires escaping certain characters.
-    # We'll use Markdown (not V2) for simplicity and safety, or we can escape.
-    # For bold, we'll use Markdown with parse_mode="Markdown".
-    # The API Gateway already sends text with * for bold, so we set parse_mode="MarkdownV2".
-    # But we need to escape special characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
-    # To avoid complexity, we'll keep parse_mode="Markdown" which is less strict.
-    # Actually, Telegram's "Markdown" mode (not V2) is simpler: *bold*, _italic_, etc.
-    # We'll use parse_mode="Markdown".
     payload = {
         "chat_id": chat_id,
         "text": f"*{title}*\n\n{message}",
@@ -300,34 +293,66 @@ def _send_telegram(cfg: dict, title: str, message: str):
         return f"failed: {e}"
 
 
-def _dispatch(title: str, message: str):
+def _dispatch(title: str, message: str, channel_filter: str):
     cfg = _load_config()
-    results = {
-        "discord": _send_discord(cfg, title, message),
-        "slack": _send_slack(cfg, title, message),
-        "telegram": _send_telegram(cfg, title, message),
-    }
-    return {k: v for k, v in results.items() if v is not None}
+    results = {}
+    # Determine which channels to send to based on the filter
+    channels_to_send = []
+    if channel_filter == "all" or channel_filter == "telegram":
+        channels_to_send.append("telegram")
+    if channel_filter == "all" or channel_filter == "discord":
+        channels_to_send.append("discord")
+    if channel_filter == "all" or channel_filter == "slack":
+        channels_to_send.append("slack")
+
+    # If the filter is a specific channel, only send to that one (already covered above)
+    # Also ensure we don't send duplicates if "all" includes a specific channel
+
+    for ch in channels_to_send:
+        if ch == "telegram":
+            result = _send_telegram(cfg, title, message)
+            if result is not None:
+                results["telegram"] = result
+        elif ch == "discord":
+            result = _send_discord(cfg, title, message)
+            if result is not None:
+                results["discord"] = result
+        elif ch == "slack":
+            result = _send_slack(cfg, title, message)
+            if result is not None:
+                results["slack"] = result
+
+    return results
 
 
 @app.post("/notify")
 def notify(req: NotifyRequest):
-    attempted = _dispatch(req.title, req.message)
+    attempted = _dispatch(req.title, req.message, req.channel)
     if not attempted:
         return {
             "delivered": False,
-            "note": "No notification channel is configured and enabled. Set them up from the Notifications tab.",
+            "note": f"No notification channel matched filter '{req.channel}' and is enabled/configured.",
         }
     # Check if any channel succeeded
     delivered = any(v == "sent" for v in attempted.values())
-    return {"delivered": delivered, "results": attempted}
+    # Build a note with the results
+    note_parts = []
+    for ch, result in attempted.items():
+        if result == "sent":
+            note_parts.append(f"{ch}: ok")
+        else:
+            note_parts.append(f"{ch}: {result}")
+    note = "; ".join(note_parts)
+    return {"delivered": delivered, "results": attempted, "note": note}
 
 
 @app.post("/test")
 def test_notifications():
+    # Test sends to all enabled channels
     attempted = _dispatch(
         "✅ Stockky test notification",
         "If you can see this, the channel is wired up correctly.",
+        channel_filter="all"
     )
     if not attempted:
         return {
@@ -335,7 +360,14 @@ def test_notifications():
             "note": "No channel is both configured and enabled. Save credentials and turn the toggle on first.",
         }
     delivered = any(v == "sent" for v in attempted.values())
-    return {"delivered": delivered, "results": attempted}
+    note_parts = []
+    for ch, result in attempted.items():
+        if result == "sent":
+            note_parts.append(f"{ch}: ok")
+        else:
+            note_parts.append(f"{ch}: {result}")
+    note = "; ".join(note_parts)
+    return {"delivered": delivered, "results": attempted, "note": note}
 
 
 if __name__ == "__main__":

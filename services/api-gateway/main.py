@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.6 – reduced parallel workers to 10, fewer retries, longer timeouts.
+v2.5.7 – truncates long Telegram messages to 4096 chars, checks delivery status.
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.6")
+app = FastAPI(title="Stockky API Gateway", version="2.5.7")
 
 # --- CORS ---
 app.add_middleware(
@@ -910,7 +910,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.6",
+        "version": "2.5.7",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -1642,6 +1642,7 @@ def test_notification_channels():
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
 
+# ----- UPDATED ENDPOINT: send-picks with truncation and delivery check -----
 @app.post("/notifications/send-picks")
 def send_picks_to_telegram(payload: dict):
     recs = payload.get("recommendations", [])
@@ -1687,6 +1688,20 @@ def send_picks_to_telegram(payload: dict):
 
     message = "\n".join(lines)
 
+    # Telegram has a 4096 character limit (including Markdown markers)
+    # We'll truncate to 4000 to be safe and add a truncation notice.
+    MAX_LEN = 4000
+    if len(message) > MAX_LEN:
+        # Try to cut at the last newline before the limit
+        truncated = message[:MAX_LEN]
+        last_newline = truncated.rfind("\n")
+        if last_newline > 0:
+            truncated = truncated[:last_newline]
+        else:
+            # If no newline, just cut at the limit
+            truncated = truncated
+        message = truncated + "\n\n... (truncated — too many stocks to list fully)"
+
     try:
         resp = httpx.post(
             f"{NOTIFICATION_URL}/notify",
@@ -1694,7 +1709,14 @@ def send_picks_to_telegram(payload: dict):
             timeout=15,
         )
         resp.raise_for_status()
-        return {"success": True, "sent": len(picks), "message": "Notification sent"}
+        data = resp.json()
+        # Check if the notification service actually delivered
+        if data.get("delivered"):
+            return {"success": True, "sent": len(picks), "message": "Notification sent"}
+        else:
+            # Service returned delivered=False
+            error_note = data.get("note", "Delivery failed")
+            raise HTTPException(status_code=502, detail=f"Notification service failed to deliver: {error_note}")
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Notification service failed: {e}")
 
