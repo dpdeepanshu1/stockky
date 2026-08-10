@@ -4,9 +4,7 @@ API Gateway
 Single entry point for the React frontend.
 Includes async scan with progress, symbol correction, Hinglish summaries,
 market movers, watchlist scan, Telegram notifications, and dynamic universe.
-v2.2.0 adds Training Service proxy routes.
-v2.3.0 adds /market/indices endpoint for live NIFTY & SENSEX.
-v2.4.0 adds Market Sentiment to system health and /wake/all endpoint.
+v2.4.1 adds parallel scanning for dramatically faster market scans.
 """
 import os
 import json
@@ -40,7 +38,7 @@ FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-ser
 EVENT_URL = os.getenv("EVENT_URL", "https://event-tracker-service-m1lw.onrender.com")
 PREDICTION_URL = os.getenv("PREDICTION_URL", "https://prediction-service-wowb.onrender.com")
 
-# ---- NEW: Market Sentiment & Training URLs ----
+# ---- Market Sentiment & Training URLs ----
 MARKET_SENTIMENT_URL = os.getenv("MARKET_SENTIMENT_URL", "https://market-sentiment-service.onrender.com")
 TRAINING_URL = os.getenv("TRAINING_URL", "https://training-service-5e9v.onrender.com")
 
@@ -54,11 +52,11 @@ SYSTEM_SERVICES = {
     "event-tracker": {"url": EVENT_URL, "required": False},
     "prediction": {"url": PREDICTION_URL, "required": False},
     "notification": {"url": NOTIFICATION_URL, "required": False},
-    "market-sentiment": {"url": MARKET_SENTIMENT_URL, "required": False},  # NEW
-    "training": {"url": TRAINING_URL, "required": False},                   # NEW
+    "market-sentiment": {"url": MARKET_SENTIMENT_URL, "required": False},
+    "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.4.0")
+app = FastAPI(title="Stockky API Gateway", version="2.4.1")
 
 # --- CORS Middleware (explicit) ---
 app.add_middleware(
@@ -654,14 +652,95 @@ def _send_scan_notification(recommendations: list, verdict: str, scanned: int, u
     except Exception as e:
         logger.warning("Failed to send scan notification: %s", e)
 
-# ── Async scan with progress (unchanged) ──────────────────────────────────
-async def run_scan_async(task_id: str, universe: List[str]):
+# ============================================================================
+# ⚡ PARALLEL SCAN IMPLEMENTATION (NEW)
+# ============================================================================
+
+MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "20"))
+
+async def _analyze_one_symbol_async(
+    symbol: str,
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore
+) -> dict:
+    """
+    Analyse one symbol using all downstream services.
+    All the fallback logic from the sequential scan is preserved.
+    """
+    async with sem:
+        try:
+            # 1. Decision Engine
+            resp = await client.get(f"{DECISION_URL}/decide/{symbol}", timeout=30)
+            resp.raise_for_status()
+            raw = resp.json()
+            normalized = _normalize_decision_response(raw, symbol)
+
+            # 2. Price fallback if missing
+            if normalized.get("close") is None:
+                price = _fetch_price_from_quote(symbol)
+                if price is not None:
+                    normalized["close"] = price
+                    if normalized.get("support") is None:
+                        normalized["support"] = round(price * 0.95, 2)
+                    if normalized.get("resistance") is None:
+                        normalized["resistance"] = round(price * 1.05, 2)
+
+            # 3. Fundamentals
+            _merge_fundamentals(normalized, symbol)
+
+            # 4. News
+            if normalized.get("news_score") is None:
+                news = _fetch_news(symbol)
+                if news:
+                    normalized["news_score"] = news.get("news_score")
+                    reasons = normalized.get("reasons", {})
+                    if news.get("reasons"):
+                        reasons["news"] = news["reasons"]
+                        normalized["reasons"] = reasons
+
+            # 5. Events
+            if normalized.get("event_risk") is False and not normalized.get("reasons", {}).get("event"):
+                events = _fetch_events(symbol)
+                if events and events.get("next_earnings_date"):
+                    normalized["event_risk"] = True
+                    reasons = normalized.get("reasons", {})
+                    reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
+                    normalized["reasons"] = reasons
+
+            # 6. Prediction
+            if normalized.get("prediction_score") is None:
+                try:
+                    pred_resp = await client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=25)
+                    if pred_resp.status_code == 200:
+                        pred_data = pred_resp.json()
+                        if pred_data.get("model_loaded"):
+                            normalized["prediction_score"] = pred_data.get("prediction_score")
+                            normalized["prediction_note"] = pred_data.get("note")
+                except Exception as e:
+                    logger.warning(f"Prediction lookup failed for {symbol}: {e}")
+
+            # 7. Natural language summary
+            normalized["natural_language_summary"] = _generate_summary(normalized)
+            return normalized
+
+        except httpx.HTTPError as e:
+            logger.warning(f"Scan error for {symbol}: {e}")
+            return {"symbol": symbol, "decision": "ERROR", "error": str(e)}
+        except Exception as e:
+            logger.error(f"Unexpected error for {symbol}: {e}")
+            return {"symbol": symbol, "decision": "ERROR", "error": str(e)}
+
+async def run_scan_parallel(task_id: str, universe: List[str]):
+    """
+    Parallel scan implementation using asyncio.gather with concurrency control.
+    """
     start_time = time.time()
-    results = []
-    errors = []
     total = len(universe)
     processed = 0
+    results = []
+    errors = []
 
+    # Initialise status in Redis
     _redis_set(SCAN_TASK_PREFIX + task_id, {
         "status": "running",
         "total": total,
@@ -671,60 +750,29 @@ async def run_scan_async(task_id: str, universe: List[str]):
         "error": None,
     }, ttl=3600)
 
+    sem = asyncio.Semaphore(MAX_PARALLEL_WORKERS)
+
     async with httpx.AsyncClient(timeout=150) as client:
-        for symbol in universe:
+        # Create tasks for all symbols
+        tasks = [
+            _analyze_one_symbol_async(sym, client, sem)
+            for sym in universe
+        ]
+
+        # Process results as they complete to update progress
+        for coro in asyncio.as_completed(tasks):
             try:
-                resp = await client.get(f"{DECISION_URL}/decide/{symbol}")
-                resp.raise_for_status()
-                raw = resp.json()
-                normalized = _normalize_decision_response(raw, symbol)
-
-                if normalized.get("close") is None:
-                    price = _fetch_price_from_quote(symbol)
-                    if price is not None:
-                        normalized["close"] = price
-                        if normalized.get("support") is None:
-                            normalized["support"] = round(price * 0.95, 2)
-                        if normalized.get("resistance") is None:
-                            normalized["resistance"] = round(price * 1.05, 2)
-
-                _merge_fundamentals(normalized, symbol)
-
-                if normalized.get("news_score") is None:
-                    news = _fetch_news(symbol)
-                    if news:
-                        normalized["news_score"] = news.get("news_score")
-                        reasons = normalized.get("reasons", {})
-                        if news.get("reasons"):
-                            reasons["news"] = news["reasons"]
-                            normalized["reasons"] = reasons
-
-                if normalized.get("event_risk") is False and not normalized.get("reasons", {}).get("event"):
-                    events = _fetch_events(symbol)
-                    if events and events.get("next_earnings_date"):
-                        normalized["event_risk"] = True
-                        reasons = normalized.get("reasons", {})
-                        reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
-                        normalized["reasons"] = reasons
-
-                if normalized.get("prediction_score") is None:
-                    try:
-                        pred_resp = await client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=60)
-                        if pred_resp.status_code == 200:
-                            pred_data = pred_resp.json()
-                            if pred_data.get("model_loaded"):
-                                normalized["prediction_score"] = pred_data.get("prediction_score")
-                                normalized["prediction_note"] = pred_data.get("note")
-                    except Exception as e:
-                        logger.warning(f"Prediction service lookup failed during scan for {symbol}: {e}")
-
-                normalized["natural_language_summary"] = _generate_summary(normalized)
-                results.append(normalized)
-            except httpx.HTTPError as e:
-                logger.warning("Scan skipped %s: %s", symbol, e)
-                errors.append({"symbol": symbol, "error": str(e)})
+                result = await coro
+                if result.get("decision") == "ERROR":
+                    errors.append({"symbol": result.get("symbol"), "error": result.get("error", "Unknown error")})
+                else:
+                    results.append(result)
+            except Exception as e:
+                logger.error(f"Task failed: {e}")
+                # We don't know which symbol, so skip
             processed += 1
             elapsed = round(time.time() - start_time, 1)
+            # Update progress every 5 symbols or at completion
             if processed % 5 == 0 or processed == total:
                 _redis_set(SCAN_TASK_PREFIX + task_id, {
                     "status": "running",
@@ -735,7 +783,10 @@ async def run_scan_async(task_id: str, universe: List[str]):
                     "error": None,
                 }, ttl=3600)
 
+    # Sort by combined score descending
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
+
+    # Build final verdict
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = actionable[:5]
     watchlist_candidates = []
@@ -784,6 +835,7 @@ async def run_scan_async(task_id: str, universe: List[str]):
         "error": None,
     }, ttl=3600)
 
+    # Send Telegram notification
     _send_scan_notification(final_result.get("recommendations", []), final_result["verdict"], final_result["scanned"], final_result["universe_size"])
 
 # ── Cached Market Movers Data ──────────────────────────────────────────────
@@ -837,8 +889,9 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.4.0",
+        "version": "2.4.1",
         "status": "running",
+        "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
             "/health": "GET – health check",
             "/system/health": "GET – health of all downstream services",
@@ -848,7 +901,7 @@ def root():
             "/watchlist/{symbol}": "DELETE – remove symbol",
             "/stock/{symbol}": "GET – get decision for a symbol",
             "/scan": "GET – synchronous scan (legacy)",
-            "/scan/start": "POST – start async scan, returns task_id",
+            "/scan/start": "POST – start async parallel scan, returns task_id",
             "/scan/status/{task_id}": "GET – get progress/result of async scan",
             "/scan/watchlist": "GET – scan only your watchlist",
             "/scan/universe": "GET – preview current scan universe",
@@ -1183,7 +1236,8 @@ def start_scan(force_refresh: bool = False, background_tasks: BackgroundTasks = 
 
         universe = _build_scan_universe()
         task_id = str(uuid.uuid4())
-        background_tasks.add_task(run_scan_async, task_id, universe)
+        # Use the new parallel scan
+        background_tasks.add_task(run_scan_parallel, task_id, universe)
         return {"task_id": task_id}
     except Exception as e:
         logger.error(f"Scan start failed: {e}")
@@ -1369,7 +1423,7 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
-# ── NEW: Market Indices endpoint ──
+# ── Market Indices endpoint ──
 @app.get("/market/indices")
 def get_market_indices():
     """
@@ -1379,14 +1433,12 @@ def get_market_indices():
         nifty = yf.Ticker("^NSEI")
         sensex = yf.Ticker("^BSESN")
 
-        # Get 1-day history
         nifty_hist = nifty.history(period="1d")
         sensex_hist = sensex.history(period="1d")
 
         if nifty_hist.empty or sensex_hist.empty:
             raise HTTPException(status_code=503, detail="Index data temporarily unavailable")
 
-        # Current price and previous close
         nifty_close = nifty_hist['Close'].iloc[-1]
         nifty_open = nifty_hist['Open'].iloc[0]
         nifty_prev_close = nifty_hist['Close'].iloc[0] if len(nifty_hist) > 1 else nifty_open
@@ -1399,7 +1451,6 @@ def get_market_indices():
         sensex_change = sensex_close - sensex_prev_close
         sensex_change_pct = (sensex_change / sensex_prev_close) * 100
 
-        # Market mood based on average change
         avg_change_pct = (nifty_change_pct + sensex_change_pct) / 2
         if avg_change_pct > 0.3:
             mood = "BULLISH"
@@ -1408,7 +1459,6 @@ def get_market_indices():
         else:
             mood = "NEUTRAL"
 
-        # Rough market score (0-100)
         market_score = 50 + (avg_change_pct * 10)
         market_score = max(0, min(100, market_score))
 
@@ -1597,13 +1647,11 @@ async def get_training_score(symbol: str):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Training service unreachable: {str(e)}")
 
-# Catch-all for any other training endpoints (if needed)
 @app.api_route("/training/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def training_other_proxy(path: str, request: Request):
     """Proxy all other training endpoints."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            # Build target URL
             target_url = f"{TRAINING_URL}/{path}"
             body = await request.body()
             headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "connection")}
