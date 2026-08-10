@@ -188,6 +188,15 @@ def check_abort():
         logger.warning("check_abort() raising KeyboardInterrupt because lock file is missing")
         raise KeyboardInterrupt("Lock file removed – training aborted.")
 
+# ---------- XGBoost callback for abort ----------
+class AbortCallback(xgb.callback.TrainingCallback):
+    """XGBoost callback that checks abort_event after each boosting round."""
+    def after_iteration(self, model, epoch, evals_log):
+        if abort_event.is_set():
+            logger.info("AbortCallback: abort_event detected, raising exception to stop training.")
+            raise KeyboardInterrupt("Training aborted by user during XGBoost fit.")
+        return False  # Continue normally if not set
+
 # ---------- Helpers ----------
 def fetch_symbol_data(symbol, period="2y", max_retries=5):
     """Fetch OHLCV data with exponential backoff for rate limits."""
@@ -356,14 +365,22 @@ def run_training_pipeline(
             X_train_scaled = scaler.fit_transform(X_train)
             X_val_scaled = scaler.transform(X_val)
 
+            # Create model with the abort callback
             model = xgb.XGBRegressor(
                 **config['model'],
                 random_state=config['random_seed'],
-                eval_metric='rmse'
+                eval_metric='rmse',
+                callbacks=[AbortCallback()]   # <-- NEW: stops mid-fit
             )
             # Check abort before fit
             check_abort()
-            model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)], verbose=False)
+
+            try:
+                model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)], verbose=False)
+            except KeyboardInterrupt:
+                # Re-raise to be caught by the outer handler
+                logger.warning("Training aborted during XGBoost fit.")
+                raise
 
             pred_val = model.predict(X_val_scaled)
 
@@ -416,7 +433,7 @@ def run_training_pipeline(
             logger.info(f"{k:>20}: {v:.4f}" if isinstance(v, float) else f"{k:>20}: {v}")
         logger.info("="*50)
 
-        # Train final production model
+        # Train final production model (with abort callback too)
         logger.info("Training production model on full dataset...")
         X_full = df[feature_cols].values.astype(np.float32)
         y_full = df['target'].values.astype(np.float32)
@@ -427,11 +444,16 @@ def run_training_pipeline(
         final_model = xgb.XGBRegressor(
             **config['model'],
             random_state=config['random_seed'],
-            eval_metric='rmse'
+            eval_metric='rmse',
+            callbacks=[AbortCallback()]   # <-- NEW
         )
         # Check abort before final fit
         check_abort()
-        final_model.fit(X_full_scaled, y_full)
+        try:
+            final_model.fit(X_full_scaled, y_full)
+        except KeyboardInterrupt:
+            logger.warning("Training aborted during final XGBoost fit.")
+            raise
 
         # Check abort before saving model
         check_abort()

@@ -293,6 +293,17 @@ async def clear_lock():
     logger.info("No lock file found")
     return JSONResponse(content={"status": "No lock found"})
 
+# ---------- Debug endpoint for forceful abort ----------
+@app.post("/debug/abort")
+async def debug_abort():
+    """Forcefully set the abort event – for testing the stop mechanism."""
+    logger.info("POST /debug/abort called – forcing abort")
+    request_abort()
+    return JSONResponse(content={"status": "Abort event set"})
+
+# ----------------------------------------------------------------------
+# API routes
+# ----------------------------------------------------------------------
 @app.get("/api/status")
 async def api_status():
     return JSONResponse(content=get_training_status())
