@@ -1,10 +1,10 @@
 """
-Decision Engine Service v0.7.1
+Decision Engine Service v0.7.2
 Changes:
 - Market Sentiment score is now part of the weighted average (weight 0.10)
 - All missing scores default to 50 (neutral)
-- Added logging for market sentiment fetch
-- Improved error handling for sentiment service
+- Added retry and fallback for market sentiment fetch
+- Increased timeout and added logging for debugging
 """
 import os
 import asyncio
@@ -26,12 +26,13 @@ NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com
 EVENT_URL = os.getenv("EVENT_URL", "https://event-tracker-service-m1lw.onrender.com")
 PREDICTION_URL = os.getenv("PREDICTION_URL", "https://prediction-service-wowb.onrender.com")
 MARKET_SENTIMENT_URL = os.getenv("MARKET_SENTIMENT_URL", "https://market-sentiment-service.onrender.com")
+API_GATEWAY_URL = os.getenv("API_GATEWAY_URL", "https://api-gateway-wizr.onrender.com")
 TRAINING_SERVICE_URL = os.getenv("TRAINING_SERVICE_URL", "https://training-service-5e9v.onrender.com")
 
 EARNINGS_RISK_DAYS = 3
 EARNINGS_BOOST_DAYS = 7
 
-app = FastAPI(title="Stockky Decision Engine", version="0.7.1")
+app = FastAPI(title="Stockky Decision Engine", version="0.7.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -56,7 +57,7 @@ class Decision(str, Enum):
 
 @app.get("/")
 def root():
-    return {"service": "Stockky Decision Engine", "version": "0.7.1", "status": "running"}
+    return {"service": "Stockky Decision Engine", "version": "0.7.2", "status": "running"}
 
 
 @app.get("/health")
@@ -75,21 +76,40 @@ async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
         return None
 
 
-# ── Market Sentiment fetch with logging ────────────────────────────
+# ── Market Sentiment fetch with retry and fallback ────────────────
 async def get_market_sentiment() -> dict:
-    """Fetch current market sentiment; return neutral fallback on failure."""
+    """Fetch current market sentiment with retry and fallback."""
+    # First try the market-sentiment service directly
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{MARKET_SENTIMENT_URL}/sentiment")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    score = data.get("market_score", 50)
+                    logger.info(f"Market sentiment fetched: {score}")
+                    return {"market_score": score, **data}
+                else:
+                    logger.warning(f"Market sentiment returned {resp.status_code} (attempt {attempt+1})")
+        except Exception as e:
+            logger.warning(f"Market sentiment fetch attempt {attempt+1} failed: {e}")
+            if attempt == 0:
+                await asyncio.sleep(1)  # brief retry delay
+
+    # Fallback: fetch from API Gateway's /market/indices
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{MARKET_SENTIMENT_URL}/sentiment")
+            resp = await client.get(f"{API_GATEWAY_URL}/market/indices")
             if resp.status_code == 200:
                 data = resp.json()
                 score = data.get("market_score", 50)
-                logger.info(f"Market sentiment fetched: {score}")
-                return {"market_score": score, **data}
-            else:
-                logger.warning(f"Market sentiment returned {resp.status_code}")
+                logger.info(f"Market sentiment fetched from API Gateway fallback: {score}")
+                return {"market_score": score, "source": "api-gateway"}
     except Exception as e:
-        logger.warning(f"Could not fetch market sentiment: {e}")
+        logger.warning(f"Fallback market sentiment fetch failed: {e}")
+
+    # Ultimate fallback
+    logger.warning("All market sentiment fetches failed, using neutral 50")
     return {"market_score": 50, "classification": "NEUTRAL", "trend": "Neutral"}
 
 
@@ -451,7 +471,7 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         training_score = training.get("training_score", 50)
 
         # Log market sentiment for debugging
-        logger.info(f"Market sentiment for {symbol}: {market_score}")
+        logger.info(f"Market sentiment for {symbol}: {market_score} (source: {sentiment.get('source', 'sentiment-service')})")
 
         market_adjustment, market_adjustment_reason = _market_sentiment_adjustment(market_score)
 
@@ -534,7 +554,7 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             "fundamental_score": fundamental_score,
             "news_score": news_score,
             "prediction_score": prediction_score,
-            "market_score": market_score,
+            "market_score": market_score,  # <-- This is the value shown in the Decision Card
             "market_sentiment_adjustment": market_adjustment,
             "training_score": training_score,
             "event_score_delta": event_delta,
