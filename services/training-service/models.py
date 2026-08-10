@@ -27,7 +27,6 @@ def ist_now() -> datetime:
 # ---------- Base ----------
 Base = declarative_base()
 
-
 # ---------- Numpy conversion helper ----------
 def convert_numpy(obj):
     """Recursively convert numpy types to Python native types."""
@@ -44,7 +43,6 @@ def convert_numpy(obj):
     if isinstance(obj, (np.bool_, bool)):
         return bool(obj)
     return obj
-
 
 # ---------- Models ----------
 class PredictionSnapshot(Base):
@@ -79,7 +77,7 @@ class PredictionSnapshot(Base):
 
     # Market sentiment at prediction time
     market_mood = Column(String(20), nullable=True)
-    market_score_extra = Column(Float, nullable=True)  # renamed to avoid conflict
+    market_score_extra = Column(Float, nullable=True)
     nifty_change_pct = Column(Float, nullable=True)
     sensex_change_pct = Column(Float, nullable=True)
 
@@ -152,27 +150,13 @@ class TrainingRun(Base):
 
 class ModelArtifact(Base):
     """
-    The actual trained model, stored IN the database rather than on local
-    disk. This is the piece that was missing entirely before: training-
-    service and prediction-service are separate Render containers with no
-    shared filesystem, so a model saved to local disk was never reachable
-    by anything else — and on free tier, not even reachable by
-    training-service's own NEXT restart. Storing the serialized bytes as a
-    row here means any service with this DATABASE_URL (or a REST call to
-    training-service) can retrieve the current production model, and nothing
-    is lost on restart.
-
-    A version is a simple auto-incrementing string ("v1", "v2", ...).
-    Exactly one row can have status="production" at a time — enforced in
-    ModelRegistry.save_production_model()/promote_model(), not at the DB
-    level, since SQLite (used for local dev without DATABASE_URL set)
-    doesn't support partial unique indexes as portably as Postgres does.
+    The actual trained model, stored IN the database.
     """
     __tablename__ = "model_artifacts"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     version = Column(String(20), unique=True, nullable=False, index=True)
-    status = Column(String(20), nullable=False, default="candidate", index=True)  # candidate | production | archived
+    status = Column(String(20), nullable=False, default="candidate", index=True)
     model_blob = Column(LargeBinary, nullable=False)
     scaler_blob = Column(LargeBinary, nullable=True)
     feature_columns = Column(JSON, nullable=True)
@@ -183,26 +167,8 @@ class ModelArtifact(Base):
 
 
 class ModelRegistry:
-    """
-    Postgres-backed model store. Replaces the local-disk-file design that
-    was referenced throughout app.py/train.py (registry.model_dir,
-    {version}.pkl, production_pointer.json) but never actually implemented
-    — the `from models import ModelRegistry` import always failed, so
-    HAS_MODEL_REGISTRY was always False and every training run silently
-    fell into a "legacy" path that saved to an unreachable local file.
-
-    Interface kept close to what the calling code already expects, so
-    app.py/train.py needed only their file-scanning logic updated to call
-    these methods instead of touching the filesystem — not a rewrite of
-    the training pipeline itself.
-    """
-
+    """Postgres-backed model store."""
     def __init__(self, session_factory=None):
-        """session_factory: a SQLAlchemy sessionmaker. If omitted, builds
-        its own from DATABASE_URL — needed because train.py's call site
-        does `ModelRegistry()` with no arguments. Passing one in explicitly
-        (as app.py does, reusing its existing SessionLocal) avoids opening
-        a second, redundant DB connection pool."""
         if session_factory is None:
             import os
             db_url = os.environ.get("DATABASE_URL", "sqlite:///./training.db")
@@ -222,17 +188,9 @@ class ModelRegistry:
         return f"v{n}"
 
     def save_production_model(self, model, scaler, config: dict, metrics: dict, feature_columns=None) -> str:
-        """Serializes and saves a model directly as the new production
-        version, archiving whatever was production before. Matches the
-        existing call site in train.py, which trains on the full dataset
-        and treats the result as immediately deployable (no separate
-        candidate/promote step in that pipeline today)."""
         return self._save(model, scaler, config, metrics, feature_columns, status="production")
 
     def save_candidate_model(self, model, scaler, config: dict, metrics: dict, feature_columns=None) -> str:
-        """For a future safer workflow: train, inspect metrics, THEN
-        promote explicitly via promote_model() instead of going live
-        immediately."""
         return self._save(model, scaler, config, metrics, feature_columns, status="candidate")
 
     def _save(self, model, scaler, config, metrics, feature_columns, status) -> str:
@@ -249,7 +207,6 @@ class ModelRegistry:
             joblib.dump(scaler, scaler_buf)
             scaler_bytes = scaler_buf.getvalue()
 
-        # 🔥 Convert numpy types to Python native for JSON serialization
         config_sanitized = convert_numpy(config)
         metrics_sanitized = convert_numpy(metrics)
 
@@ -268,7 +225,6 @@ class ModelRegistry:
                 promoted_at=ist_now() if status == "production" else None,
             )
             if status == "production":
-                # Exactly one production row at a time — archive the rest.
                 session.query(ModelArtifact).filter(
                     ModelArtifact.status == "production"
                 ).update({"status": "archived"})
@@ -279,9 +235,6 @@ class ModelRegistry:
             session.close()
 
     def promote_model(self, version: str) -> bool:
-        """Promotes an existing candidate (or archived) version to
-        production, archiving whatever was production before. Returns
-        False if the version doesn't exist."""
         session = self._session_factory()
         try:
             target = session.query(ModelArtifact).filter(ModelArtifact.version == version).first()
@@ -298,8 +251,6 @@ class ModelRegistry:
             session.close()
 
     def get_production_model(self):
-        """Returns (model, scaler, metadata_dict) for the current
-        production model, or None if none has ever been promoted."""
         import io
         import joblib
 
@@ -325,8 +276,6 @@ class ModelRegistry:
             session.close()
 
     def list_models(self):
-        """Metadata only (no blobs) for every version, newest first —
-        what /api/models and the Training tab's history view need."""
         session = self._session_factory()
         try:
             rows = session.query(ModelArtifact).order_by(desc(ModelArtifact.created_at)).all()
@@ -345,7 +294,7 @@ class ModelRegistry:
             session.close()
 
 
-# ---------- Migration helper ----------
+# ---------- Migration helper (fixes missing columns) ----------
 def ensure_schema(engine):
     """Add missing columns to existing tables if needed."""
     inspector = inspect(engine)
@@ -354,7 +303,15 @@ def ensure_schema(engine):
     table_name = "prediction_snapshots"
     if inspector.has_table(table_name):
         existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
+        # Complete list of all columns defined in PredictionSnapshot (except 'id')
         required_columns = {
+            # Basic fields
+            'prediction_id': 'VARCHAR(50) UNIQUE NOT NULL',
+            'symbol': 'VARCHAR(20) NOT NULL',
+            'timestamp': 'TIMESTAMP NOT NULL',
+            'price': 'FLOAT NOT NULL',
+            'decision': 'VARCHAR(20) NOT NULL',
+            'confidence': 'VARCHAR(20)',
             'combined_score': 'FLOAT',
             'technical_score': 'FLOAT',
             'fundamental_score': 'FLOAT',
@@ -363,22 +320,35 @@ def ensure_schema(engine):
             'market_score': 'FLOAT',
             'market_sentiment_adjustment': 'FLOAT',
             'training_score': 'FLOAT',
+            'event_risk': 'BOOLEAN',
             'entry_range_low': 'FLOAT',
             'entry_range_high': 'FLOAT',
+            'target': 'FLOAT',
+            'stop_loss': 'FLOAT',
+            'holding_period': 'VARCHAR(50)',
             'support': 'FLOAT',
             'resistance': 'FLOAT',
+            'sector': 'VARCHAR(50)',
+            'valuation': 'TEXT',
+            # Market sentiment fields
             'market_mood': 'VARCHAR(20)',
+            'market_score_extra': 'FLOAT',
             'nifty_change_pct': 'FLOAT',
             'sensex_change_pct': 'FLOAT',
+            # Technical fields
             'rsi': 'FLOAT',
             'macd': 'VARCHAR(20)',
             'ema': 'VARCHAR(20)',
             'volume_ratio': 'FLOAT',
+            # Fundamental fields
             'debt_to_equity': 'FLOAT',
             'roe': 'FLOAT',
             'roce': 'FLOAT',
+            # JSON and metadata
             'feature_snapshot': 'JSON',
             'model_version': 'VARCHAR(50)',
+            'created_at': 'TIMESTAMP',
+            # Outcome flags
             't1_success': 'INTEGER',
             't5_success': 'INTEGER',
             'overall_success': 'INTEGER',
@@ -395,7 +365,6 @@ def ensure_schema(engine):
     table_name = "training_runs"
     if inspector.has_table(table_name):
         existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
-        # All columns defined in TrainingRun model
         required_columns = {
             'run_timestamp': 'TIMESTAMP',
             'config': 'JSON',
@@ -413,7 +382,6 @@ def ensure_schema(engine):
                     conn.execute(text(alter_sql))
                     conn.commit()
                     print(f"Added column {col_name} to {table_name}")
-
 
 # ---------- Database setup helpers ----------
 def get_engine(database_url="sqlite:///./training.db"):
