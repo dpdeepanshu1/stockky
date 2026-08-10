@@ -31,7 +31,6 @@ jobs:
 
       - name: Wake up backend services
         env:
-          # Store these URLs in your GitHub Secrets (Settings -> Secrets and variables -> Actions)
           API_GATEWAY_URL: ${{ secrets.API_GATEWAY_URL }}
           MARKET_DATA_URL: ${{ secrets.MARKET_DATA_URL }}
           TECHNICAL_URL: ${{ secrets.TECHNICAL_URL }}
@@ -39,25 +38,29 @@ jobs:
           DECISION_URL: ${{ secrets.DECISION_URL }}
         run: |
           echo "Waking up backend services (to avoid cold-start timeouts)..."
-          
           curl -I $API_GATEWAY_URL/health || true
           curl -I $MARKET_DATA_URL/health || true
           curl -I $TECHNICAL_URL/health || true
           curl -I $FUNDAMENTAL_URL/health || true
           curl -I $DECISION_URL/health || true
-          
           echo "Waiting 60 seconds for services to fully spin up..."
           sleep 60
 
       - name: Retrain model
         working-directory: services/prediction-service
-        run: python train.py
+        run: |
+          python train.py
+          # Ensure the output directory for the volume mount exists
+          mkdir -p ../../data/prediction-model
+          # Copy the trained model to the mounted volume location
+          cp model.pkl ../../data/prediction-model/model.pkl
 
       - name: Commit and push updated model
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add services/prediction-service/model.pkl
+          # Add the model from the volume-mapped path
+          git add data/prediction-model/model.pkl
           # Only commit if there are changes
           if git diff --staged --quiet; then
             echo "No changes to model.pkl"
