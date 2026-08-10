@@ -5,7 +5,7 @@ Single responsibility: trigger analysis for all watchlist stocks in parallel,
 detect decision changes worth notifying about, poll the Event Tracker for
 material corporate events, and write the end-of-day report.
 
-Market hours (NSE): 09:15-15:30 IST. Scans run every 30 minutes during the
+Market hours (NSE): 09:15-15:30 IST. Scans run every 60 minutes during the
 window (1hr before open to 1hr after close).
 
 Notification rule: only notify when a symbol's decision newly becomes BUY NOW,
@@ -39,7 +39,7 @@ logger = logging.getLogger("scheduler-service")
 API_GATEWAY_URL   = os.getenv("API_GATEWAY_URL",   "https://api-gateway-wizr.onrender.com").rstrip("/")
 EVENT_TRACKER_URL = os.getenv("EVENT_TRACKER_URL", "https://event-tracker-service-m1lw.onrender.com").rstrip("/")
 NOTIFICATION_URL  = os.getenv("NOTIFICATION_URL",  "https://notification-service-36py.onrender.com").rstrip("/")
-SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))  # Changed to 60 minutes
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))          # parallel threads
 REPORTS_DIR  = os.getenv("REPORTS_DIR", "/tmp/reports")
 IST = ZoneInfo("Asia/Kolkata")
