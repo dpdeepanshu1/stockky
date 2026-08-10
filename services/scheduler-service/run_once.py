@@ -14,6 +14,9 @@ Coordination with Render scheduler service:
   - If the timestamp is within the last SCAN_INTERVAL_MINUTES (30 min), we skip
     the scan and its notifications to avoid duplication.
   - Otherwise, we run the scan (fallback) and send top picks / decision changes.
+
+Timeout for the full scan is set to 1800 seconds (30 minutes) to accommodate
+the entire pipeline (market data, technicals, fundamentals, decision engine).
 """
 import os
 import json
@@ -79,6 +82,8 @@ BUY_FAMILY = {"BUY NOW", "PREPARE TO BUY", "HOLD"}
 
 # Default interval (should match scheduler service)
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
+# Timeout for the full scan – 30 minutes (1800 seconds)
+SCAN_TIMEOUT_SECONDS = int(os.getenv("SCAN_TIMEOUT_SECONDS", "1800"))
 
 
 def is_holiday(today: datetime) -> bool:
@@ -157,7 +162,12 @@ def run_event_check():
         logger.warning("Event check failed (non-fatal): %s", e)
 
 
-def run_scan_and_diff(timeout: int = 120) -> Dict[str, Any]:
+def run_scan_and_diff(timeout: int = SCAN_TIMEOUT_SECONDS) -> Dict[str, Any]:
+    """
+    Fetch scan results, notify on decision changes, and return the scan result.
+    The timeout is set to SCAN_TIMEOUT_SECONDS (default 1800s = 30 min) to allow
+    the entire pipeline to complete.
+    """
     try:
         resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=timeout)
         resp.raise_for_status()
@@ -326,14 +336,26 @@ def main():
         else:
             logger.info("Running scan (fallback) at %s", time_now.strftime("%H:%M"))
             scan_result = run_scan_and_diff()
-            picks = scan_result.get("recommendations", [])
-            if picks:
-                store_daily_picks(today_str, picks)
-                send_scan_picks(picks)
-            else:
-                send_scan_picks([])
 
-            run_event_check()
+            if scan_result:
+                # Scan succeeded – process recommendations and send updates
+                picks = scan_result.get("recommendations", [])
+                if picks:
+                    store_daily_picks(today_str, picks)
+                    send_scan_picks(picks)
+                else:
+                    # Successful scan, but no picks
+                    send_scan_picks([])
+
+                # Only check events if scan was successful
+                run_event_check()
+            else:
+                # Scan failed (timeout, connection error, etc.)
+                logger.error("Scan failed – no results available.")
+                _notify(
+                    "⚠️ Scan Failed",
+                    f"The market scan at {time_now.strftime('%H:%M')} IST timed out or failed. Please check the system."
+                )
 
     logger.info("Scheduler tick completed.")
 
