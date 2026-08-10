@@ -8,12 +8,18 @@ Enhanced with timed notifications:
   - 15:30 IST: Market close summary
   - 16:30 IST: "Going to sleep" + preview for tomorrow
 Uses Redis to track sent messages (so each event fires only once per day).
+
+Coordination with Render scheduler service:
+  - Before performing a scan, we check Redis key "stockky:scheduler:last_scan_timestamp"
+  - If the timestamp is within the last SCAN_INTERVAL_MINUTES (30 min), we skip
+    the scan and its notifications to avoid duplication.
+  - Otherwise, we run the scan (fallback) and send top picks / decision changes.
 """
 import os
 import json
 import logging
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any
 
@@ -45,6 +51,7 @@ OPEN_NOW_KEY = "stockky:scheduler:open_now:"     # + date (sent market-open)
 CLOSE_MSG_KEY = "stockky:scheduler:close_msg:"   # + date (sent close summary)
 SLEEP_MSG_KEY = "stockky:scheduler:sleep_msg:"   # + date (sent sleep)
 DAILY_PICKS_KEY = "stockky:scheduler:picks:"     # + date (store top picks of the day)
+LAST_SCAN_KEY = "stockky:scheduler:last_scan_timestamp"   # written by scheduler service
 
 # NSE holidays 2026 (static; can be extended or fetched from API)
 HOLIDAYS_2026 = [
@@ -69,6 +76,9 @@ _redis = Redis(
 )
 
 BUY_FAMILY = {"BUY NOW", "PREPARE TO BUY", "HOLD"}
+
+# Default interval (should match scheduler service)
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
 
 
 def is_holiday(today: datetime) -> bool:
@@ -227,11 +237,15 @@ def send_market_open_now():
 
 
 def send_scan_picks(picks: List[Dict]):
-    """Send the top picks from the latest scan."""
+    """Send the top picks from the latest scan, with timestamp."""
+    timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
     if not picks:
-        _notify("\U0001F6AB No buy signals", "No actionable BUY NOW / PREPARE TO BUY stocks at the moment.")
+        _notify(
+            "\U0001F6AB No buy signals",
+            f"No actionable BUY NOW / PREPARE TO BUY stocks at this hour.\nTime: {timestamp}"
+        )
     else:
-        msg = format_stock_picks(picks)
+        msg = format_stock_picks(picks) + f"\n\n⏱️ {timestamp}"
         _notify("\U0001F4C8 Market Scan Update", msg)
 
 
@@ -259,8 +273,34 @@ def send_close_summary(date_str: str):
 
 def send_sleep_message():
     """Send 'Going to sleep' message with preview for tomorrow."""
-    # For preview, we could do an after-hours scan or just send a generic message.
     _notify("\U0001F634 Going to sleep", "Good night! I'll be back tomorrow before market open. Preview for tomorrow: Keep an eye on global cues and any after-market news.")
+
+
+def should_skip_scan() -> bool:
+    """
+    Check if the scheduler service already ran a scan recently.
+    Returns True if we should skip (avoid duplication), False if we should run.
+    """
+    try:
+        last_scan_str = _redis.get(LAST_SCAN_KEY)
+        if not last_scan_str:
+            logger.info("No last scan timestamp found in Redis – will run scan.")
+            return False
+
+        last_scan_time = datetime.fromisoformat(last_scan_str)
+        now = datetime.now(IST)
+        # If the last scan was within SCAN_INTERVAL_MINUTES (default 30) minutes, skip.
+        if (now - last_scan_time) < timedelta(minutes=SCAN_INTERVAL_MINUTES):
+            logger.info("Scheduler service already ran a scan at %s (within %d min) – skipping GitHub scan.",
+                        last_scan_time.strftime("%H:%M"), SCAN_INTERVAL_MINUTES)
+            return True
+        else:
+            logger.info("Last scan was at %s (more than %d min ago) – running GitHub scan.",
+                        last_scan_time.strftime("%H:%M"), SCAN_INTERVAL_MINUTES)
+            return False
+    except Exception as e:
+        logger.warning("Error checking last scan timestamp: %s – will run scan as fallback.", e)
+        return False
 
 
 def main():
@@ -276,13 +316,12 @@ def main():
     # 2. Sync event subscriptions (always do this)
     sync_event_subscriptions()
 
-    # 3. Determine which events to fire (using Redis flags)
-
+    # 3. Timed notifications (market open, close, sleep) – these are independent and de‑duplicated
     # Open announcement (08:15)
     if time_now == OPEN_ANNOUNCE_TIME:
         if not _redis.get(OPEN_MSG_KEY + today_str):
             send_market_open_announcement()
-            _redis.set(OPEN_MSG_KEY + today_str, "1", ex=86400)  # expire after 1 day
+            _redis.set(OPEN_MSG_KEY + today_str, "1", ex=86400)
 
     # Market open (09:15)
     if time_now == MARKET_OPEN:
@@ -290,21 +329,25 @@ def main():
             send_market_open_now()
             _redis.set(OPEN_NOW_KEY + today_str, "1", ex=86400)
 
-    # Regular scans: run at every 30-min interval from 08:30 to 15:30 inclusive
-    # We'll run if minute is 0 or 30 and time between SCAN_START and SCAN_END (inclusive).
+    # 4. Regular scans: run only if we are at a 0 or 30 minute mark and within scan window,
+    # AND the scheduler service hasn't already scanned this slot.
     if (time_now.minute in (0, 30)) and (SCAN_START <= time_now <= SCAN_END):
-        logger.info("Running scheduled scan at %s", time_now.strftime("%H:%M"))
-        scan_result = run_scan_and_diff()
-        picks = scan_result.get("recommendations", [])  # top 5 picks from scan
-        if picks:
-            store_daily_picks(today_str, picks)
-            send_scan_picks(picks)
+        if should_skip_scan():
+            # Scheduler already did the work – we skip scan and all associated notifications.
+            logger.info("Skipping GitHub scan because scheduler service handled it.")
         else:
-            # Still send a message about no buy signals
-            send_scan_picks([])
+            logger.info("Running scheduled scan (fallback) at %s", time_now.strftime("%H:%M"))
+            scan_result = run_scan_and_diff()
+            picks = scan_result.get("recommendations", [])  # top 5 picks from scan
+            if picks:
+                store_daily_picks(today_str, picks)
+                send_scan_picks(picks)
+            else:
+                # Send "no buy" message with timestamp
+                send_scan_picks([])
 
-        # Also check events (maybe we want this only when scanning)
-        run_event_check()
+            # Also check events (maybe we want this only when scanning)
+            run_event_check()
 
     # Market close summary (15:30)
     if time_now == CLOSE_SUMMARY_TIME:
@@ -318,7 +361,6 @@ def main():
             send_sleep_message()
             _redis.set(SLEEP_MSG_KEY + today_str, "1", ex=86400)
 
-    # If none of the above, just log that we did nothing.
     logger.info("Scheduler tick completed.")
 
 

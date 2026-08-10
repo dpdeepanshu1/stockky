@@ -50,6 +50,7 @@ SCAN_WINDOW_END   = dtime(16, 30)  # 1hr after market close
 # Redis for cross‑service state (shared with GitHub Actions runner)
 STATE_KEY = "stockky:scheduler:last_decisions"
 EOD_KEY_PREFIX = "stockky:scheduler:eod:"
+LAST_SCAN_KEY = "stockky:scheduler:last_scan_timestamp"   # new: timestamp of last scan
 
 _redis = None
 if Redis is not None:
@@ -248,7 +249,7 @@ def run_scan_job():
     elapsed = (datetime.now() - start).total_seconds()
     logger.info("Scan completed in %.2f seconds for %d symbols", elapsed, len(symbols))
 
-    # Optional: store a summary in Redis for frontend
+    # Store summary and last‑scan timestamp (for GitHub Actions coordination)
     try:
         summary = {
             "timestamp": now.isoformat(),
@@ -260,8 +261,11 @@ def run_scan_job():
         }
         if _redis:
             _redis.setex("stockky:last_scan_summary", 3600, json.dumps(summary))
+            # Write last scan timestamp (ISO format) – used by GitHub Actions
+            _redis.set(LAST_SCAN_KEY, now.isoformat())
+            logger.info("Last scan timestamp written to Redis")
     except Exception as e:
-        logger.warning("Could not store scan summary: %s", e)
+        logger.warning("Could not store scan summary or timestamp: %s", e)
 
 def run_event_check_job():
     """Poll Event Tracker for changes and notify."""
