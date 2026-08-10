@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.10 – sensitive scoring for /market/indices, correct fetched_at.
+v2.5.11 – moderated sensitivity for /market/indices (±0.3% → 0–100).
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.10")
+app = FastAPI(title="Stockky API Gateway", version="2.5.11")
 
 # --- CORS ---
 app.add_middleware(
@@ -911,7 +911,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.10",
+        "version": "2.5.11",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -934,7 +934,7 @@ def root():
             "/market/top-losers": "GET – top 10 losers",
             "/market/most-active": "GET – top 10 most active by volume",
             "/market/trending": "GET – trending stocks (momentum + news)",
-            "/market/indices": "GET – live NIFTY 50 & SENSEX (sensitive score, fetched_at)",
+            "/market/indices": "GET – live NIFTY 50 & SENSEX (moderated score, fetched_at)",
             "/notifications/health": "GET – notification service health",
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
@@ -1489,12 +1489,12 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
-# ── IMPROVED /market/indices with sensitive scoring and fetched_at ──────────
+# ── IMPROVED /market/indices with moderated scoring and fetched_at ──────────
 @app.get("/market/indices")
 def get_market_indices(force_refresh: bool = False):
     """
-    Fetch real-time NIFTY 50 and SENSEX index values with a sensitive market score.
-    - Uses mapping: -0.2% -> 0, 0% -> 50, +0.2% -> 100.
+    Fetch real-time NIFTY 50 and SENSEX index values with a moderated market score.
+    - Uses mapping: -0.3% -> 0, 0% -> 50, +0.3% -> 100.
     - Returns fetched_at timestamp.
     - Stores last known values in Redis.
     """
@@ -1525,9 +1525,9 @@ def get_market_indices(force_refresh: bool = False):
         sensex_change = sensex_close - sensex_prev_close
         sensex_change_pct = (sensex_change / sensex_prev_close) * 100
 
-        # Sensitive score mapping: -0.2% -> 0, 0% -> 50, +0.2% -> 100
+        # Moderated score mapping: -0.3% -> 0, 0% -> 50, +0.3% -> 100
         avg_change = (nifty_change_pct + sensex_change_pct) / 2
-        sensitivity = 0.002  # 0.2%
+        sensitivity = 0.003  # 0.3%
         raw_score = 50 + (avg_change / sensitivity) * 50
         market_score = max(0, min(100, raw_score))
 
