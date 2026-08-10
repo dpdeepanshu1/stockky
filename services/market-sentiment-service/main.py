@@ -3,7 +3,7 @@ Market Sentiment Service
 Responsibility: Fetch Indian index data (NIFTY 50, SENSEX) and compute a
 normalized market sentiment score and classification.
 
-v0.4.0 – batch fetch, request locking, stale cache fallback, never 503.
+v0.5.0 – increased cache, fallback to Ticker.history, better retry logic.
 """
 import os
 import logging
@@ -19,11 +19,28 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# Set User-Agent for yfinance requests
+import requests
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+})
+try:
+    yf.set_session(session)
+except AttributeError:
+    try:
+        yf.shared._session = session
+    except AttributeError:
+        pass
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("market-sentiment-service")
 
 # --- Configuration ---
-# Only two main indices to reduce API calls
 INDEX_SYMBOLS: Dict[str, str] = {
     "NIFTY 50": "^NSEI",
     "SENSEX": "^BSESN",
@@ -33,11 +50,11 @@ INDEX_SYMBOLS: Dict[str, str] = {
 _cache: Dict[str, Any] = {
     "data": None,
     "timestamp": None,
-    "ttl_seconds": 120,  # 2 minutes
+    "ttl_seconds": 300,  # 5 minutes – increased from 2 min
     "lock": asyncio.Lock(),
 }
 
-app = FastAPI(title="Stockky Market Sentiment Service", version="0.4.0")
+app = FastAPI(title="Stockky Market Sentiment Service", version="0.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -86,14 +103,54 @@ def _safe_int(val):
     except (TypeError, ValueError):
         return None
 
+def fetch_individual_ticker(symbol: str, name: str, max_retries=3) -> Optional[IndexData]:
+    """Fetch a single ticker using Ticker.history as a fallback."""
+    for attempt in range(max_retries):
+        try:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="2d")
+            if len(hist) >= 2:
+                current = _safe_float(hist['Close'].iloc[-1])
+                prev_close = _safe_float(hist['Close'].iloc[-2])
+                change = _safe_float(current - prev_close) if current and prev_close else None
+                change_pct = _safe_float((change / prev_close) * 100) if change and prev_close else None
+                high = _safe_float(hist['High'].iloc[-1])
+                low = _safe_float(hist['Low'].iloc[-1])
+                volume = _safe_int(hist['Volume'].iloc[-1])
+                return IndexData(
+                    symbol=symbol,
+                    name=name,
+                    current=current,
+                    previous_close=prev_close,
+                    change=change,
+                    change_percent=change_pct,
+                    high=high,
+                    low=low,
+                    volume=volume,
+                    timestamp=datetime.now()
+                )
+            else:
+                logger.warning(f"Insufficient history for {name} ({symbol})")
+                return None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = (2 ** attempt) + 1
+                logger.warning(f"Individual fetch for {name} attempt {attempt+1} failed: {e}, retrying in {wait}s")
+                time.sleep(wait)
+                continue
+            else:
+                logger.error(f"Individual fetch for {name} failed after {max_retries} retries: {e}")
+                return None
+    return None
+
 def fetch_indices_batch(symbols: Dict[str, str]) -> Dict[str, IndexData]:
-    """Fetch all indices in a single batch using yf.download."""
+    """Fetch all indices in a single batch using yf.download; fallback to individual if batch fails."""
     result = {}
     if not symbols:
         return result
 
     yf_symbols = list(symbols.values())
-    max_retries = 3
+    max_retries = 2  # fewer retries for batch, then fallback
     data = None
     for attempt in range(max_retries):
         try:
@@ -106,26 +163,47 @@ def fetch_indices_batch(symbols: Dict[str, str]) -> Dict[str, IndexData]:
                 threads=False,
                 progress=False
             )
-            logger.info(f"Batch download success: {len(data)} tickers")
-            break
+            if data is not None and not data.empty:
+                logger.info(f"Batch download success: {len(data)} tickers")
+                break
+            else:
+                logger.warning(f"Batch download returned empty data on attempt {attempt+1}")
         except Exception as e:
+            logger.warning(f"Batch download attempt {attempt+1} failed: {e}")
             if attempt < max_retries - 1:
                 wait = (2 ** attempt) + 1
-                logger.warning(f"Batch download attempt {attempt+1} failed: {e}, retrying in {wait}s")
                 time.sleep(wait)
                 continue
             else:
-                logger.error(f"Batch download failed after {max_retries} retries: {e}")
+                logger.error("Batch download failed, falling back to individual fetches")
+                # Fallback: fetch each symbol individually
+                for name, sym in symbols.items():
+                    data = fetch_individual_ticker(sym, name)
+                    if data:
+                        result[name] = data
+                    else:
+                        logger.warning(f"Individual fetch also failed for {name}")
                 return result
 
-    if data is None:
+    if data is None or data.empty:
+        # If batch failed completely, try individual
+        for name, sym in symbols.items():
+            data = fetch_individual_ticker(sym, name)
+            if data:
+                result[name] = data
+            else:
+                logger.warning(f"Individual fetch failed for {name}")
         return result
 
-    # Process each symbol
+    # Process batch data
     for name, sym in symbols.items():
         try:
             if sym not in data.columns or data[sym].empty:
                 logger.warning(f"No data for {name} ({sym})")
+                # Try individual fetch for this symbol
+                ind_data = fetch_individual_ticker(sym, name)
+                if ind_data:
+                    result[name] = ind_data
                 continue
             df = data[sym]
             if len(df) >= 2:
@@ -150,8 +228,15 @@ def fetch_indices_batch(symbols: Dict[str, str]) -> Dict[str, IndexData]:
                 )
             else:
                 logger.warning(f"Insufficient data for {name} ({sym})")
+                ind_data = fetch_individual_ticker(sym, name)
+                if ind_data:
+                    result[name] = ind_data
         except Exception as e:
             logger.error(f"Error processing {name} ({sym}): {e}")
+            # Try individual fetch
+            ind_data = fetch_individual_ticker(sym, name)
+            if ind_data:
+                result[name] = ind_data
 
     return result
 
@@ -272,11 +357,11 @@ async def health_check():
 async def root():
     return {
         "service": "Stockky Market Sentiment Service",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
-            "/sentiment": "GET – current market sentiment (cached 120s)",
+            "/sentiment": "GET – current market sentiment (cached 300s)",
             "/sentiment?force_refresh=true": "GET – force refresh",
         },
     }
