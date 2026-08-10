@@ -140,7 +140,18 @@ DEFAULT_TRAINING_CONFIG = {
 # ---------- Lock and progress files ----------
 LOCK_FILE = 'training.lock'
 PROGRESS_FILE = 'training_progress.json'
-_abort_flag = False
+_abort_flag = False   # global abort signal
+
+def request_abort():
+    """Set the global abort flag to True. Called by the API to stop training."""
+    global _abort_flag
+    _abort_flag = True
+    # Optionally remove the lock file to release the lock for future runs
+    if os.path.exists(LOCK_FILE):
+        try:
+            os.remove(LOCK_FILE)
+        except:
+            pass
 
 def write_progress(current_fold, total_folds, elapsed_seconds=None):
     """Write current progress to a JSON file."""
@@ -157,26 +168,17 @@ def write_progress(current_fold, total_folds, elapsed_seconds=None):
         pass
 
 def lock_checker():
-    """Background thread that checks the lock file and raises KeyboardInterrupt if missing."""
+    """Background thread that checks the lock file and sets abort flag if missing."""
     global _abort_flag
     while not _abort_flag:
         time.sleep(2.0)  # Check every 2 seconds
         if not os.path.exists(LOCK_FILE):
-            logger.warning("Lock file missing – aborting training immediately.")
-            # Raise an exception in the main thread
-            import threading
-            main_thread = threading.main_thread()
-            if main_thread.is_alive():
-                # Use signal to interrupt the main thread if possible
-                try:
-                    signal.raise_signal(signal.SIGINT)  # Sends KeyboardInterrupt
-                except Exception:
-                    # Fallback: set a flag and check it inside the loop
-                    _abort_flag = True
-                    break
+            logger.warning("Lock file missing – aborting training.")
+            _abort_flag = True
+            break
 
 def check_abort():
-    """Check if abort flag is set; raise KeyboardInterrupt."""
+    """Check if abort flag is set or lock file is missing; raise KeyboardInterrupt."""
     global _abort_flag
     if _abort_flag:
         raise KeyboardInterrupt("Training aborted by user.")
@@ -266,9 +268,13 @@ def run_training_pipeline(
     db_session: Optional[Session] = None,
     model_store_path: str = "./model-store",
 ) -> Dict[str, Any]:
+    global _abort_flag
     np.random.seed(config['random_seed'])
     random.seed(config['random_seed'])
     os.makedirs(model_store_path, exist_ok=True)
+
+    # Reset abort flag at start
+    _abort_flag = False
 
     # Start the lock‑checking thread
     checker_thread = threading.Thread(target=lock_checker, daemon=True)
@@ -479,7 +485,6 @@ def run_training_pipeline(
         raise
     finally:
         # Stop the checker thread
-        global _abort_flag
         _abort_flag = True
         # Clean up progress file
         try:
