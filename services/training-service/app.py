@@ -27,6 +27,7 @@ from evaluate import (
     evaluate_t5 as _evaluate_t5_prediction,
     evaluate_pending_predictions,
 )
+from train import request_abort   # <-- ADDED
 
 # Optional imports
 try:
@@ -285,7 +286,8 @@ async def lock_status():
 async def clear_lock():
     if os.path.exists(LOCK_FILE):
         os.remove(LOCK_FILE)
-        return JSONResponse(content={"status": "Lock cleared"})
+        request_abort()   # <-- Signal the training loop to stop
+        return JSONResponse(content={"status": "Lock cleared and abort requested"})
     return JSONResponse(content={"status": "No lock found"})
 
 @app.get("/api/status")
