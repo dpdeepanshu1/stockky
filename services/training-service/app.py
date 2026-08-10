@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 SERVICE_URL = os.environ.get('SERVICE_URL', "https://training-service-5e9v.onrender.com")
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./training.db')
+MODEL_STORE_PATH = os.environ.get('MODEL_STORE_PATH', './model-store')
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine)
 
@@ -170,12 +171,10 @@ def get_training_status():
             logger.error(f"Error loading report: {e}")
     if HAS_MODEL_REGISTRY:
         try:
-            registry = ModelRegistry()
-            pointer_path = os.path.join(registry.model_dir, 'production_pointer.json')
-            if os.path.exists(pointer_path):
-                with open(pointer_path, 'r') as f:
-                    pointer = json.load(f)
-                status['model_version'] = pointer.get('version')
+            registry = ModelRegistry(SessionLocal)
+            prod = registry.get_production_model()
+            if prod:
+                status['model_version'] = prod[2]['version']
         except Exception as e:
             logger.warning(f"Could not read model registry: {e}")
     return convert_numpy(status)
@@ -183,61 +182,16 @@ def get_training_status():
 def get_models_list():
     if not HAS_MODEL_REGISTRY:
         raise HTTPException(status_code=501, detail="Model registry not available")
-    registry = ModelRegistry()
-    models = []
-    model_dir = registry.model_dir
-    for fname in os.listdir(model_dir):
-        if fname.endswith('.pkl') and '_scaler' not in fname and 'production_pointer' not in fname:
-            version = fname.replace('.pkl', '')
-            meta_path = os.path.join(model_dir, f'{version}_meta.json')
-            if os.path.exists(meta_path):
-                with open(meta_path, 'r') as f:
-                    meta = json.load(f)
-                models.append({
-                    'version': version,
-                    'created_at': meta.get('created_at'),
-                    'status': meta.get('status', 'candidate'),
-                    'metrics': convert_numpy(meta.get('metrics', {}))
-                })
-            else:
-                models.append({'version': version, 'status': 'unknown'})
-    pointer_path = os.path.join(model_dir, 'production_pointer.json')
-    if os.path.exists(pointer_path):
-        with open(pointer_path, 'r') as f:
-            pointer = json.load(f)
-        prod_version = pointer.get('version')
-        for m in models:
-            if m['version'] == prod_version:
-                m['status'] = 'production'
-                break
-    models.sort(key=lambda x: x.get('created_at', ''), reverse=True)
-    return convert_numpy(models)
+    registry = ModelRegistry(SessionLocal)
+    return convert_numpy(registry.list_models())
 
 def promote_model(version: str):
     if not HAS_MODEL_REGISTRY:
         raise HTTPException(status_code=501, detail="Model registry not available")
-    registry = ModelRegistry()
-    model_path = os.path.join(registry.model_dir, f'{version}.pkl')
-    scaler_path = os.path.join(registry.model_dir, f'{version}_scaler.pkl')
-    meta_path = os.path.join(registry.model_dir, f'{version}_meta.json')
-    if not os.path.exists(model_path):
+    registry = ModelRegistry(SessionLocal)
+    ok = registry.promote_model(version)
+    if not ok:
         raise HTTPException(status_code=404, detail=f"Model version {version} not found")
-    if os.path.exists(meta_path):
-        with open(meta_path, 'r') as f:
-            meta = json.load(f)
-        meta['status'] = 'production'
-        meta['promoted_at'] = datetime.now().isoformat()
-        with open(meta_path, 'w') as f:
-            json.dump(convert_numpy(meta), f, indent=2)
-    pointer = {'version': version, 'path': model_path}
-    with open(os.path.join(registry.model_dir, 'production_pointer.json'), 'w') as f:
-        json.dump(pointer, f, indent=2)
-    try:
-        import shutil
-        shutil.copy(model_path, 'model.pkl')
-        shutil.copy(scaler_path, 'scaler.pkl')
-    except Exception as e:
-        logger.warning(f"Could not create model.pkl symlink: {e}")
     logger.info(f"Promoted model {version} to production")
     return {"status": "success", "version": version}
 
@@ -510,6 +464,31 @@ async def prediction_history(limit: int = 50, offset: int = 0):
 @app.get("/model-status")
 async def model_status():
     return JSONResponse(content=get_training_status())
+
+@app.get("/training-score/{symbol}")
+async def training_score(symbol: str):
+    """decision-engine-service calls this for every decision — it was
+    proxying to a route that didn't exist anywhere in the deployed app,
+    silently 404ing every single time and falling back to a neutral 50.
+    This wires it to the real (existing) scanner instead of leaving it
+    404ing.
+
+    NOTE: this does NOT yet make the training_score meaningful — that
+    requires a genuine model registry (today's ModelRegistry import
+    always fails, so the scanner can never load a model) AND real
+    historical-outcome data to compute similarity from (which requires
+    DATABASE_URL to be a real Postgres, not the ephemeral default
+    SQLite). Until both of those are addressed, this will keep returning
+    404 -> decision-engine's existing fallback to a neutral 50, which is
+    the same safe behavior as before. Fixing the route itself is a
+    prerequisite either way.
+    """
+    from scanner import TrainingScanner
+    scanner = TrainingScanner(SessionLocal, MODEL_STORE_PATH)
+    score = scanner.score_symbol(symbol)
+    if not score:
+        raise HTTPException(status_code=404, detail="Symbol not found or insufficient data")
+    return score
 
 @app.post("/train")
 async def trigger_train(background_tasks: BackgroundTasks):

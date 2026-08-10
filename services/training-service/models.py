@@ -9,7 +9,8 @@ Tables:
 """
 from datetime import datetime
 from sqlalchemy import (
-    Column, String, Float, Integer, Boolean, DateTime, JSON, Text, create_engine, inspect, text
+    Column, String, Float, Integer, Boolean, DateTime, JSON, Text, LargeBinary,
+    create_engine, inspect, text, desc
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -120,6 +121,197 @@ class TrainingRun(Base):
     walk_forward_metrics = Column(JSON, nullable=True)
     fold_details = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ModelArtifact(Base):
+    """
+    The actual trained model, stored IN the database rather than on local
+    disk. This is the piece that was missing entirely before: training-
+    service and prediction-service are separate Render containers with no
+    shared filesystem, so a model saved to local disk was never reachable
+    by anything else — and on free tier, not even reachable by
+    training-service's own NEXT restart. Storing the serialized bytes as a
+    row here means any service with this DATABASE_URL (or a REST call to
+    training-service) can retrieve the current production model, and nothing
+    is lost on restart.
+
+    A version is a simple auto-incrementing string ("v1", "v2", ...).
+    Exactly one row can have status="production" at a time — enforced in
+    ModelRegistry.save_production_model()/promote_model(), not at the DB
+    level, since SQLite (used for local dev without DATABASE_URL set)
+    doesn't support partial unique indexes as portably as Postgres does.
+    """
+    __tablename__ = "model_artifacts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version = Column(String(20), unique=True, nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="candidate", index=True)  # candidate | production | archived
+    model_blob = Column(LargeBinary, nullable=False)
+    scaler_blob = Column(LargeBinary, nullable=True)
+    feature_columns = Column(JSON, nullable=True)
+    config = Column(JSON, nullable=True)
+    metrics = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    promoted_at = Column(DateTime, nullable=True)
+
+
+class ModelRegistry:
+    """
+    Postgres-backed model store. Replaces the local-disk-file design that
+    was referenced throughout app.py/train.py (registry.model_dir,
+    {version}.pkl, production_pointer.json) but never actually implemented
+    — the `from models import ModelRegistry` import always failed, so
+    HAS_MODEL_REGISTRY was always False and every training run silently
+    fell into a "legacy" path that saved to an unreachable local file.
+
+    Interface kept close to what the calling code already expects, so
+    app.py/train.py needed only their file-scanning logic updated to call
+    these methods instead of touching the filesystem — not a rewrite of
+    the training pipeline itself.
+    """
+
+    def __init__(self, session_factory=None):
+        """session_factory: a SQLAlchemy sessionmaker. If omitted, builds
+        its own from DATABASE_URL — needed because train.py's call site
+        does `ModelRegistry()` with no arguments. Passing one in explicitly
+        (as app.py does, reusing its existing SessionLocal) avoids opening
+        a second, redundant DB connection pool."""
+        if session_factory is None:
+            import os
+            db_url = os.environ.get("DATABASE_URL", "sqlite:///./training.db")
+            engine = create_engine(db_url, echo=False)
+            Base.metadata.create_all(engine)
+            session_factory = sessionmaker(bind=engine)
+        self._session_factory = session_factory
+
+    def _next_version(self, session) -> str:
+        latest = session.query(ModelArtifact).order_by(desc(ModelArtifact.id)).first()
+        n = 1
+        if latest and latest.version.startswith("v"):
+            try:
+                n = int(latest.version[1:]) + 1
+            except ValueError:
+                n = (latest.id or 0) + 1
+        return f"v{n}"
+
+    def save_production_model(self, model, scaler, config: dict, metrics: dict, feature_columns=None) -> str:
+        """Serializes and saves a model directly as the new production
+        version, archiving whatever was production before. Matches the
+        existing call site in train.py, which trains on the full dataset
+        and treats the result as immediately deployable (no separate
+        candidate/promote step in that pipeline today)."""
+        return self._save(model, scaler, config, metrics, feature_columns, status="production")
+
+    def save_candidate_model(self, model, scaler, config: dict, metrics: dict, feature_columns=None) -> str:
+        """For a future safer workflow: train, inspect metrics, THEN
+        promote explicitly via promote_model() instead of going live
+        immediately."""
+        return self._save(model, scaler, config, metrics, feature_columns, status="candidate")
+
+    def _save(self, model, scaler, config, metrics, feature_columns, status) -> str:
+        import io
+        import joblib
+
+        model_buf = io.BytesIO()
+        joblib.dump(model, model_buf)
+        model_bytes = model_buf.getvalue()
+
+        scaler_bytes = None
+        if scaler is not None:
+            scaler_buf = io.BytesIO()
+            joblib.dump(scaler, scaler_buf)
+            scaler_bytes = scaler_buf.getvalue()
+
+        session = self._session_factory()
+        try:
+            version = self._next_version(session)
+            artifact = ModelArtifact(
+                version=version,
+                status=status,
+                model_blob=model_bytes,
+                scaler_blob=scaler_bytes,
+                feature_columns=feature_columns,
+                config=config,
+                metrics=metrics,
+                created_at=datetime.utcnow(),
+                promoted_at=datetime.utcnow() if status == "production" else None,
+            )
+            if status == "production":
+                # Exactly one production row at a time — archive the rest.
+                session.query(ModelArtifact).filter(
+                    ModelArtifact.status == "production"
+                ).update({"status": "archived"})
+            session.add(artifact)
+            session.commit()
+            return version
+        finally:
+            session.close()
+
+    def promote_model(self, version: str) -> bool:
+        """Promotes an existing candidate (or archived) version to
+        production, archiving whatever was production before. Returns
+        False if the version doesn't exist."""
+        session = self._session_factory()
+        try:
+            target = session.query(ModelArtifact).filter(ModelArtifact.version == version).first()
+            if not target:
+                return False
+            session.query(ModelArtifact).filter(
+                ModelArtifact.status == "production"
+            ).update({"status": "archived"})
+            target.status = "production"
+            target.promoted_at = datetime.utcnow()
+            session.commit()
+            return True
+        finally:
+            session.close()
+
+    def get_production_model(self):
+        """Returns (model, scaler, metadata_dict) for the current
+        production model, or None if none has ever been promoted."""
+        import io
+        import joblib
+
+        session = self._session_factory()
+        try:
+            artifact = session.query(ModelArtifact).filter(
+                ModelArtifact.status == "production"
+            ).order_by(desc(ModelArtifact.promoted_at)).first()
+            if not artifact:
+                return None
+            model = joblib.load(io.BytesIO(artifact.model_blob))
+            scaler = joblib.load(io.BytesIO(artifact.scaler_blob)) if artifact.scaler_blob else None
+            meta = {
+                "version": artifact.version,
+                "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
+                "promoted_at": artifact.promoted_at.isoformat() if artifact.promoted_at else None,
+                "feature_columns": artifact.feature_columns,
+                "config": artifact.config,
+                "metrics": artifact.metrics,
+            }
+            return model, scaler, meta
+        finally:
+            session.close()
+
+    def list_models(self):
+        """Metadata only (no blobs) for every version, newest first —
+        what /api/models and the Training tab's history view need."""
+        session = self._session_factory()
+        try:
+            rows = session.query(ModelArtifact).order_by(desc(ModelArtifact.created_at)).all()
+            return [
+                {
+                    "version": r.version,
+                    "status": r.status,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "promoted_at": r.promoted_at.isoformat() if r.promoted_at else None,
+                    "metrics": r.metrics,
+                    "config": r.config,
+                }
+                for r in rows
+            ]
+        finally:
+            session.close()
 
 
 # ---------- Migration helper ----------
