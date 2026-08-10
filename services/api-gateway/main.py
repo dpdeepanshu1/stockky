@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.2 – fixed health check to include 'ready' flag and added /ready endpoint.
+v2.5.3 – adds stale cache fallback for /market/indices to avoid 500s on rate limit.
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.2")
+app = FastAPI(title="Stockky API Gateway", version="2.5.3")
 
 # --- CORS ---
 app.add_middleware(
@@ -911,7 +911,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.2",
+        "version": "2.5.3",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -1493,12 +1493,12 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
-# ── Market Indices endpoint with caching ──────────────────────────────────
+# ── Market Indices endpoint with caching and stale fallback ──────────────────
 @app.get("/market/indices")
 def get_market_indices():
     """
     Fetch real-time NIFTY 50 and SENSEX index values with point changes.
-    Cached for 5 minutes to avoid rate limits.
+    Cached for 5 minutes to avoid rate limits. If yfinance fails, returns stale cache if available.
     """
     cached = _redis_get(INDICES_CACHE_KEY)
     if cached and isinstance(cached, dict):
@@ -1554,6 +1554,13 @@ def get_market_indices():
         return result
     except Exception as e:
         logger.error(f"Error fetching indices: {e}")
+        # If we have stale cache, return it
+        stale = _redis_get(INDICES_CACHE_KEY)
+        if stale and isinstance(stale, dict):
+            logger.info("Returning stale cached indices data")
+            stale["stale"] = True
+            return stale
+        # Otherwise raise a 500
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── Universe preview ──────────────────────────────────────────────────────
