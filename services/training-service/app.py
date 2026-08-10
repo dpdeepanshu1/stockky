@@ -27,7 +27,7 @@ from evaluate import (
     evaluate_t5 as _evaluate_t5_prediction,
     evaluate_pending_predictions,
 )
-from train import request_abort   # <-- Use the new abort function
+from train import request_abort   # <-- abort function
 
 # Optional imports
 try:
@@ -122,7 +122,7 @@ def convert_numpy(obj):
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
-    ensure_schema(engine)
+    ensure_schema(engine)   # <-- this will add missing columns
     logger.info("Database schema initialized.")
     if os.path.exists(LOCK_FILE):
         try:
