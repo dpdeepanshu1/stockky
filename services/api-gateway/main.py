@@ -4,7 +4,7 @@ API Gateway
 Single entry point for the React frontend.
 Includes async scan with progress, symbol correction, Hinglish summaries,
 market movers, watchlist scan, Telegram notifications, and dynamic universe.
-v2.4.1 adds parallel scanning for dramatically faster market scans.
+v2.4.2 adds improved error handling, retries, and connection pooling.
 """
 import os
 import json
@@ -56,7 +56,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.4.1")
+app = FastAPI(title="Stockky API Gateway", version="2.4.2")
 
 # --- CORS Middleware (explicit) ---
 app.add_middleware(
@@ -653,10 +653,12 @@ def _send_scan_notification(recommendations: list, verdict: str, scanned: int, u
         logger.warning("Failed to send scan notification: %s", e)
 
 # ============================================================================
-# ⚡ PARALLEL SCAN IMPLEMENTATION (NEW)
+# ⚡ PARALLEL SCAN IMPLEMENTATION (with retries and improved error handling)
 # ============================================================================
 
 MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "20"))
+MAX_RETRIES = 2
+RETRY_BACKOFF = 1.5
 
 async def _analyze_one_symbol_async(
     symbol: str,
@@ -665,70 +667,95 @@ async def _analyze_one_symbol_async(
 ) -> dict:
     """
     Analyse one symbol using all downstream services.
-    All the fallback logic from the sequential scan is preserved.
+    Includes retry logic for transient failures.
     """
     async with sem:
-        try:
-            # 1. Decision Engine
-            resp = await client.get(f"{DECISION_URL}/decide/{symbol}", timeout=30)
-            resp.raise_for_status()
-            raw = resp.json()
-            normalized = _normalize_decision_response(raw, symbol)
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                # 1. Decision Engine
+                resp = await client.get(f"{DECISION_URL}/decide/{symbol}", timeout=45)
+                resp.raise_for_status()
+                raw = resp.json()
+                normalized = _normalize_decision_response(raw, symbol)
 
-            # 2. Price fallback if missing
-            if normalized.get("close") is None:
-                price = _fetch_price_from_quote(symbol)
-                if price is not None:
-                    normalized["close"] = price
-                    if normalized.get("support") is None:
-                        normalized["support"] = round(price * 0.95, 2)
-                    if normalized.get("resistance") is None:
-                        normalized["resistance"] = round(price * 1.05, 2)
+                # 2. Price fallback if missing
+                if normalized.get("close") is None:
+                    price = _fetch_price_from_quote(symbol)
+                    if price is not None:
+                        normalized["close"] = price
+                        if normalized.get("support") is None:
+                            normalized["support"] = round(price * 0.95, 2)
+                        if normalized.get("resistance") is None:
+                            normalized["resistance"] = round(price * 1.05, 2)
 
-            # 3. Fundamentals
-            _merge_fundamentals(normalized, symbol)
+                # 3. Fundamentals
+                _merge_fundamentals(normalized, symbol)
 
-            # 4. News
-            if normalized.get("news_score") is None:
-                news = _fetch_news(symbol)
-                if news:
-                    normalized["news_score"] = news.get("news_score")
-                    reasons = normalized.get("reasons", {})
-                    if news.get("reasons"):
-                        reasons["news"] = news["reasons"]
+                # 4. News
+                if normalized.get("news_score") is None:
+                    news = _fetch_news(symbol)
+                    if news:
+                        normalized["news_score"] = news.get("news_score")
+                        reasons = normalized.get("reasons", {})
+                        if news.get("reasons"):
+                            reasons["news"] = news["reasons"]
+                            normalized["reasons"] = reasons
+
+                # 5. Events
+                if normalized.get("event_risk") is False and not normalized.get("reasons", {}).get("event"):
+                    events = _fetch_events(symbol)
+                    if events and events.get("next_earnings_date"):
+                        normalized["event_risk"] = True
+                        reasons = normalized.get("reasons", {})
+                        reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
                         normalized["reasons"] = reasons
 
-            # 5. Events
-            if normalized.get("event_risk") is False and not normalized.get("reasons", {}).get("event"):
-                events = _fetch_events(symbol)
-                if events and events.get("next_earnings_date"):
-                    normalized["event_risk"] = True
-                    reasons = normalized.get("reasons", {})
-                    reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
-                    normalized["reasons"] = reasons
+                # 6. Prediction
+                if normalized.get("prediction_score") is None:
+                    try:
+                        pred_resp = await client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=25)
+                        if pred_resp.status_code == 200:
+                            pred_data = pred_resp.json()
+                            if pred_data.get("model_loaded"):
+                                normalized["prediction_score"] = pred_data.get("prediction_score")
+                                normalized["prediction_note"] = pred_data.get("note")
+                    except Exception as e:
+                        logger.warning(f"Prediction lookup failed for {symbol}: {e}")
 
-            # 6. Prediction
-            if normalized.get("prediction_score") is None:
-                try:
-                    pred_resp = await client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=25)
-                    if pred_resp.status_code == 200:
-                        pred_data = pred_resp.json()
-                        if pred_data.get("model_loaded"):
-                            normalized["prediction_score"] = pred_data.get("prediction_score")
-                            normalized["prediction_note"] = pred_data.get("note")
-                except Exception as e:
-                    logger.warning(f"Prediction lookup failed for {symbol}: {e}")
+                # 7. Natural language summary
+                normalized["natural_language_summary"] = _generate_summary(normalized)
+                return normalized
 
-            # 7. Natural language summary
-            normalized["natural_language_summary"] = _generate_summary(normalized)
-            return normalized
-
-        except httpx.HTTPError as e:
-            logger.warning(f"Scan error for {symbol}: {e}")
-            return {"symbol": symbol, "decision": "ERROR", "error": str(e)}
-        except Exception as e:
-            logger.error(f"Unexpected error for {symbol}: {e}")
-            return {"symbol": symbol, "decision": "ERROR", "error": str(e)}
+            except httpx.HTTPError as e:
+                # Log the error with details
+                error_type = type(e).__name__
+                error_msg = str(e) or f"{error_type} (empty message)"
+                logger.warning(
+                    f"Scan error for {symbol} (attempt {attempt+1}/{MAX_RETRIES+1}): {error_type} - {error_msg}"
+                )
+                if attempt < MAX_RETRIES:
+                    # Exponential backoff
+                    wait = RETRY_BACKOFF ** attempt
+                    logger.info(f"Retrying {symbol} in {wait:.1f}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    # Final failure
+                    return {
+                        "symbol": symbol,
+                        "decision": "ERROR",
+                        "error": f"{error_type}: {error_msg if error_msg else 'Unknown HTTP error'}"
+                    }
+            except Exception as e:
+                # Non-HTTP error
+                logger.error(f"Unexpected error for {symbol}: {type(e).__name__} - {str(e)}")
+                return {
+                    "symbol": symbol,
+                    "decision": "ERROR",
+                    "error": f"Unexpected: {type(e).__name__} - {str(e)}"
+                }
+        # Should never reach here
+        return {"symbol": symbol, "decision": "ERROR", "error": "Max retries exceeded"}
 
 async def run_scan_parallel(task_id: str, universe: List[str]):
     """
@@ -752,7 +779,9 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
 
     sem = asyncio.Semaphore(MAX_PARALLEL_WORKERS)
 
-    async with httpx.AsyncClient(timeout=150) as client:
+    # Use a client with connection pooling and higher limits
+    limits = httpx.Limits(max_keepalive_connections=100, max_connections=100)
+    async with httpx.AsyncClient(timeout=150, limits=limits) as client:
         # Create tasks for all symbols
         tasks = [
             _analyze_one_symbol_async(sym, client, sem)
@@ -889,7 +918,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.4.1",
+        "version": "2.4.2",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -967,7 +996,7 @@ async def system_health():
     all_ok = all(v["ok"] for v in services.values())
     return {"required_ok": required_ok, "all_ok": all_ok, "services": services}
 
-# ── NEW: Wake all services ──────────────────────────────────────────────────
+# ── Wake all services ──────────────────────────────────────────────────
 @app.post("/wake/all")
 async def wake_all_services():
     """Ping all services to wake them from cold start."""
@@ -1236,7 +1265,6 @@ def start_scan(force_refresh: bool = False, background_tasks: BackgroundTasks = 
 
         universe = _build_scan_universe()
         task_id = str(uuid.uuid4())
-        # Use the new parallel scan
         background_tasks.add_task(run_scan_parallel, task_id, universe)
         return {"task_id": task_id}
     except Exception as e:
