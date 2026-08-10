@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.4 – increased health check timeout for market-data to 15 seconds.
+v2.5.5 – robust fallback for /market/indices; market-sentiment optional.
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.4")
+app = FastAPI(title="Stockky API Gateway", version="2.5.5")
 
 # --- CORS ---
 app.add_middleware(
@@ -911,7 +911,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.4",
+        "version": "2.5.5",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -934,7 +934,7 @@ def root():
             "/market/top-losers": "GET – top 10 losers",
             "/market/most-active": "GET – top 10 most active by volume",
             "/market/trending": "GET – trending stocks (momentum + news)",
-            "/market/indices": "GET – live NIFTY 50 & SENSEX points (cached)",
+            "/market/indices": "GET – live NIFTY 50 & SENSEX points (cached, fallback on error)",
             "/notifications/health": "GET – notification service health",
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
@@ -1495,18 +1495,22 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
-# ── Market Indices endpoint with caching and stale fallback ──────────────────
+# ── Market Indices endpoint with caching and robust fallback ──────────────────
 @app.get("/market/indices")
 def get_market_indices():
     """
     Fetch real-time NIFTY 50 and SENSEX index values with point changes.
-    Cached for 5 minutes to avoid rate limits. If yfinance fails, returns stale cache if available.
+    - Cached for 5 minutes to avoid rate limits.
+    - If yfinance fails, return stale cache if available.
+    - If no cache, return a sensible "market closed" fallback so the frontend never sees a 500.
     """
+    # First, try to serve from cache
     cached = _redis_get(INDICES_CACHE_KEY)
     if cached and isinstance(cached, dict):
         logger.info("Serving cached indices data")
         return cached
 
+    # If no cache, try to fetch fresh
     try:
         nifty = yf.Ticker("^NSEI")
         sensex = yf.Ticker("^BSESN")
@@ -1554,16 +1558,29 @@ def get_market_indices():
         }
         _redis_set(INDICES_CACHE_KEY, result, ttl=300)  # 5 minutes
         return result
+
     except Exception as e:
         logger.error(f"Error fetching indices: {e}")
-        # If we have stale cache, return it
+        # Check for stale cache again (in case it was set during the fetch attempt)
         stale = _redis_get(INDICES_CACHE_KEY)
         if stale and isinstance(stale, dict):
             logger.info("Returning stale cached indices data")
             stale["stale"] = True
             return stale
-        # Otherwise raise a 500
-        raise HTTPException(status_code=500, detail=str(e))
+
+        # No cache at all – return a fallback response so the frontend doesn't break
+        logger.warning("No cache available, returning fallback indices data")
+        fallback = {
+            "nifty": {"price": 0, "change": 0, "change_pct": 0},
+            "sensex": {"price": 0, "change": 0, "change_pct": 0},
+            "market_mood": "NEUTRAL",
+            "market_score": 50,
+            "stale": True,
+            "fallback": True
+        }
+        # Store this fallback for a short time to avoid repeated failures
+        _redis_set(INDICES_CACHE_KEY, fallback, ttl=60)
+        return fallback
 
 # ── Universe preview ──────────────────────────────────────────────────────
 @app.get("/scan/universe")
@@ -1748,6 +1765,19 @@ async def training_other_proxy(path: str, request: Request):
             )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Training service unreachable: {str(e)}")
+
+# ── Startup cache pre-population ──────────────────────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    """Pre-populate indices cache on startup to avoid first empty request."""
+    try:
+        # Attempt to fetch indices and cache them
+        logger.info("Pre-populating market indices cache on startup...")
+        # We'll just call the endpoint internally
+        result = get_market_indices()
+        logger.info("Market indices cache pre-populated successfully")
+    except Exception as e:
+        logger.warning(f"Could not pre-populate indices cache: {e}")
 
 if __name__ == "__main__":
     import uvicorn
