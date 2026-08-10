@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.15 – adds Cache-Control headers for /market/indices and always updates fetched_at.
+v2.5.16 – uses IST for fetched_at timestamp (hh:mm:ss AM/PM).
 """
 import os
 import json
@@ -12,6 +12,7 @@ import logging
 import difflib
 import uuid
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Optional, Set, Dict, Union
 
 import httpx
@@ -25,6 +26,9 @@ from upstash_redis import Redis
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api-gateway")
+
+# ---- IST timezone ----
+IST = ZoneInfo("Asia/Kolkata")
 
 # ---- Live Render URLs ----
 DECISION_URL = os.getenv("DECISION_URL", "https://decision-engine-service-0hg6.onrender.com")
@@ -54,7 +58,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.15")
+app = FastAPI(title="Stockky API Gateway", version="2.5.16")
 
 # --- CORS ---
 app.add_middleware(
@@ -663,8 +667,8 @@ def _wake_notification_service() -> bool:
 # ⚡ PARALLEL SCAN with reduced workers and retries
 # ============================================================================
 
-MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "10"))   # Reduced from 20
-MAX_RETRIES = 1                                                           # Reduced from 2
+MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "10"))
+MAX_RETRIES = 1
 RETRY_BACKOFF = 1.0
 
 async def _analyze_one_symbol_ultra(
@@ -679,13 +683,11 @@ async def _analyze_one_symbol_ultra(
     async with sem:
         for attempt in range(MAX_RETRIES + 1):
             try:
-                # === 1. Fetch decision engine (primary) ===
                 decision_resp = await client.get(f"{DECISION_URL}/decide/{symbol}", timeout=90)
                 decision_resp.raise_for_status()
                 raw = decision_resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
 
-                # === 2. Fetch price if missing ===
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
                     if price is not None:
@@ -695,7 +697,6 @@ async def _analyze_one_symbol_ultra(
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                # === 3. Parallel fetch fundamentals, events, news, prediction ===
                 fund_task = _fetch_fundamental_cached(symbol, client)
                 event_task = _fetch_events_cached(symbol, client)
                 news_task = _fetch_news_cached(symbol, client)
@@ -706,7 +707,6 @@ async def _analyze_one_symbol_ultra(
                 news_data = await news_task
                 pred_score, pred_note = await pred_task
 
-                # === 4. Merge results ===
                 if fund_metrics:
                     normalized["fundamental_metrics"] = fund_metrics
                     normalized["fundamental_fallback"] = fund_fallback
@@ -728,7 +728,6 @@ async def _analyze_one_symbol_ultra(
                     normalized["prediction_score"] = pred_score
                     normalized["prediction_note"] = pred_note
 
-                # === 5. Generate summary ===
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 return normalized
 
@@ -759,10 +758,6 @@ async def _analyze_one_symbol_ultra(
         return {"symbol": symbol, "decision": "ERROR", "error": "Max retries exceeded"}
 
 async def run_scan_parallel(task_id: str, universe: List[str]):
-    """
-    Parallel scan with internal parallelisation per symbol.
-    Overall timeout increased to 240s.
-    """
     start_time = time.time()
     total = len(universe)
     processed = 0
@@ -807,7 +802,6 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
                     "error": None,
                 }, ttl=3600)
 
-    # Sort and build result
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
 
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
@@ -911,7 +905,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.15",
+        "version": "2.5.16",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -934,7 +928,7 @@ def root():
             "/market/top-losers": "GET – top 10 losers",
             "/market/most-active": "GET – top 10 most active by volume",
             "/market/trending": "GET – trending stocks (momentum + news)",
-            "/market/indices": "GET – live NIFTY 50 & SENSEX (with Cache-Control headers)",
+            "/market/indices": "GET – live NIFTY 50 & SENSEX (IST time, Cache-Control)",
             "/notifications/health": "GET – notification service health",
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
@@ -1489,22 +1483,22 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
-# ── IMPROVED /market/indices with Cache-Control and always‑current fetched_at ──
+# ── IMPROVED /market/indices with IST time ──────────────────────────────
 @app.get("/market/indices")
 def get_market_indices(force_refresh: bool = False):
     """
     Fetch real-time NIFTY 50 and SENSEX index values with a moderated market score.
     - Uses mapping: -0.3 percentage points -> 0, 0% -> 50, +0.3 percentage points -> 100.
-    - ALWAYS returns fetched_at = current time on every request.
+    - Uses IST (Asia/Kolkata) for the fetched_at timestamp, formatted as hh:mm:ss AM/PM.
     - Adds Cache-Control headers to prevent browser caching.
-    - Stores last known values in Redis.
     """
-    current_time = datetime.now().isoformat()
+    now_ist = datetime.now(IST)
+    fetched_at_str = now_ist.strftime("%I:%M:%S %p")
 
     if not force_refresh:
         cached = _redis_get(INDICES_CACHE_KEY)
         if cached and isinstance(cached, dict):
-            cached["fetched_at"] = current_time
+            cached["fetched_at"] = fetched_at_str
             return JSONResponse(
                 content=cached,
                 headers={
@@ -1559,7 +1553,7 @@ def get_market_indices(force_refresh: bool = False):
             },
             "market_mood": mood,
             "market_score": round(market_score),
-            "fetched_at": current_time,
+            "fetched_at": fetched_at_str,
         }
         _redis_set(INDICES_CACHE_KEY, result, ttl=300)
         _redis_set(INDICES_LAST_KNOWN, result, ttl=86400)
@@ -1576,7 +1570,7 @@ def get_market_indices(force_refresh: bool = False):
         logger.error(f"Error fetching indices: {e}")
         last_known = _redis_get(INDICES_LAST_KNOWN)
         if last_known and isinstance(last_known, dict):
-            last_known["fetched_at"] = current_time
+            last_known["fetched_at"] = fetched_at_str
             last_known["stale"] = True
             _redis_set(INDICES_CACHE_KEY, last_known, ttl=60)
             return JSONResponse(
@@ -1593,7 +1587,7 @@ def get_market_indices(force_refresh: bool = False):
                 "sensex": {"price": 0, "change": 0, "change_pct": 0},
                 "market_mood": "NEUTRAL",
                 "market_score": 50,
-                "fetched_at": current_time,
+                "fetched_at": fetched_at_str,
                 "stale": True,
                 "fallback": True
             }

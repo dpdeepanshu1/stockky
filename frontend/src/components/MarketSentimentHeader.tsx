@@ -71,15 +71,8 @@ export default function MarketSentimentHeader() {
       ? "bg-signal-sell/20 text-signal-sell border-signal-sell/30"
       : "bg-signal-hold/20 text-signal-hold border-signal-hold/30";
 
-  // Format fetched_at to local time in 12‑hour format with AM/PM
-  const formattedTime = fetched_at
-    ? new Date(fetched_at).toLocaleTimeString('en-IN', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: true,
-      })
-    : "";
+  // `fetched_at` is already formatted in IST (e.g., "08:37:43 AM")
+  const formattedTime = fetched_at || "";
 
   return (
     <div className="bg-graphite border border-slate rounded-2xl p-6 shadow-lg">
