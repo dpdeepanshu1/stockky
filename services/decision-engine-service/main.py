@@ -1,9 +1,10 @@
-""" Decision Engine Service v0.6.0
+"""
+Decision Engine Service v0.7.0
 Changes:
-- Market Sentiment now acts as an independent adjustment factor (not weighted)
-- Positive sentiment (>60) adds bonus; negative sentiment (<40) subtracts
-- Added market_sentiment_adjustment to response
-- Records BUY/PREPARE predictions to Training Service for T+1/T+5 tracking
+- Market Sentiment score is now part of the weighted average (weight 0.10)
+- All missing scores default to 50 (neutral)
+- Market sentiment adjustment (bonus/penalty) still applied on top
+- Better fallback handling for missing data
 """
 import os
 import asyncio
@@ -24,13 +25,13 @@ FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-ser
 NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")
 EVENT_URL = os.getenv("EVENT_URL", "https://event-tracker-service-m1lw.onrender.com")
 PREDICTION_URL = os.getenv("PREDICTION_URL", "https://prediction-service-wowb.onrender.com")
-MARKET_SENTIMENT_URL = os.getenv("MARKET_SENTIMENT_URL", "http://market-sentiment-service:8009")
-TRAINING_SERVICE_URL = os.getenv("TRAINING_SERVICE_URL", "http://training-service:8010")
+MARKET_SENTIMENT_URL = os.getenv("MARKET_SENTIMENT_URL", "https://market-sentiment-service.onrender.com")
+TRAINING_SERVICE_URL = os.getenv("TRAINING_SERVICE_URL", "https://training-service-5e9v.onrender.com")
 
 EARNINGS_RISK_DAYS = 3
 EARNINGS_BOOST_DAYS = 7
 
-app = FastAPI(title="Stockky Decision Engine", version="0.6.0")
+app = FastAPI(title="Stockky Decision Engine", version="0.7.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -55,7 +56,7 @@ class Decision(str, Enum):
 
 @app.get("/")
 def root():
-    return {"service": "Stockky Decision Engine", "version": "0.6.0", "status": "running"}
+    return {"service": "Stockky Decision Engine", "version": "0.7.0", "status": "running"}
 
 
 @app.get("/health")
@@ -213,53 +214,62 @@ def _extract_event_signals(events: dict | None) -> dict:
 
 # ── Market Sentiment Adjustment ──────────────────────────────
 def _market_sentiment_adjustment(market_score: int) -> tuple:
+    """Return (adjustment_value, reason_string) based on market sentiment."""
     if market_score >= 70:
-        return (10, f"📈 Strong bullish market sentiment (+10)")
+        return (8, f"📈 Very strong bullish market sentiment (+8)")
     elif market_score >= 60:
-        bonus = int((market_score - 60) / 10 * 10)
+        bonus = int((market_score - 60) / 10 * 8)
         return (bonus, f"📈 Positive market sentiment (+{bonus})")
     elif market_score <= 30:
-        return (-10, f"📉 Strong bearish market sentiment (-10)")
+        return (-8, f"📉 Very strong bearish market sentiment (-8)")
     elif market_score <= 40:
-        penalty = int((40 - market_score) / 10 * 10)
+        penalty = int((40 - market_score) / 10 * 8)
         return (-penalty, f"📉 Negative market sentiment (-{penalty})")
     else:
         return (0, f"➖ Neutral market sentiment (no adjustment)")
 
 
-# ── Combined score ──────────────────────────────────────────────
+# ── Combined score (with market sentiment as a component) ──────────
 def _combined_score(
     technical_score: int,
     fundamental_score: int,
     news_score: int | None,
     prediction_score: int | None,
     training_score: int,
+    market_score: int,
     event_delta: int = 0,
     market_adjustment: int = 0,
 ) -> float:
-    if news_score is not None and prediction_score is not None:
-        weights = {"t": 0.35, "f": 0.25, "n": 0.14, "p": 0.20, "train": 0.06}
-    elif news_score is not None:
-        weights = {"t": 0.40, "f": 0.28, "n": 0.25, "p": 0.0, "train": 0.07}
-    elif prediction_score is not None:
-        weights = {"t": 0.38, "f": 0.26, "n": 0.0, "p": 0.30, "train": 0.06}
-    else:
-        weights = {"t": 0.50, "f": 0.38, "n": 0.0, "p": 0.0, "train": 0.12}
+    """
+    Weighted average of all available scores.
+    Missing scores default to 50.
+    Weights: technical 0.30, fundamental 0.20, news 0.15, prediction 0.15, market 0.10, training 0.10.
+    Then add event_delta and market_adjustment.
+    """
+    # Default missing values to 50
+    news = news_score if news_score is not None else 50
+    pred = prediction_score if prediction_score is not None else 50
+
+    weights = {
+        "t": 0.30,
+        "f": 0.20,
+        "n": 0.15,
+        "p": 0.15,
+        "m": 0.10,
+        "train": 0.10,
+    }
 
     total = (
         technical_score * weights["t"] +
         fundamental_score * weights["f"] +
-        (news_score or 0) * weights["n"] +
-        (prediction_score or 0) * weights["p"] +
+        news * weights["n"] +
+        pred * weights["p"] +
+        market_score * weights["m"] +
         training_score * weights["train"]
     )
 
-    if news_score is not None:
-        news_delta = (news_score - 50) / 50 * 10
-        total += news_delta
-
-    total += event_delta
-    total += market_adjustment
+    # Add event and market adjustments
+    total += event_delta + market_adjustment
 
     return round(max(0, min(100, total)), 1)
 
@@ -329,7 +339,6 @@ async def record_prediction_for_training(
 ):
     """
     Send immutable prediction snapshot to Training Service's /api/predictions endpoint.
-    This is the new endpoint that stores predictions for T+1/T+5 evaluation.
     """
     payload = {
         "symbol": symbol,
@@ -352,19 +361,19 @@ async def record_prediction_for_training(
         "holding_period": "2-6 weeks",
         "support": features.get("support"),
         "resistance": features.get("resistance"),
-        "sector": None,  # Not available here, can be added if needed
-        "valuation": "fair",  # placeholder
+        "sector": None,
+        "valuation": "fair",
         "market_mood": market_sentiment.get("classification", "NEUTRAL"),
         "nifty_change_pct": market_sentiment.get("nifty_change_pct"),
         "sensex_change_pct": market_sentiment.get("sensex_change_pct"),
-        "rsi": None,         # Not available directly, could be extracted from technical if present
+        "rsi": None,
         "macd": None,
         "ema": None,
         "volume_ratio": None,
         "debt_to_equity": fundamental_metrics.get("debt_to_equity") if fundamental_metrics else None,
         "roe": fundamental_metrics.get("roe") if fundamental_metrics else None,
         "roce": fundamental_metrics.get("roce") if fundamental_metrics else None,
-        "feature_snapshot": features,  # store all features as JSON
+        "feature_snapshot": features,
     }
 
     try:
@@ -452,6 +461,7 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         market_score = sentiment.get("market_score", 50)
         training_score = training.get("training_score", 50)
 
+        # Market adjustment (bonus/penalty) – applied on top of weighted average
         market_adjustment, market_adjustment_reason = _market_sentiment_adjustment(market_score)
 
         event_signals = _extract_event_signals(events)
@@ -468,12 +478,14 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         if close and resistance and resistance > 0:
             dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
 
+        # NEW: combined score includes market_score
         combined = _combined_score(
             technical_score,
             fundamental_score,
             news_score,
             prediction_score,
             training_score,
+            market_score,
             event_delta,
             market_adjustment,
         )
