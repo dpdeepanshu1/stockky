@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.9 – improved /market/indices to return last known values (never zeros).
+v2.5.10 – sensitive scoring for /market/indices, correct fetched_at.
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.9")
+app = FastAPI(title="Stockky API Gateway", version="2.5.10")
 
 # --- CORS ---
 app.add_middleware(
@@ -106,7 +106,7 @@ KNOWN_SYMBOLS_KEY   = "stockky:known_symbols"
 SCAN_TASK_PREFIX    = "stockky:scan_task:"
 MARKET_MOVERS_CACHE_PREFIX = "stockky:market_movers:"
 INDICES_CACHE_KEY   = "stockky:indices"
-INDICES_LAST_KNOWN  = "stockky:indices_last_known"  # NEW: stores last valid data
+INDICES_LAST_KNOWN  = "stockky:indices_last_known"
 
 FUNDAMENTAL_CACHE_PREFIX = "stockky:fundamental:"
 EVENT_CACHE_PREFIX = "stockky:event:"
@@ -911,7 +911,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.9",
+        "version": "2.5.10",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -934,7 +934,7 @@ def root():
             "/market/top-losers": "GET – top 10 losers",
             "/market/most-active": "GET – top 10 most active by volume",
             "/market/trending": "GET – trending stocks (momentum + news)",
-            "/market/indices": "GET – live NIFTY 50 & SENSEX points (cached, with last-known fallback)",
+            "/market/indices": "GET – live NIFTY 50 & SENSEX (sensitive score, fetched_at)",
             "/notifications/health": "GET – notification service health",
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
@@ -1489,23 +1489,20 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
-# ── IMPROVED /market/indices endpoint with last-known fallback ──────────
+# ── IMPROVED /market/indices with sensitive scoring and fetched_at ──────────
 @app.get("/market/indices")
 def get_market_indices(force_refresh: bool = False):
     """
-    Fetch real-time NIFTY 50 and SENSEX index values.
-    - If force_refresh=true, bypass cache and fetch fresh data.
-    - Returns last known values if fresh data fails (never returns zeros).
-    - Stores last known values in Redis for fallback.
+    Fetch real-time NIFTY 50 and SENSEX index values with a sensitive market score.
+    - Uses mapping: -0.2% -> 0, 0% -> 50, +0.2% -> 100.
+    - Returns fetched_at timestamp.
+    - Stores last known values in Redis.
     """
-    # If force_refresh is True, skip cache entirely
     if not force_refresh:
         cached = _redis_get(INDICES_CACHE_KEY)
         if cached and isinstance(cached, dict):
-            # Ensure fetched_at exists
             if "fetched_at" not in cached:
                 cached["fetched_at"] = cached.get("timestamp", datetime.now().isoformat())
-            logger.info("Serving cached indices data")
             return cached
 
     try:
@@ -1528,16 +1525,19 @@ def get_market_indices(force_refresh: bool = False):
         sensex_change = sensex_close - sensex_prev_close
         sensex_change_pct = (sensex_change / sensex_prev_close) * 100
 
-        avg_change_pct = (nifty_change_pct + sensex_change_pct) / 2
-        if avg_change_pct > 0.3:
+        # Sensitive score mapping: -0.2% -> 0, 0% -> 50, +0.2% -> 100
+        avg_change = (nifty_change_pct + sensex_change_pct) / 2
+        sensitivity = 0.002  # 0.2%
+        raw_score = 50 + (avg_change / sensitivity) * 50
+        market_score = max(0, min(100, raw_score))
+
+        # Mood based on score
+        if market_score >= 60:
             mood = "BULLISH"
-        elif avg_change_pct < -0.3:
+        elif market_score <= 40:
             mood = "BEARISH"
         else:
             mood = "NEUTRAL"
-
-        market_score = 50 + (avg_change_pct * 10)
-        market_score = max(0, min(100, market_score))
 
         fetched_at = datetime.now().isoformat()
         result = {
@@ -1555,22 +1555,17 @@ def get_market_indices(force_refresh: bool = False):
             "market_score": round(market_score),
             "fetched_at": fetched_at,
         }
-        # Cache and also store as last known
         _redis_set(INDICES_CACHE_KEY, result, ttl=300)
-        _redis_set(INDICES_LAST_KNOWN, result, ttl=86400)  # keep for 24h
+        _redis_set(INDICES_LAST_KNOWN, result, ttl=86400)
         return result
 
     except Exception as e:
         logger.error(f"Error fetching indices: {e}")
-        # Try to return last known values
         last_known = _redis_get(INDICES_LAST_KNOWN)
         if last_known and isinstance(last_known, dict):
-            logger.info("Returning last known indices data")
             last_known["stale"] = True
-            # Update fetched_at to show when it was last refreshed
             return last_known
 
-        # If no last known, return a neutral fallback with zeros (only once)
         fallback = {
             "nifty": {"price": 0, "change": 0, "change_pct": 0},
             "sensex": {"price": 0, "change": 0, "change_pct": 0},
@@ -1580,7 +1575,6 @@ def get_market_indices(force_refresh: bool = False):
             "stale": True,
             "fallback": True
         }
-        # Cache this fallback briefly
         _redis_set(INDICES_CACHE_KEY, fallback, ttl=60)
         _redis_set(INDICES_LAST_KNOWN, fallback, ttl=86400)
         return fallback
