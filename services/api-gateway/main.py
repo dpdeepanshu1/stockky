@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.7 – truncates long Telegram messages to 4096 chars, checks delivery status.
+v2.5.8 – splits long Telegram messages into multiple parts.
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.7")
+app = FastAPI(title="Stockky API Gateway", version="2.5.8")
 
 # --- CORS ---
 app.add_middleware(
@@ -910,7 +910,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.7",
+        "version": "2.5.8",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -938,7 +938,7 @@ def root():
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
             "/notifications/test": "POST – test notifications",
-            "/notifications/send-picks": "POST – manually send picks to Telegram",
+            "/notifications/send-picks": "POST – manually send picks to Telegram (splits long messages)",
             "/training/status": "GET – get training model status",
             "/training/train": "POST – trigger a new training run",
             "/training/score/{symbol}": "GET – get training intelligence score for a symbol",
@@ -1642,7 +1642,7 @@ def test_notification_channels():
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Notification service unreachable: {e}")
 
-# ----- UPDATED ENDPOINT: send-picks with truncation and delivery check -----
+# ----- UPDATED: send-picks with split for long messages -----
 @app.post("/notifications/send-picks")
 def send_picks_to_telegram(payload: dict):
     recs = payload.get("recommendations", [])
@@ -1659,8 +1659,8 @@ def send_picks_to_telegram(payload: dict):
         title = "📊 *All Actionable Stocks (BUY NOW / PREPARE TO BUY)*"
         picks = recs
 
-    lines = [title, ""]
-    for i, r in enumerate(picks, 1):
+    # Helper to format a single pick
+    def format_pick(r, index):
         symbol = r.get("symbol", "?")
         decision = r.get("decision", "UNKNOWN")
         score = r.get("combined_score", 0)
@@ -1671,8 +1671,8 @@ def send_picks_to_telegram(payload: dict):
         entry_low = entry.get("low")
         entry_high = entry.get("high")
         holding = r.get("holding_period", "N/A")
-
-        lines.append(f"{i}. *{symbol}* – {decision} (Score: {score})")
+        lines = []
+        lines.append(f"{index}. *{symbol}* – {decision} (Score: {score})")
         if close:
             lines.append(f"   Current: ₹{close:.2f}")
         if entry_low and entry_high:
@@ -1684,41 +1684,77 @@ def send_picks_to_telegram(payload: dict):
             lines.append(f"   Stop: ₹{stop:.2f}")
         if holding != "N/A":
             lines.append(f"   Hold: {holding}")
-        lines.append("")
+        return "\n".join(lines)
 
-    message = "\n".join(lines)
+    # If top5, just send one message (always short)
+    if msg_type == "top5":
+        lines = [title, ""]
+        for i, r in enumerate(picks, 1):
+            lines.append(format_pick(r, i))
+            lines.append("")
+        message = "\n".join(lines)
+        try:
+            resp = httpx.post(
+                f"{NOTIFICATION_URL}/notify",
+                json={"title": "Market Scan Picks", "message": message, "channel": "telegram"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("delivered"):
+                return {"success": True, "sent": len(picks), "message": "Notification sent"}
+            else:
+                error_note = data.get("note", "Delivery failed")
+                raise HTTPException(status_code=502, detail=f"Notification service failed to deliver: {error_note}")
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Notification service failed: {e}")
 
-    # Telegram has a 4096 character limit (including Markdown markers)
-    # We'll truncate to 4000 to be safe and add a truncation notice.
-    MAX_LEN = 4000
-    if len(message) > MAX_LEN:
-        # Try to cut at the last newline before the limit
-        truncated = message[:MAX_LEN]
-        last_newline = truncated.rfind("\n")
-        if last_newline > 0:
-            truncated = truncated[:last_newline]
+    # For all actionable: chunk picks into multiple messages if needed
+    pick_strings = []
+    for i, r in enumerate(picks, 1):
+        pick_strings.append(format_pick(r, i))
+
+    base_header = title + "\n\n"
+    MAX_CHARS = 4000  # safe limit under Telegram's 4096
+    chunks = []
+    current_chunk = []
+    current_len = len(base_header)
+    for pick_str in pick_strings:
+        pick_len = len(pick_str) + 1  # +1 for trailing newline
+        if current_len + pick_len + 10 > MAX_CHARS:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_len = len(base_header)
+        current_chunk.append(pick_str)
+        current_len += pick_len + 1
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    total_chunks = len(chunks)
+    sent_count = 0
+    for idx, chunk in enumerate(chunks, 1):
+        if total_chunks > 1:
+            header = f"{title} (Part {idx}/{total_chunks})\n\n"
         else:
-            # If no newline, just cut at the limit
-            truncated = truncated
-        message = truncated + "\n\n... (truncated — too many stocks to list fully)"
+            header = f"{title}\n\n"
+        message = header + "\n".join(chunk) + "\n"
+        try:
+            resp = httpx.post(
+                f"{NOTIFICATION_URL}/notify",
+                json={"title": "Market Scan Picks", "message": message, "channel": "telegram"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("delivered"):
+                sent_count += 1
+            else:
+                error_note = data.get("note", "Delivery failed")
+                raise HTTPException(status_code=502, detail=f"Part {idx} failed: {error_note}")
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Notification service failed for part {idx}: {e}")
 
-    try:
-        resp = httpx.post(
-            f"{NOTIFICATION_URL}/notify",
-            json={"title": "Market Scan Picks", "message": message, "channel": "telegram"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        # Check if the notification service actually delivered
-        if data.get("delivered"):
-            return {"success": True, "sent": len(picks), "message": "Notification sent"}
-        else:
-            # Service returned delivered=False
-            error_note = data.get("note", "Delivery failed")
-            raise HTTPException(status_code=502, detail=f"Notification service failed to deliver: {error_note}")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Notification service failed: {e}")
+    return {"success": True, "sent": len(picks), "parts": total_chunks, "message": f"Notification sent in {total_chunks} parts"}
 
 # ============================================================================
 # Training Service Proxy Routes
