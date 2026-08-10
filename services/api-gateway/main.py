@@ -2,11 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.1 – tuned for free‑tier Render performance:
-- Parallel workers: 20 (reduced from 30 to avoid timeouts)
-- Increased timeouts (60s per call, 180s total)
-- Added caching for /market/indices
-- Robust retry with exponential backoff
+v2.5.2 – fixed health check to include 'ready' flag and added /ready endpoint.
 """
 import os
 import json
@@ -58,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.1")
+app = FastAPI(title="Stockky API Gateway", version="2.5.2")
 
 # --- CORS ---
 app.add_middleware(
@@ -667,7 +663,7 @@ def _wake_notification_service() -> bool:
 # ⚡ ULTRA-FAST PARALLEL SCAN with internal parallelism and caching
 # ============================================================================
 
-MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "20"))  # reduced from 30
+MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "20"))
 MAX_RETRIES = 2
 RETRY_BACKOFF = 1.5
 
@@ -915,11 +911,12 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.1",
+        "version": "2.5.2",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
             "/health": "GET – health check",
+            "/ready": "GET – lightweight readiness check",
             "/system/health": "GET – health of all downstream services",
             "/wake/all": "POST – wake all services",
             "/watchlist": "GET/POST – manage watchlist",
@@ -952,42 +949,37 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "api-gateway", "redis": bool(_redis)}
+    # Always return instantly – no blocking operations
+    return {
+        "status": "ok",
+        "service": "api-gateway",
+        "redis": bool(_redis),
+        "ready": True   # frontend expects this
+    }
+
+@app.get("/ready")
+def ready():
+    return {"ready": bool(_redis)}
 
 @app.get("/system/health")
 async def system_health():
+    # Reduce timeout to 10 seconds per service to avoid hanging
     async def check(name: str, url: str, required: bool):
         if not url:
             return name, {"ok": False, "required": required, "status": "not_configured", "url": None}
-        start = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=70) as client:
+            async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(f"{url.rstrip('/')}/health")
-            elapsed = round(time.monotonic() - start, 1)
             if resp.status_code == 200:
-                return name, {"ok": True, "required": required, "status": "up", "seconds": elapsed, "url": url}
-            return name, {
-                "ok": False,
-                "required": required,
-                "status": f"http_{resp.status_code}",
-                "seconds": elapsed,
-                "url": url,
-            }
-        except httpx.HTTPError as e:
-            elapsed = round(time.monotonic() - start, 1)
-            return name, {
-                "ok": False,
-                "required": required,
-                "status": "unreachable",
-                "seconds": elapsed,
-                "error": str(e)[:200],
-                "url": url,
-            }
+                return name, {"ok": True, "required": required, "status": "up", "url": url}
+            return name, {"ok": False, "required": required, "status": f"http_{resp.status_code}", "url": url}
+        except Exception as e:
+            return name, {"ok": False, "required": required, "status": "unreachable", "error": str(e)[:100], "url": url}
 
     results = await asyncio.gather(
         *(check(name, cfg["url"], cfg["required"]) for name, cfg in SYSTEM_SERVICES.items())
     )
-    services = {"api-gateway": {"ok": True, "required": True, "status": "up", "seconds": 0, "url": None}}
+    services = {"api-gateway": {"ok": True, "required": True, "status": "up", "url": None}}
     services.update(dict(results))
     required_ok = all(v["ok"] for v in services.values() if v["required"])
     all_ok = all(v["ok"] for v in services.values())
@@ -1093,10 +1085,7 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                 if result.get("resistance") is None:
                     result["resistance"] = round(price * 1.05, 2)
 
-        # Use synchronous fallbacks (calls async? We keep sync for simplicity)
-        # We'll call the async versions but we're in sync context – keep old approach.
-        # This route is not part of the parallel scan, so it's fine to keep sync.
-        _merge_fundamentals(result, symbol_to_use)  # this is sync
+        _merge_fundamentals(result, symbol_to_use)
 
         if result.get("news_score") is None:
             news = _fetch_news(symbol_to_use)
