@@ -294,15 +294,15 @@ class ModelRegistry:
             session.close()
 
 
-# ---------- Migration helper (fixes missing columns) ----------
+# ---------- Migration helper (fixes missing columns and types) ----------
 def ensure_schema(engine):
-    """Add missing columns to existing tables if needed."""
+    """Add missing columns and fix column types if needed."""
     inspector = inspect(engine)
 
     # ---- prediction_snapshots ----
     table_name = "prediction_snapshots"
     if inspector.has_table(table_name):
-        existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
+        existing_columns = {col['name']: col['type'] for col in inspector.get_columns(table_name)}
         # Complete list of all columns defined in PredictionSnapshot (except 'id')
         required_columns = {
             # Basic fields
@@ -353,13 +353,29 @@ def ensure_schema(engine):
             't5_success': 'INTEGER',
             'overall_success': 'INTEGER',
         }
+
         with engine.connect() as conn:
+            # 1. Add missing columns
             for col_name, col_type in required_columns.items():
                 if col_name not in existing_columns:
                     alter_sql = f'ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}'
                     conn.execute(text(alter_sql))
                     conn.commit()
                     print(f"Added column {col_name} to {table_name}")
+
+            # 2. Fix column types for known mismatches
+            # Confidence should be VARCHAR, not NUMERIC/DOUBLE
+            if 'confidence' in existing_columns:
+                col_type = existing_columns['confidence']
+                # Check if it's a numeric type (e.g., DOUBLE PRECISION, NUMERIC, FLOAT)
+                if 'double' in str(col_type).lower() or 'numeric' in str(col_type).lower() or 'float' in str(col_type).lower():
+                    alter_sql = f'ALTER TABLE {table_name} ALTER COLUMN confidence TYPE VARCHAR(20) USING confidence::text'
+                    conn.execute(text(alter_sql))
+                    conn.commit()
+                    print("Fixed confidence column type to VARCHAR(20)")
+
+            # Similarly, you can add checks for decision, market_mood, macd, ema if needed
+            # but they are likely already correct.
 
     # ---- training_runs ----
     table_name = "training_runs"
