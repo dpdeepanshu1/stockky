@@ -227,13 +227,17 @@ export default function Training() {
   // ---------- Render helpers ----------
   const formatDate = (dateStr: string | null | undefined) => {
     if (!dateStr) return "Never";
-    return new Date(dateStr).toLocaleString("en-IN", {
+    const dt = new Date(dateStr);
+    // Force IST display
+    const formatter = new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata",
       day: "2-digit",
       month: "short",
       year: "numeric",
       hour: "2-digit",
       minute: "2-digit",
     });
+    return formatter.format(dt);
   };
 
   const formatTime = (seconds: number) => {
