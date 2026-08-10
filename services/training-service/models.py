@@ -14,9 +14,28 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+import numpy as np
 
 # ---------- Base ----------
 Base = declarative_base()
+
+
+# ---------- Numpy conversion helper ----------
+def convert_numpy(obj):
+    """Recursively convert numpy types to Python native types."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: convert_numpy(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [convert_numpy(v) for v in obj]
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    return obj
 
 
 # ---------- Models ----------
@@ -222,6 +241,10 @@ class ModelRegistry:
             joblib.dump(scaler, scaler_buf)
             scaler_bytes = scaler_buf.getvalue()
 
+        # 🔥 Convert numpy types to Python native for JSON serialization
+        config_sanitized = convert_numpy(config)
+        metrics_sanitized = convert_numpy(metrics)
+
         session = self._session_factory()
         try:
             version = self._next_version(session)
@@ -231,8 +254,8 @@ class ModelRegistry:
                 model_blob=model_bytes,
                 scaler_blob=scaler_bytes,
                 feature_columns=feature_columns,
-                config=config,
-                metrics=metrics,
+                config=config_sanitized,
+                metrics=metrics_sanitized,
                 created_at=datetime.utcnow(),
                 promoted_at=datetime.utcnow() if status == "production" else None,
             )
