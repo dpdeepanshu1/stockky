@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.13 – updates fetched_at when returning stale cache.
+v2.5.14 – always updates fetched_at to current time on every request.
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.13")
+app = FastAPI(title="Stockky API Gateway", version="2.5.14")
 
 # --- CORS ---
 app.add_middleware(
@@ -911,7 +911,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.13",
+        "version": "2.5.14",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -934,7 +934,7 @@ def root():
             "/market/top-losers": "GET – top 10 losers",
             "/market/most-active": "GET – top 10 most active by volume",
             "/market/trending": "GET – trending stocks (momentum + news)",
-            "/market/indices": "GET – live NIFTY 50 & SENSEX (moderated score, fetched_at)",
+            "/market/indices": "GET – live NIFTY 50 & SENSEX (fetched_at always current)",
             "/notifications/health": "GET – notification service health",
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
@@ -1489,20 +1489,24 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
-# ── CORRECTED /market/indices with updated fetched_at on stale ──────────
+# ── CORRECTED /market/indices with always‑current fetched_at ──────────
 @app.get("/market/indices")
 def get_market_indices(force_refresh: bool = False):
     """
     Fetch real-time NIFTY 50 and SENSEX index values with a moderated market score.
     - Uses mapping: -0.3 percentage points -> 0, 0% -> 50, +0.3 percentage points -> 100.
-    - Always returns fetched_at (current time when fresh or stale).
+    - ALWAYS returns fetched_at = current time on every request.
+    - Stores last known values in Redis.
     """
+    # Always set fetched_at to the current time on every response
+    current_time = datetime.now().isoformat()
+
     if not force_refresh:
         cached = _redis_get(INDICES_CACHE_KEY)
         if cached and isinstance(cached, dict):
-            if "fetched_at" not in cached:
-                cached["fetched_at"] = cached.get("timestamp", datetime.now().isoformat())
-            # Ensure stale flag is preserved
+            # Update fetched_at to current time before returning
+            cached["fetched_at"] = current_time
+            # Preserve stale flag if present
             return cached
 
     try:
@@ -1538,7 +1542,6 @@ def get_market_indices(force_refresh: bool = False):
         else:
             mood = "NEUTRAL"
 
-        fetched_at = datetime.now().isoformat()
         result = {
             "nifty": {
                 "price": round(nifty_close, 2),
@@ -1552,7 +1555,7 @@ def get_market_indices(force_refresh: bool = False):
             },
             "market_mood": mood,
             "market_score": round(market_score),
-            "fetched_at": fetched_at,
+            "fetched_at": current_time,  # always current
         }
         _redis_set(INDICES_CACHE_KEY, result, ttl=300)
         _redis_set(INDICES_LAST_KNOWN, result, ttl=86400)
@@ -1562,10 +1565,9 @@ def get_market_indices(force_refresh: bool = False):
         logger.error(f"Error fetching indices: {e}")
         last_known = _redis_get(INDICES_LAST_KNOWN)
         if last_known and isinstance(last_known, dict):
-            # Update fetched_at to current time so frontend shows latest attempt time
-            last_known["fetched_at"] = datetime.now().isoformat()
+            # Update timestamp and mark as stale
+            last_known["fetched_at"] = current_time
             last_known["stale"] = True
-            # Also update the cache so subsequent requests get the updated timestamp
             _redis_set(INDICES_CACHE_KEY, last_known, ttl=60)  # short TTL to retry soon
             return last_known
         else:
@@ -1574,7 +1576,7 @@ def get_market_indices(force_refresh: bool = False):
                 "sensex": {"price": 0, "change": 0, "change_pct": 0},
                 "market_mood": "NEUTRAL",
                 "market_score": 50,
-                "fetched_at": datetime.now().isoformat(),
+                "fetched_at": current_time,
                 "stale": True,
                 "fallback": True
             }
@@ -1824,7 +1826,6 @@ async def training_other_proxy(path: str, request: Request):
 @app.on_event("startup")
 async def startup_event():
     try:
-        # Clear old cache to force fresh data with corrected sensitivity
         _redis.delete(INDICES_CACHE_KEY)
         logger.info("Cleared old indices cache on startup")
         result = get_market_indices(force_refresh=True)
