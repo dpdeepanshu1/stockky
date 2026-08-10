@@ -193,7 +193,6 @@ def format_stock_picks(picks: List[Dict]) -> str:
 def store_daily_picks(date_str: str, picks: List[Dict]):
     """Store the day's top picks in Redis for the summary."""
     key = DAILY_PICKS_KEY + date_str
-    # We'll keep a list of picks (append new ones) but cap at 20 to avoid bloat.
     existing = _redis.get(key)
     if existing:
         try:
@@ -203,12 +202,10 @@ def store_daily_picks(date_str: str, picks: List[Dict]):
     else:
         existing_picks = []
 
-    # Merge: if a symbol already exists, update it; else append
     symbols = {p["symbol"]: p for p in existing_picks}
     for p in picks:
         symbols[p["symbol"]] = p
     new_list = list(symbols.values())
-    # Sort by score descending, keep top 20
     new_list.sort(key=lambda x: x.get("combined_score", 0), reverse=True)
     if len(new_list) > 20:
         new_list = new_list[:20]
@@ -227,12 +224,10 @@ def get_daily_picks(date_str: str) -> List[Dict]:
 
 
 def send_market_open_announcement():
-    """Send 'Market opens in 1 hour' message (08:15)."""
     _notify("\U0001F55B Market opens in 1 hour", "The market will open at 09:15 IST. Get ready!")
 
 
 def send_market_open_now():
-    """Send 'Market is open now' message (09:15)."""
     _notify("\U0001F7E2 Market is now open", "Trading has started. Let's find opportunities!")
 
 
@@ -250,7 +245,6 @@ def send_scan_picks(picks: List[Dict]):
 
 
 def send_close_summary(date_str: str):
-    """Send end-of-day summary: best picks of the day."""
     picks = get_daily_picks(date_str)
     if not picks:
         _notify("\U0001F4CA End of Day – No picks today", "No strong buy opportunities were found today.")
@@ -272,7 +266,6 @@ def send_close_summary(date_str: str):
 
 
 def send_sleep_message():
-    """Send 'Going to sleep' message with preview for tomorrow."""
     _notify("\U0001F634 Going to sleep", "Good night! I'll be back tomorrow before market open. Preview for tomorrow: Keep an eye on global cues and any after-market news.")
 
 
@@ -289,7 +282,7 @@ def should_skip_scan() -> bool:
 
         last_scan_time = datetime.fromisoformat(last_scan_str)
         now = datetime.now(IST)
-        # If the last scan was within SCAN_INTERVAL_MINUTES (default 30) minutes, skip.
+        # If the last scan was within SCAN_INTERVAL_MINUTES, skip.
         if (now - last_scan_time) < timedelta(minutes=SCAN_INTERVAL_MINUTES):
             logger.info("Scheduler service already ran a scan at %s (within %d min) – skipping GitHub scan.",
                         last_scan_time.strftime("%H:%M"), SCAN_INTERVAL_MINUTES)
@@ -316,50 +309,44 @@ def main():
     # 2. Sync event subscriptions (always do this)
     sync_event_subscriptions()
 
-    # 3. Timed notifications (market open, close, sleep) – these are independent and de‑duplicated
-    # Open announcement (08:15)
+    # 3. Timed notifications (market open, close, sleep) – independent and de‑duplicated
     if time_now == OPEN_ANNOUNCE_TIME:
         if not _redis.get(OPEN_MSG_KEY + today_str):
             send_market_open_announcement()
             _redis.set(OPEN_MSG_KEY + today_str, "1", ex=86400)
 
-    # Market open (09:15)
     if time_now == MARKET_OPEN:
         if not _redis.get(OPEN_NOW_KEY + today_str):
             send_market_open_now()
             _redis.set(OPEN_NOW_KEY + today_str, "1", ex=86400)
 
-    # 4. Regular scans: run only if we are at a 0 or 30 minute mark and within scan window,
-    # AND the scheduler service hasn't already scanned this slot.
-    if (time_now.minute in (0, 30)) and (SCAN_START <= time_now <= SCAN_END):
-        if should_skip_scan():
-            # Scheduler already did the work – we skip scan and all associated notifications.
-            logger.info("Skipping GitHub scan because scheduler service handled it.")
-        else:
-            logger.info("Running scheduled scan (fallback) at %s", time_now.strftime("%H:%M"))
-            scan_result = run_scan_and_diff()
-            picks = scan_result.get("recommendations", [])  # top 5 picks from scan
-            if picks:
-                store_daily_picks(today_str, picks)
-                send_scan_picks(picks)
-            else:
-                # Send "no buy" message with timestamp
-                send_scan_picks([])
-
-            # Also check events (maybe we want this only when scanning)
-            run_event_check()
-
-    # Market close summary (15:30)
     if time_now == CLOSE_SUMMARY_TIME:
         if not _redis.get(CLOSE_MSG_KEY + today_str):
             send_close_summary(today_str)
             _redis.set(CLOSE_MSG_KEY + today_str, "1", ex=86400)
 
-    # Sleep message (16:30)
     if time_now == SLEEP_TIME:
         if not _redis.get(SLEEP_MSG_KEY + today_str):
             send_sleep_message()
             _redis.set(SLEEP_MSG_KEY + today_str, "1", ex=86400)
+
+    # 4. Regular scans: run if within scan window and the scheduler hasn't scanned recently.
+    # No minute restriction – fallback runs whenever the GitHub Action is triggered.
+    if SCAN_START <= time_now <= SCAN_END:
+        if should_skip_scan():
+            logger.info("Skipping GitHub scan because scheduler service handled it.")
+        else:
+            logger.info("Running scan (fallback) at %s", time_now.strftime("%H:%M"))
+            scan_result = run_scan_and_diff()
+            picks = scan_result.get("recommendations", [])
+            if picks:
+                store_daily_picks(today_str, picks)
+                send_scan_picks(picks)
+            else:
+                send_scan_picks([])   # sends "no buy" with timestamp
+
+            # Also check events
+            run_event_check()
 
     logger.info("Scheduler tick completed.")
 
