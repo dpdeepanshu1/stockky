@@ -12,7 +12,7 @@ export default function Training() {
   const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
   const [isStopping, setIsStopping] = useState(false);
 
-  // NEW: prediction history and insights
+  // Prediction history and insights
   const [predictions, setPredictions] = useState<any[]>([]);
   const [insights, setInsights] = useState<any[]>([]);
   const [summaryMetrics, setSummaryMetrics] = useState<any>(null);
@@ -21,7 +21,6 @@ export default function Training() {
 
   const timerIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
   const ESTIMATED_TOTAL_SECONDS = 300;
 
   // ---------- API calls ----------
@@ -31,15 +30,7 @@ export default function Training() {
       const data = await api.getTrainingStatus();
       setStatus(data);
 
-      // training_in_progress flipping to false is the actual completion
-      // signal (it tracks the backend's lock file). Whether that
-      // completion was a success is a separate question, answered by
-      // whether a production model now exists. The previous version
-      // checked these as two independent branches, so a training run
-      // that finished successfully but happened to poll on a tick where
-      // training_in_progress was already false and production_model_exists
-      // hadn't been read fell through to the failure branch and showed
-      // "stopped or interrupted" for a run that actually succeeded.
+      // If training is active in the UI and backend says it's not running anymore
       if (training && data.training_in_progress === false) {
         const succeeded = Boolean(data.production_model_exists && data.last_training);
         stopTraining(succeeded);
@@ -54,7 +45,6 @@ export default function Training() {
   const fetchPredictionHistory = async () => {
     setLoadingHistory(true);
     try {
-      // We'll fetch via the API gateway, which routes to /api/predictions/history
       const response = await fetch(
         `${import.meta.env.VITE_API_URL}/training/api/predictions/history?limit=20`,
         { headers: { "Content-Type": "application/json" } }
@@ -105,11 +95,6 @@ export default function Training() {
 
   const clearLock = async () => {
     try {
-      // Goes through the gateway's /training proxy, same as fetchPredictionHistory
-      // / fetchInsights / fetchSummaryMetrics above. Calling training-service's
-      // own SERVICE_URL directly doesn't work: locally it's the Docker-internal
-      // hostname http://training-service:5001, unreachable from the browser;
-      // in production it's a same-origin-policy cross-origin call.
       const response = await fetch(
         `${import.meta.env.VITE_API_URL}/training/lock`,
         { method: "DELETE" }
@@ -174,7 +159,10 @@ export default function Training() {
       showToast("success", "✅ Training completed successfully! Model is deployed.");
       fetchStatus();
     } else {
-      showToast("error", "❌ Training stopped or interrupted.");
+      // Only show error if we were actually training and it failed
+      if (training) {
+        showToast("error", "❌ Training stopped or interrupted.");
+      }
     }
   };
 
@@ -214,10 +202,13 @@ export default function Training() {
       return;
     }
     setIsStopping(true);
+
+    // Try to clear the lock, but even if it fails, we stop the UI
     const cleared = await clearLock();
-    if (cleared) {
-      stopTraining(false);
-      showToast("info", "Training stopped. Lock cleared.");
+    // Always stop the UI regardless of lock status
+    stopTraining(false);
+    if (!cleared) {
+      showToast("info", "Lock may already be cleared. Training stopped in UI.");
     }
     setIsStopping(false);
   };
@@ -302,7 +293,6 @@ export default function Training() {
     );
   };
 
-  // Render prediction history table
   const renderPredictionHistory = () => {
     if (loadingHistory) return <Spinner />;
     if (!predictions.length) return <p className="text-mist/40 text-sm">No predictions recorded yet.</p>;
@@ -353,7 +343,6 @@ export default function Training() {
     );
   };
 
-  // Render insights
   const renderInsights = () => {
     if (loadingInsights) return <Spinner />;
     if (!insights.length) return <p className="text-mist/40 text-sm">No insights available yet.</p>;
@@ -558,7 +547,7 @@ export default function Training() {
             </div>
           )}
 
-          {/* ----- NEW: Prediction History ----- */}
+          {/* Prediction History */}
           <div className="bg-graphite border border-slate/60 rounded-xl p-5">
             <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
               📋 Prediction History (T+1 / T+5 tracking)
@@ -566,7 +555,7 @@ export default function Training() {
             {renderPredictionHistory()}
           </div>
 
-          {/* ----- NEW: Summary Metrics (from training runs) ----- */}
+          {/* Summary Metrics */}
           {summaryMetrics && (
             <div className="bg-graphite border border-slate/60 rounded-xl p-5">
               <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
@@ -581,7 +570,7 @@ export default function Training() {
             </div>
           )}
 
-          {/* ----- NEW: Learning Insights ----- */}
+          {/* Learning Insights */}
           <div className="bg-graphite border border-slate/60 rounded-xl p-5">
             <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
               💡 Learning Insights
