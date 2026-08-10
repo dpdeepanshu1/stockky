@@ -4,34 +4,73 @@ Technical Analysis Service
 Single responsibility: compute technical indicators (score, trend,
 support/resistance) for a given NSE symbol.
 
-Data source: fetches OHLCV candles from the Market Data Service (which
-handles yfinance, caching, and the _tz bypass). Never calls yfinance
-directly — avoids rate limits and duplicate network calls.
-
-All indicators computed with pure pandas — no external TA library needed.
+Data source: fetches OHLCV candles from the Market Data Service.
+All results are cached with TTL that respects market hours:
+- During NSE trading hours: TTL = 300 seconds (5 min)
+- Outside: TTL = 21600 seconds (6 hours)
 """
 import os
 import logging
 import math
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+try:
+    from upstash_redis import Redis
+except ImportError:
+    Redis = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("technical-analysis-service")
 
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-app = FastAPI(title="Stockky Technical Analysis Service", version="0.2.1")
+app = FastAPI(title="Stockky Technical Analysis Service", version="0.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ── Redis cache ────────────────────────────────────────────────────────────────
+try:
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        cache = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+        cache.ping()
+        logger.info("Connected to Upstash Redis")
+    else:
+        raise ValueError("Upstash credentials not set")
+except Exception as e:
+    logger.warning("Redis unavailable (%s). Running without cache.", e)
+    cache = None
+
+def is_market_open() -> bool:
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    if now.weekday() >= 5:
+        return False
+    return dtime(9, 15) <= now.time() <= dtime(15, 30)
+
+def get_cache_ttl() -> int:
+    return 300 if is_market_open() else 21600
+
+def _cache_get(key: str):
+    if not cache:
+        return None
+    val = cache.get(key)
+    return json.loads(val) if val else None
+
+def _cache_set(key: str, value: dict, ttl: int = None):
+    if not cache:
+        return
+    if ttl is None:
+        ttl = get_cache_ttl()
+    cache.setex(key, ttl, json.dumps(value, default=str))
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper().replace(".NS", "").replace(".BO", "")
-
 
 def _safe(val, decimals=2):
     try:
@@ -40,9 +79,7 @@ def _safe(val, decimals=2):
     except (TypeError, ValueError):
         return None
 
-
 def _fetch_quote_price(symbol: str) -> float | None:
-    """Fetch current price from market-data service quote endpoint."""
     try:
         resp = httpx.get(f"{MARKET_DATA_URL}/quote/{symbol}", timeout=10)
         if resp.status_code == 200:
@@ -52,9 +89,7 @@ def _fetch_quote_price(symbol: str) -> float | None:
         pass
     return None
 
-
 def _fetch_history(symbol: str):
-    """Fetch OHLCV candles from market-data-service. Returns DataFrame or None if insufficient data."""
     try:
         resp = httpx.get(
             f"{MARKET_DATA_URL}/history/{symbol}",
@@ -73,21 +108,15 @@ def _fetch_history(symbol: str):
     df = pd.DataFrame(candles)
     df["date"] = pd.to_datetime(df["date"])
     df.set_index("date", inplace=True)
-
-    # Rename columns to standard Title case
     rename = {}
     for col in df.columns:
         rename[col] = col.capitalize()
     df.rename(columns=rename, inplace=True)
-
-    # Ensure numeric
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df.dropna(subset=["Close"], inplace=True)
     return df
-
 
 # ── Indicator calculations ─────────────────────────────────────────────────────
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -97,10 +126,8 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     rs = gain / loss.replace(0, float("nan"))
     return 100 - (100 / (1 + rs))
 
-
 def _ema(close: pd.Series, span: int) -> pd.Series:
     return close.ewm(span=span, adjust=False).mean()
-
 
 def _macd(close: pd.Series):
     exp12 = _ema(close, 12)
@@ -109,25 +136,21 @@ def _macd(close: pd.Series):
     signal = _ema(macd_line, 9)
     return macd_line, signal
 
-
 def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
         (low - close.shift()).abs(),
     ], axis=1).max(axis=1)
-
     dm_pos = high.diff()
     dm_neg = -low.diff()
     dm_pos = dm_pos.where((dm_pos > dm_neg) & (dm_pos > 0), 0.0)
     dm_neg = dm_neg.where((dm_neg > dm_pos) & (dm_neg > 0), 0.0)
-
     atr   = tr.rolling(period).mean()
     di_pos = 100 * dm_pos.rolling(period).mean() / atr.replace(0, float("nan"))
     di_neg = 100 * dm_neg.rolling(period).mean() / atr.replace(0, float("nan"))
     dx = 100 * (di_pos - di_neg).abs() / (di_pos + di_neg).replace(0, float("nan"))
     return dx.rolling(period).mean()
-
 
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
     tr = pd.concat([
@@ -137,42 +160,39 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-
 def _bollinger(close: pd.Series, period: int = 20):
     mid  = close.rolling(period).mean()
     std  = close.rolling(period).std()
     return mid + 2 * std, mid - 2 * std
 
-
 def _support_resistance(df: pd.DataFrame, window: int = 20):
     recent = df.tail(window)
     return float(recent["Low"].min()), float(recent["High"].max())
 
-
-# ── Main route ─────────────────────────────────────────────────────────────────
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "technical-analysis-service"}
 
-
 @app.get("/")
 def root():
-    return {"service": "technical-analysis-service", "version": "0.2.1", "status": "ok",
+    return {"service": "technical-analysis-service", "version": "0.3.0", "status": "ok",
             "endpoints": ["/health", "/analyze/{symbol}"]}
-
 
 @app.get("/analyze/{symbol}")
 def analyze(symbol: str):
     sym = normalize_symbol(symbol)
+    cache_key = f"tech_analysis:{sym}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
     df = _fetch_history(sym)
 
-    # ── Handle insufficient data (newly listed stocks) ──
     if df is None or len(df) < 5:
-        # Try to get current price from quote endpoint
         price = _fetch_quote_price(sym)
         if price:
-            # Even with only price, we can still return something
-            return {
+            result = {
                 "symbol": sym,
                 "technical_score": 50,
                 "trend_strength": "unknown",
@@ -183,12 +203,11 @@ def analyze(symbol: str):
                 "data_insufficient": True,
                 "reasons": [
                     f"Insufficient price history for {sym} (newly listed stock). "
-                    f"Current price: ₹{price:.2f}. Please check back in 2-3 days for full analysis."
+                    f"Current price: ₹{price:.2f}. Please check back in 2-3 days."
                 ],
             }
         else:
-            # No price even from quote
-            return {
+            result = {
                 "symbol": sym,
                 "technical_score": 50,
                 "trend_strength": "unknown",
@@ -199,19 +218,18 @@ def analyze(symbol: str):
                 "data_insufficient": True,
                 "reasons": [
                     f"Insufficient price data for {sym} (newly listed stock). "
-                    "Please check back in 2-3 days after Yahoo Finance updates its database."
+                    "Please check back in 2-3 days."
                 ],
             }
-    # ──────────────────────────────────────────────────────
+        _cache_set(cache_key, result)
+        return result
 
     close  = df["Close"]
     high   = df["High"]
     low    = df["Low"]
     volume = df["Volume"]
-
-    # ── Compute indicators ─────────────────────────────────────────────────────
-    # Only compute if we have enough data; else use defaults
     data_length = len(df)
+
     rsi_series = _rsi(close) if data_length >= 14 else pd.Series([50]*data_length, index=df.index)
     macd_line, macd_sig = _macd(close) if data_length >= 26 else (pd.Series([0]*data_length, index=df.index), pd.Series([0]*data_length, index=df.index))
     ema20 = _ema(close, min(20, data_length)) if data_length >= 5 else close
@@ -240,132 +258,125 @@ def analyze(symbol: str):
     vol_now    = float(latest["Volume"])
     vol_avg20  = float(volume.tail(min(20, len(volume))).mean()) if len(volume) >= 5 else vol_now
 
-    # ── Score (baseline 50) ────────────────────────────────────────────────────
     score   = 50
     reasons = []
 
-    # RSI
     if rsi_val < 30:
         score += 12
-        reasons.append(f"RSI at {rsi_val:.1f} — oversold, potential reversal zone")
+        reasons.append(f"RSI at {rsi_val:.1f} — oversold")
     elif rsi_val > 70:
         score -= 12
-        reasons.append(f"RSI at {rsi_val:.1f} — overbought, momentum may be exhausted")
+        reasons.append(f"RSI at {rsi_val:.1f} — overbought")
     else:
-        reasons.append(f"RSI at {rsi_val:.1f} — neutral momentum")
+        reasons.append(f"RSI at {rsi_val:.1f} — neutral")
 
-    # MACD (only if we had enough data)
     if data_length >= 26:
         bullish_cross = prev_macd < prev_sig and macd_val > macd_s_val
         bearish_cross = prev_macd > prev_sig and macd_val < macd_s_val
         if bullish_cross:
             score += 15
-            reasons.append("MACD just crossed above signal — bullish crossover")
+            reasons.append("MACD bullish crossover")
         elif bearish_cross:
             score -= 15
-            reasons.append("MACD just crossed below signal — bearish crossover")
+            reasons.append("MACD bearish crossover")
         elif macd_val > macd_s_val:
             score += 5
-            reasons.append("MACD above signal line — bullish bias intact")
+            reasons.append("MACD above signal line")
         else:
             score -= 5
-            reasons.append("MACD below signal line — bearish bias intact")
+            reasons.append("MACD below signal line")
     else:
-        reasons.append("MACD: insufficient data for full calculation")
+        reasons.append("MACD: insufficient data")
 
-    # EMA trend stack
     if data_length >= 30:
         if close_val > ema20_val > ema50_val > ema200_val:
             score += 15
-            reasons.append("Price above EMA20/50/200 in bullish stack — strong uptrend")
+            reasons.append("Bullish EMA stack")
         elif close_val < ema20_val < ema50_val < ema200_val:
             score -= 15
-            reasons.append("Price below EMA20/50/200 in bearish stack — strong downtrend")
+            reasons.append("Bearish EMA stack")
         elif close_val > ema200_val:
             score += 5
-            reasons.append("Price above 200 EMA — long-term trend bullish")
+            reasons.append("Above 200 EMA")
         else:
             score -= 5
-            reasons.append("Price below 200 EMA — long-term trend bearish")
+            reasons.append("Below 200 EMA")
     else:
-        reasons.append("EMA trend: insufficient data for full trend analysis")
+        reasons.append("EMA trend: insufficient data")
 
-    # Parabolic SAR proxy (price vs 20-period SMA)
     if data_length >= 20:
         sma20 = float(close.tail(20).mean())
-        sar_bullish = close_val > sma20
-        if sar_bullish:
+        if close_val > sma20:
             score += 8
-            reasons.append("Price above 20-day average — short-term momentum positive")
+            reasons.append("Above 20-day SMA")
         else:
             score -= 8
-            reasons.append("Price below 20-day average — short-term momentum negative")
+            reasons.append("Below 20-day SMA")
     else:
         reasons.append("Short-term momentum: insufficient data")
 
-    # ADX trend strength
     trend_strength = "strong" if adx_val >= 25 else "moderate" if adx_val >= 20 else "weak"
     if data_length >= 20:
         if adx_val >= 25:
-            reasons.append(f"ADX at {adx_val:.1f} — strong trend, higher conviction signal")
+            reasons.append(f"ADX {adx_val:.1f} — strong trend")
         else:
-            reasons.append(f"ADX at {adx_val:.1f} — weak/no trend, range-bound caution")
+            reasons.append(f"ADX {adx_val:.1f} — weak/no trend")
     else:
-        reasons.append("ADX: insufficient data for trend strength")
+        reasons.append("ADX: insufficient data")
 
-    # Bollinger Band position
     if data_length >= 20:
         bb_range = bb_up - bb_lo if bb_up != bb_lo else 1
         bb_pct   = (close_val - bb_lo) / bb_range * 100
         if bb_pct < 20:
             score += 8
-            reasons.append(f"Price near lower Bollinger Band ({bb_pct:.0f}%) — oversold zone")
+            reasons.append(f"Near lower BB ({bb_pct:.0f}%)")
         elif bb_pct > 80:
             score -= 8
-            reasons.append(f"Price near upper Bollinger Band ({bb_pct:.0f}%) — overbought zone")
+            reasons.append(f"Near upper BB ({bb_pct:.0f}%)")
     else:
         reasons.append("Bollinger Bands: insufficient data")
 
-    # Proximity to support/resistance
     dist_res = round(((resistance - close_val) / close_val) * 100, 2) if resistance and close_val else 999
     dist_sup = round(((close_val - support)   / close_val) * 100, 2) if support and close_val else 999
     if dist_res < 2:
         score -= 8
-        reasons.append(f"Price only {dist_res}% below resistance ({resistance:.0f}) — breakout needed")
+        reasons.append(f"{dist_res}% below resistance")
     if dist_sup < 2:
         score += 8
-        reasons.append(f"Price only {dist_sup}% above support ({support:.0f}) — favorable risk/reward")
+        reasons.append(f"{dist_sup}% above support")
 
-    # Volume
     volume_surge = vol_avg20 > 0 and vol_now > vol_avg20 * 1.5
     if volume_surge:
         score += 8
-        reasons.append("Volume surging vs 20-day average — institutional interest likely")
+        reasons.append("Volume surge")
 
     score = max(0, min(100, round(score)))
 
-    return {
-        "symbol":          sym,
-        "close":           round(close_val, 2),
+    result = {
+        "symbol": sym,
+        "close": round(close_val, 2),
         "technical_score": score,
-        "trend_strength":  trend_strength,
-        "support":         round(support, 2) if support else None,
-        "resistance":      round(resistance, 2) if resistance else None,
-        "rsi":             round(rsi_val, 1),
-        "adx":             round(adx_val, 1),
-        "atr":             round(atr_val, 2),
-        "ema20":           round(ema20_val, 2),
-        "ema50":           round(ema50_val, 2),
-        "ema200":          round(ema200_val, 2),
-        "bb_upper":        round(bb_up, 2),
-        "bb_lower":        round(bb_lo, 2),
-        "volume_surge":    bool(volume_surge),
+        "trend_strength": trend_strength,
+        "support": round(support, 2) if support else None,
+        "resistance": round(resistance, 2) if resistance else None,
+        "rsi": round(rsi_val, 1),
+        "adx": round(adx_val, 1),
+        "atr": round(atr_val, 2),
+        "ema20": round(ema20_val, 2),
+        "ema50": round(ema50_val, 2),
+        "ema200": round(ema200_val, 2),
+        "bb_upper": round(bb_up, 2),
+        "bb_lower": round(bb_lo, 2),
+        "volume_surge": bool(volume_surge),
         "data_insufficient": data_length < 30,
-        "reasons":         reasons,
+        "reasons": reasons,
     }
 
+    _cache_set(cache_key, result)
+    return result
 
 if __name__ == "__main__":
     import uvicorn
+    import json  # added for json.dumps
     port = int(os.getenv("PORT", 8002))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

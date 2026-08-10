@@ -2,12 +2,10 @@
 Market Data Service
 --------------------
 Single responsibility: fetch raw market data (price history, quote, company info)
-for Indian equities from free public sources (Yahoo Finance via yfinance) and
-serve it over REST. No analysis logic lives here on purpose — this service is
-a dumb, reliable data pipe so every other service can share one cache and one
-rate-limit budget.
-
-NSE tickers on Yahoo Finance use the ".NS" suffix (e.g. TCS.NS, RELIANCE.NS).
+for Indian equities from free public sources (yfinance) and serve over REST.
+All data is cached with TTL that depends on market hours:
+- During NSE trading hours (09:15-15:30 IST, Mon-Fri): TTL = 300 seconds (5 min)
+- Outside: TTL = 21600 seconds (6 hours)
 """
 import os
 import time
@@ -15,7 +13,8 @@ import json
 import logging
 import math
 import random
-from datetime import datetime
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import requests
@@ -28,7 +27,7 @@ from pydantic import BaseModel
 
 import httpx
 
-# --- Patch yfinance session with a proper User-Agent ---
+# ── yfinance session patch ────────────────────────────────────────────────────
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -51,6 +50,7 @@ try:
 except AttributeError:
     pass
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def _safe(val, decimals=2):
     try:
         f = float(val)
@@ -72,7 +72,6 @@ def _compute_growth(current, previous):
     return ((current - previous) / previous) * 100
 
 def _with_retry(func, max_retries=5, base_delay=3):
-    """Retry with exponential backoff and full jitter."""
     for attempt in range(max_retries):
         try:
             return func()
@@ -83,18 +82,27 @@ def _with_retry(func, max_retries=5, base_delay=3):
             logging.warning(f"Retry {attempt+1}/{max_retries} after {wait:.1f}s: {e}")
             time.sleep(wait)
 
+def is_market_open() -> bool:
+    """Return True if current time is within NSE trading hours (Mon-Fri, 09:15-15:30 IST)."""
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    if now.weekday() >= 5:
+        return False
+    return dtime(9, 15) <= now.time() <= dtime(15, 30)
+
+def get_cache_ttl() -> int:
+    """Return TTL in seconds: 300 if market open, else 21600 (6 hours)."""
+    return 300 if is_market_open() else 21600
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("market-data-service")
 
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
-
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 
-app = FastAPI(title="Stockky Market Data Service", version="0.1.4")
+app = FastAPI(title="Stockky Market Data Service", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -102,7 +110,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     return JSONResponse(
@@ -111,7 +118,7 @@ async def global_exception_handler(request, exc):
         headers={"Access-Control-Allow-Origin": "*"}
     )
 
-# ---------- Redis cache ----------
+# ── Redis cache ────────────────────────────────────────────────────────────────
 try:
     if UPSTASH_URL and UPSTASH_TOKEN:
         cache = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
@@ -129,12 +136,14 @@ def _cache_get(key: str):
     val = cache.get(key)
     return json.loads(val) if val else None
 
-def _cache_set(key: str, value: dict, ttl: int = CACHE_TTL_SECONDS):
+def _cache_set(key: str, value: dict, ttl: int = None):
     if not cache:
         return
+    if ttl is None:
+        ttl = get_cache_ttl()
     cache.setex(key, ttl, json.dumps(value, default=str))
 
-# ---------- Fallback cache (30 days) ----------
+# Fallback cache (30 days)
 FALLBACK_TTL_SECONDS = 30 * 24 * 60 * 60
 
 def _fallback_get(key: str):
@@ -167,19 +176,19 @@ class QuoteResponse(BaseModel):
     pe_ratio: Optional[float]
     fetched_at: str
 
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {
         "service": "Stockky Market Data Service",
-        "version": "0.1.4",
+        "version": "0.2.0",
         "status": "running",
         "cache_enabled": bool(cache),
         "endpoints": {
             "/health": "GET – health check",
             "/quote/{symbol}": "GET – latest quote",
-            "/history/{symbol}": "GET – OHLCV candles (period, interval)",
+            "/history/{symbol}": "GET – OHLCV candles",
             "/fundamentals/{symbol}": "GET – raw fundamental data",
-            "/docs": "Swagger UI documentation",
         },
     }
 
@@ -187,7 +196,7 @@ async def root():
 def health():
     return {"status": "ok", "service": "market-data-service", "cache": bool(cache)}
 
-# --- NSE India Official API (Primary Source for Indian Stocks) ---
+# ── NSE India Official API (Primary) ─────────────────────────────────────────
 _nse_headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -200,8 +209,8 @@ def _fetch_nse_quote(symbol: str) -> Optional[dict]:
     try:
         clean_sym = symbol.replace(".NS", "").replace(".BO", "")
         with httpx.Client(headers=_nse_headers, timeout=15) as client:
-            client.get("https://www.nseindia.com") # Fetch cookies
-            time.sleep(0.5) # Pause to ensure cookies are set
+            client.get("https://www.nseindia.com")
+            time.sleep(0.5)
             url = f"https://www.nseindia.com/api/quote-equity?symbol={clean_sym}"
             resp = client.get(url)
             if resp.status_code == 200:
@@ -227,7 +236,6 @@ def _fetch_nse_fundamentals(symbol: str) -> Optional[dict]:
         logger.warning(f"NSE Fundamentals fetch failed: {e}")
     return None
 
-# --- Yahoo Raw API Fallback (Secondary) ---
 def _fetch_price_from_yahoo_raw(symbol: str) -> Optional[float]:
     try:
         for sym in [symbol, symbol.replace(".NS", "")]:
@@ -254,7 +262,7 @@ def get_quote(symbol: str):
     if cached:
         return cached
 
-    # 1. Primary Source: NSE India Official API (Best for new Indian stocks)
+    # 1. NSE India
     nse_data = _fetch_nse_quote(sym)
     if nse_data:
         price = _safe(nse_data.get("priceInfo", {}).get("lastPrice"))
@@ -272,10 +280,10 @@ def get_quote(symbol: str):
                 "pe_ratio": _safe(nse_data.get("priceInfo", {}).get("pe")),
                 "fetched_at": datetime.utcnow().isoformat(),
             }
-            _cache_set(cache_key, result, ttl=300)
+            _cache_set(cache_key, result)
             return result
 
-    # 2. Secondary: Alpha Vantage
+    # 2. Alpha Vantage
     price = None
     if ALPHA_VANTAGE_API_KEY:
         possible_symbols = [sym, sym.replace(".NS", "")]
@@ -294,7 +302,7 @@ def get_quote(symbol: str):
             except Exception as e:
                 logger.warning(f"Alpha Vantage fallback for {alpha_sym} failed: {e}")
 
-    # 3. Twelve Data (free, reliable)
+    # 3. Twelve Data
     if price is None and TWELVE_DATA_API_KEY:
         try:
             clean_sym = sym.replace(".NS", "").replace(".BO", "")
@@ -308,7 +316,7 @@ def get_quote(symbol: str):
         except Exception as e:
             logger.warning(f"Twelve Data fallback failed: {e}")
 
-    # 4. Polygon.io (free tier, 5 calls/min)
+    # 4. Polygon.io
     if price is None and POLYGON_API_KEY:
         try:
             clean_sym = sym.replace(".NS", "").replace(".BO", "")
@@ -326,7 +334,7 @@ def get_quote(symbol: str):
     if price is None:
         price = _fetch_price_from_yahoo_raw(sym)
 
-    # 6. Final fallback: yfinance
+    # 6. yfinance final fallback
     if price is None:
         ticker = yf.Ticker(sym)
         ticker._tz = "Asia/Kolkata"
@@ -358,7 +366,7 @@ def get_quote(symbol: str):
             _cache_set(cache_key, result)
             return result
 
-    # If we extracted price via one of the APIs, return a simplified response
+    # If we have a price from one of the APIs, build minimal response
     if price is not None:
         result = {
             "symbol": sym,
@@ -373,11 +381,11 @@ def get_quote(symbol: str):
             "pe_ratio": None,
             "fetched_at": datetime.utcnow().isoformat(),
         }
-        _cache_set(cache_key, result, ttl=300)
+        _cache_set(cache_key, result)
         return result
 
-    # No price from any source – return a fallback with price=None
-    logger.warning(f"Could not fetch price for {sym} from any source. Returning fallback quote with price: None.")
+    # No price – return fallback
+    logger.warning(f"Could not fetch price for {sym} from any source. Returning fallback.")
     result = {
         "symbol": sym,
         "name": sym,
@@ -391,7 +399,7 @@ def get_quote(symbol: str):
         "pe_ratio": None,
         "fetched_at": datetime.utcnow().isoformat(),
     }
-    _cache_set(cache_key, result, ttl=300)
+    _cache_set(cache_key, result)
     return result
 
 @app.get("/history/{symbol}")
@@ -434,7 +442,7 @@ def get_history(
             raise HTTPException(status_code=404, detail=f"No valid candles for {sym}")
 
         result = {"symbol": sym, "period": period, "interval": interval, "candles": candles}
-        _cache_set(cache_key, result, ttl=900)
+        _cache_set(cache_key, result, ttl=900)  # history can be cached a bit longer (15 min)
         return result
 
     except HTTPException:
@@ -688,7 +696,7 @@ def get_fundamentals_raw(symbol: str):
         _fallback_set(cache_key, result)
 
     if result:
-        _cache_set(cache_key, result, ttl=86400)
+        _cache_set(cache_key, result, ttl=86400)  # fundamentals change slowly, cache 24h
         return result
 
     stale = _fallback_get(cache_key)
