@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.14 – always updates fetched_at to current time on every request.
+v2.5.15 – adds Cache-Control headers for /market/indices and always updates fetched_at.
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.14")
+app = FastAPI(title="Stockky API Gateway", version="2.5.15")
 
 # --- CORS ---
 app.add_middleware(
@@ -911,7 +911,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.14",
+        "version": "2.5.15",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -934,7 +934,7 @@ def root():
             "/market/top-losers": "GET – top 10 losers",
             "/market/most-active": "GET – top 10 most active by volume",
             "/market/trending": "GET – trending stocks (momentum + news)",
-            "/market/indices": "GET – live NIFTY 50 & SENSEX (fetched_at always current)",
+            "/market/indices": "GET – live NIFTY 50 & SENSEX (with Cache-Control headers)",
             "/notifications/health": "GET – notification service health",
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
@@ -1489,25 +1489,30 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
-# ── CORRECTED /market/indices with always‑current fetched_at ──────────
+# ── IMPROVED /market/indices with Cache-Control and always‑current fetched_at ──
 @app.get("/market/indices")
 def get_market_indices(force_refresh: bool = False):
     """
     Fetch real-time NIFTY 50 and SENSEX index values with a moderated market score.
     - Uses mapping: -0.3 percentage points -> 0, 0% -> 50, +0.3 percentage points -> 100.
     - ALWAYS returns fetched_at = current time on every request.
+    - Adds Cache-Control headers to prevent browser caching.
     - Stores last known values in Redis.
     """
-    # Always set fetched_at to the current time on every response
     current_time = datetime.now().isoformat()
 
     if not force_refresh:
         cached = _redis_get(INDICES_CACHE_KEY)
         if cached and isinstance(cached, dict):
-            # Update fetched_at to current time before returning
             cached["fetched_at"] = current_time
-            # Preserve stale flag if present
-            return cached
+            return JSONResponse(
+                content=cached,
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                }
+            )
 
     try:
         nifty = yf.Ticker("^NSEI")
@@ -1529,9 +1534,8 @@ def get_market_indices(force_refresh: bool = False):
         sensex_change = sensex_close - sensex_prev_close
         sensex_change_pct = (sensex_change / sensex_prev_close) * 100
 
-        # Corrected sensitivity: 0.3 percentage points -> 0-100
         avg_change = (nifty_change_pct + sensex_change_pct) / 2
-        sensitivity = 0.3  # percentage points
+        sensitivity = 0.3
         raw_score = 50 + (avg_change / sensitivity) * 50
         market_score = max(0, min(100, raw_score))
 
@@ -1555,21 +1559,34 @@ def get_market_indices(force_refresh: bool = False):
             },
             "market_mood": mood,
             "market_score": round(market_score),
-            "fetched_at": current_time,  # always current
+            "fetched_at": current_time,
         }
         _redis_set(INDICES_CACHE_KEY, result, ttl=300)
         _redis_set(INDICES_LAST_KNOWN, result, ttl=86400)
-        return result
+        return JSONResponse(
+            content=result,
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            }
+        )
 
     except Exception as e:
         logger.error(f"Error fetching indices: {e}")
         last_known = _redis_get(INDICES_LAST_KNOWN)
         if last_known and isinstance(last_known, dict):
-            # Update timestamp and mark as stale
             last_known["fetched_at"] = current_time
             last_known["stale"] = True
-            _redis_set(INDICES_CACHE_KEY, last_known, ttl=60)  # short TTL to retry soon
-            return last_known
+            _redis_set(INDICES_CACHE_KEY, last_known, ttl=60)
+            return JSONResponse(
+                content=last_known,
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                }
+            )
         else:
             fallback = {
                 "nifty": {"price": 0, "change": 0, "change_pct": 0},
@@ -1582,7 +1599,14 @@ def get_market_indices(force_refresh: bool = False):
             }
             _redis_set(INDICES_CACHE_KEY, fallback, ttl=60)
             _redis_set(INDICES_LAST_KNOWN, fallback, ttl=86400)
-            return fallback
+            return JSONResponse(
+                content=fallback,
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                }
+            )
 
 # ── Universe preview ──────────────────────────────────────────────────────
 @app.get("/scan/universe")

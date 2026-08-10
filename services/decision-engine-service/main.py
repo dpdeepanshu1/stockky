@@ -1,10 +1,9 @@
 """
-Decision Engine Service v0.7.2
+Decision Engine Service v0.7.3
 Changes:
-- Market Sentiment score is now part of the weighted average (weight 0.10)
-- All missing scores default to 50 (neutral)
-- Added retry and fallback for market sentiment fetch
-- Increased timeout and added logging for debugging
+- Fetches market sentiment from API Gateway's /market/indices endpoint (fast and reliable)
+- Always includes the live market_score in the response
+- Added retry and logging
 """
 import os
 import asyncio
@@ -25,14 +24,13 @@ FUNDAMENTAL_URL = os.getenv("FUNDAMENTAL_URL", "https://fundamental-analysis-ser
 NEWS_URL = os.getenv("NEWS_URL", "https://news-intelligence-service.onrender.com")
 EVENT_URL = os.getenv("EVENT_URL", "https://event-tracker-service-m1lw.onrender.com")
 PREDICTION_URL = os.getenv("PREDICTION_URL", "https://prediction-service-wowb.onrender.com")
-MARKET_SENTIMENT_URL = os.getenv("MARKET_SENTIMENT_URL", "https://market-sentiment-service.onrender.com")
 API_GATEWAY_URL = os.getenv("API_GATEWAY_URL", "https://api-gateway-wizr.onrender.com")
 TRAINING_SERVICE_URL = os.getenv("TRAINING_SERVICE_URL", "https://training-service-5e9v.onrender.com")
 
 EARNINGS_RISK_DAYS = 3
 EARNINGS_BOOST_DAYS = 7
 
-app = FastAPI(title="Stockky Decision Engine", version="0.7.2")
+app = FastAPI(title="Stockky Decision Engine", version="0.7.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -57,7 +55,7 @@ class Decision(str, Enum):
 
 @app.get("/")
 def root():
-    return {"service": "Stockky Decision Engine", "version": "0.7.2", "status": "running"}
+    return {"service": "Stockky Decision Engine", "version": "0.7.3", "status": "running"}
 
 
 @app.get("/health")
@@ -76,39 +74,26 @@ async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
         return None
 
 
-# ── Market Sentiment fetch with retry and fallback ────────────────
+# ── Market Sentiment fetch from API Gateway ──────────────────────
 async def get_market_sentiment() -> dict:
-    """Fetch current market sentiment with retry and fallback."""
-    # First try the market-sentiment service directly
+    """Fetch live market sentiment from the API Gateway's /market/indices endpoint."""
     for attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(f"{MARKET_SENTIMENT_URL}/sentiment")
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                # Use the API Gateway's endpoint – it always returns a score
+                resp = await client.get(f"{API_GATEWAY_URL}/market/indices?force_refresh=false")
                 if resp.status_code == 200:
                     data = resp.json()
                     score = data.get("market_score", 50)
-                    logger.info(f"Market sentiment fetched: {score}")
+                    logger.info(f"Market sentiment fetched from API Gateway: {score}")
                     return {"market_score": score, **data}
                 else:
-                    logger.warning(f"Market sentiment returned {resp.status_code} (attempt {attempt+1})")
+                    logger.warning(f"API Gateway returned {resp.status_code} (attempt {attempt+1})")
         except Exception as e:
             logger.warning(f"Market sentiment fetch attempt {attempt+1} failed: {e}")
             if attempt == 0:
-                await asyncio.sleep(1)  # brief retry delay
-
-    # Fallback: fetch from API Gateway's /market/indices
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{API_GATEWAY_URL}/market/indices")
-            if resp.status_code == 200:
-                data = resp.json()
-                score = data.get("market_score", 50)
-                logger.info(f"Market sentiment fetched from API Gateway fallback: {score}")
-                return {"market_score": score, "source": "api-gateway"}
-    except Exception as e:
-        logger.warning(f"Fallback market sentiment fetch failed: {e}")
-
-    # Ultimate fallback
+                await asyncio.sleep(0.5)
+    # Fallback
     logger.warning("All market sentiment fetches failed, using neutral 50")
     return {"market_score": 50, "classification": "NEUTRAL", "trend": "Neutral"}
 
@@ -260,7 +245,6 @@ def _combined_score(
     event_delta: int = 0,
     market_adjustment: int = 0,
 ) -> float:
-    # Default missing values to 50
     news = news_score if news_score is not None else 50
     pred = prediction_score if prediction_score is not None else 50
 
@@ -470,8 +454,7 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         market_score = sentiment.get("market_score", 50)
         training_score = training.get("training_score", 50)
 
-        # Log market sentiment for debugging
-        logger.info(f"Market sentiment for {symbol}: {market_score} (source: {sentiment.get('source', 'sentiment-service')})")
+        logger.info(f"Market sentiment for {symbol}: {market_score}")
 
         market_adjustment, market_adjustment_reason = _market_sentiment_adjustment(market_score)
 
@@ -489,7 +472,6 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         if close and resistance and resistance > 0:
             dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
 
-        # Combined score includes market_score
         combined = _combined_score(
             technical_score,
             fundamental_score,
@@ -554,7 +536,7 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             "fundamental_score": fundamental_score,
             "news_score": news_score,
             "prediction_score": prediction_score,
-            "market_score": market_score,  # <-- This is the value shown in the Decision Card
+            "market_score": market_score,   # <-- live market sentiment
             "market_sentiment_adjustment": market_adjustment,
             "training_score": training_score,
             "event_score_delta": event_delta,
@@ -584,7 +566,6 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         if fundamental.get("metrics"):
             response["fundamental_metrics"] = fundamental["metrics"]
 
-        # Record prediction for training
         if decision in (Decision.BUY_NOW, Decision.PREPARE_TO_BUY) and close:
             background_tasks.add_task(
                 record_prediction_for_training,
