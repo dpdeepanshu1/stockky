@@ -3,23 +3,28 @@ Outcome evaluation for predictions.
 Enhanced to support comprehensive metrics, batch evaluation, and summary statistics.
 """
 import logging
+import os
 from datetime import datetime, timedelta
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 import yfinance as yf
 import numpy as np
 import pandas as pd
 
-# ✅ Absolute import
 import models as db_models
 from metrics import calculate_sharpe, calculate_sortino, max_drawdown, cumulative_return, win_rate, profit_factor
 
 logger = logging.getLogger("training-service.evaluate")
 
-# ---------- Existing T+1 / T+5 evaluators (kept intact, with minor enhancements) ----------
+# ---------- Database setup ----------
+DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./training.db')
+engine = create_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(bind=engine)
 
+# ---------- Existing T+1 / T+5 evaluators ----------
 def evaluate_t1(prediction_id: str):
     """Evaluate a prediction on T+1 (next trading day)."""
-    db = Session()
+    db = SessionLocal()
     try:
         pred = db.query(db_models.PredictionSnapshot).filter(
             db_models.PredictionSnapshot.prediction_id == prediction_id
@@ -92,7 +97,7 @@ def evaluate_t1(prediction_id: str):
 
 def evaluate_t5(prediction_id: str):
     """Evaluate a prediction on T+5 (approximately one week)."""
-    db = Session()
+    db = SessionLocal()
     try:
         pred = db.query(db_models.PredictionSnapshot).filter(
             db_models.PredictionSnapshot.prediction_id == prediction_id
@@ -164,16 +169,14 @@ def evaluate_t5(prediction_id: str):
     finally:
         db.close()
 
-# ---------- NEW: Batch evaluation and summary functions ----------
-
+# ---------- Batch evaluation and summary functions ----------
 def evaluate_pending_predictions(period: str = 'T+1'):
     """
     Evaluate all predictions that do not yet have an outcome for the given period.
     period: 'T+1' or 'T+5'
     """
-    db = Session()
+    db = SessionLocal()
     try:
-        # Find predictions without outcome for this period
         subquery = db.query(db_models.PredictionOutcome.prediction_id).filter(
             db_models.PredictionOutcome.evaluation_period == period
         ).subquery()
@@ -197,16 +200,14 @@ def compute_training_metrics():
     Aggregate all outcomes and compute overall performance metrics.
     Returns a dict with metrics like Sharpe, Sortino, win rate, etc.
     """
-    db = Session()
+    db = SessionLocal()
     try:
-        # Fetch all T+1 outcomes with return_pct
         outcomes_t1 = db.query(db_models.PredictionOutcome).filter(
             db_models.PredictionOutcome.evaluation_period == 'T+1',
             db_models.PredictionOutcome.return_pct.isnot(None)
         ).all()
         returns_t1 = [o.return_pct / 100.0 for o in outcomes_t1 if o.return_pct is not None]
         
-        # For T+5
         outcomes_t5 = db.query(db_models.PredictionOutcome).filter(
             db_models.PredictionOutcome.evaluation_period == 'T+5',
             db_models.PredictionOutcome.return_pct.isnot(None)
@@ -249,7 +250,7 @@ def update_prediction_success(prediction_id: str):
     """
     Update the prediction snapshot with overall success flag (if T+1 and T+5 both success, mark as overall success).
     """
-    db = Session()
+    db = SessionLocal()
     try:
         pred = db.query(db_models.PredictionSnapshot).filter(
             db_models.PredictionSnapshot.prediction_id == prediction_id
