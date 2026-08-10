@@ -367,15 +367,42 @@ def ensure_schema(engine):
             # Confidence should be VARCHAR, not NUMERIC/DOUBLE
             if 'confidence' in existing_columns:
                 col_type = existing_columns['confidence']
-                # Check if it's a numeric type (e.g., DOUBLE PRECISION, NUMERIC, FLOAT)
                 if 'double' in str(col_type).lower() or 'numeric' in str(col_type).lower() or 'float' in str(col_type).lower():
                     alter_sql = f'ALTER TABLE {table_name} ALTER COLUMN confidence TYPE VARCHAR(20) USING confidence::text'
                     conn.execute(text(alter_sql))
                     conn.commit()
                     print("Fixed confidence column type to VARCHAR(20)")
 
-            # Similarly, you can add checks for decision, market_mood, macd, ema if needed
-            # but they are likely already correct.
+    # ---- prediction_outcomes ----
+    table_name = "prediction_outcomes"
+    if inspector.has_table(table_name):
+        existing_columns = {col['name']: col['type'] for col in inspector.get_columns(table_name)}
+        required_columns = {
+            'prediction_id': 'VARCHAR(50) NOT NULL',
+            'evaluation_period': 'VARCHAR(10) NOT NULL',
+            'evaluation_date': 'TIMESTAMP NOT NULL',
+            'open_price': 'FLOAT',
+            'high_price': 'FLOAT',
+            'low_price': 'FLOAT',
+            'close_price': 'FLOAT',
+            'max_favorable_excursion': 'FLOAT',
+            'max_adverse_excursion': 'FLOAT',
+            'return_pct': 'FLOAT',
+            'entry_reached': 'INTEGER',
+            'target_reached': 'INTEGER',
+            'stop_loss_reached': 'INTEGER',
+            'direction_correct': 'INTEGER',
+            'success': 'INTEGER',
+            'notes': 'TEXT',
+            'created_at': 'TIMESTAMP',
+        }
+        with engine.connect() as conn:
+            for col_name, col_type in required_columns.items():
+                if col_name not in existing_columns:
+                    alter_sql = f'ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}'
+                    conn.execute(text(alter_sql))
+                    conn.commit()
+                    print(f"Added column {col_name} to {table_name}")
 
     # ---- training_runs ----
     table_name = "training_runs"
