@@ -203,9 +203,14 @@ def save_training_run_to_db(session, config, metrics, fold_details, model_versio
         session.rollback()
 
 # ---------- Main Training Pipeline ----------
-def run_training_pipeline(config: Dict[str, Any], db_session: Optional[Session] = None) -> Dict[str, Any]:
+def run_training_pipeline(
+    config: Dict[str, Any],
+    db_session: Optional[Session] = None,
+    model_store_path: str = "./model-store",
+) -> Dict[str, Any]:
     np.random.seed(config['random_seed'])
     random.seed(config['random_seed'])
+    os.makedirs(model_store_path, exist_ok=True)
 
     symbols = config['data']['symbols']
     logger.info(f"Fetching data for {len(symbols)} symbols...")
@@ -338,11 +343,11 @@ def run_training_pipeline(config: Dict[str, Any], db_session: Optional[Session] 
         model_version = registry.save_production_model(final_model, final_scaler, config, metrics)
         logger.info(f"Production model saved with version: {model_version}")
     else:
-        joblib.dump(final_model, 'model.pkl')
-        joblib.dump(final_scaler, 'scaler.pkl')
-        with open('training_config.json', 'w') as f:
+        joblib.dump(final_model, os.path.join(model_store_path, 'model.pkl'))
+        joblib.dump(final_scaler, os.path.join(model_store_path, 'scaler.pkl'))
+        with open(os.path.join(model_store_path, 'training_config.json'), 'w') as f:
             json.dump(convert_numpy(config), f, indent=2)
-        logger.info("Production model saved as model.pkl (legacy mode)")
+        logger.info(f"Production model saved under {model_store_path} (legacy mode)")
 
     report = {
         'timestamp': datetime.now().isoformat(),
@@ -355,8 +360,9 @@ def run_training_pipeline(config: Dict[str, Any], db_session: Optional[Session] 
         'config': convert_numpy(config)
     }
 
-    joblib.dump(report, 'training_report.joblib')
-    logger.info("Training report saved to training_report.joblib")
+    report_path = os.path.join(model_store_path, 'training_report.joblib')
+    joblib.dump(report, report_path)
+    logger.info(f"Training report saved to {report_path}")
 
     # Log training run to DB if session provided
     if HAS_DB and db_session is not None:
@@ -386,9 +392,8 @@ def train_model(db_session, model_store_path: str):
     logger.info("=" * 60)
     logger.info("TRAINING STARTED (via train_model)")
     logger.info("=" * 60)
-    
-    if model_store_path:
-        os.environ["MODEL_STORE_PATH"] = model_store_path
+
+    model_store_path = model_store_path or os.environ.get("MODEL_STORE_PATH", "./model-store")
 
     config = DEFAULT_TRAINING_CONFIG.copy()
     env_symbols = os.getenv("TRAINING_SYMBOLS")
@@ -405,8 +410,8 @@ def train_model(db_session, model_store_path: str):
             logger.warning(f"Could not load config file: {e}")
     
     try:
-        # Pass the session to run_training_pipeline
-        report = run_training_pipeline(config, db_session=db_session)
+        # Pass the session and resolved model_store_path to run_training_pipeline
+        report = run_training_pipeline(config, db_session=db_session, model_store_path=model_store_path)
         if report:
             logger.info("Training completed successfully")
             logger.info(f"Dataset size: {report.get('dataset_size', 0)}")
@@ -440,4 +445,8 @@ if __name__ == '__main__':
         HAS_DB = False
 
     # When running standalone, we don't have a db_session, so pass None
-    run_training_pipeline(config, db_session=None)
+    run_training_pipeline(
+        config,
+        db_session=None,
+        model_store_path=os.environ.get("MODEL_STORE_PATH", "./model-store"),
+    )

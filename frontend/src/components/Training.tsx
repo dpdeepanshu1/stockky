@@ -31,13 +31,18 @@ export default function Training() {
       const data = await api.getTrainingStatus();
       setStatus(data);
 
-      if (data.production_model_exists && data.last_training) {
-        if (training) {
-          stopTraining(true);
-        }
-      }
+      // training_in_progress flipping to false is the actual completion
+      // signal (it tracks the backend's lock file). Whether that
+      // completion was a success is a separate question, answered by
+      // whether a production model now exists. The previous version
+      // checked these as two independent branches, so a training run
+      // that finished successfully but happened to poll on a tick where
+      // training_in_progress was already false and production_model_exists
+      // hadn't been read fell through to the failure branch and showed
+      // "stopped or interrupted" for a run that actually succeeded.
       if (training && data.training_in_progress === false) {
-        stopTraining(false);
+        const succeeded = Boolean(data.production_model_exists && data.last_training);
+        stopTraining(succeeded);
       }
     } catch (err) {
       showToast("error", "Failed to fetch training status.");
@@ -100,8 +105,15 @@ export default function Training() {
 
   const clearLock = async () => {
     try {
-      const baseUrl = status?.service_url || import.meta.env.VITE_TRAINING_SERVICE_URL || "https://training-service-5e9v.onrender.com";
-      const response = await fetch(`${baseUrl}/lock`, { method: "DELETE" });
+      // Goes through the gateway's /training proxy, same as fetchPredictionHistory
+      // / fetchInsights / fetchSummaryMetrics above. Calling training-service's
+      // own SERVICE_URL directly doesn't work: locally it's the Docker-internal
+      // hostname http://training-service:5001, unreachable from the browser;
+      // in production it's a same-origin-policy cross-origin call.
+      const response = await fetch(
+        `${import.meta.env.VITE_API_URL}/training/lock`,
+        { method: "DELETE" }
+      );
       if (response.ok) {
         showToast("success", "Training lock cleared.");
         return true;

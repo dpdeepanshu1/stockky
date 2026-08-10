@@ -10,6 +10,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
@@ -19,6 +20,16 @@ from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker
 
 from models import Base, ensure_schema, PredictionSnapshot, PredictionOutcome, TrainingRun
+# Aliased: this module also defines async route handlers named evaluate_t1
+# and evaluate_t5 further down. Importing under the real names would work
+# until Python reaches those `async def evaluate_t1(...)` lines, at which
+# point they'd silently shadow these imports for anything defined below
+# them. Aliasing avoids relying on statement order to keep the two apart.
+from evaluate import (
+    evaluate_t1 as _evaluate_t1_prediction,
+    evaluate_t5 as _evaluate_t5_prediction,
+    evaluate_pending_predictions,
+)
 
 # Optional imports
 try:
@@ -36,6 +47,12 @@ except ImportError:
 HAS_DB = True
 
 app = FastAPI(title="Training Intelligence", version="1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -145,38 +162,57 @@ def is_training_running():
 # Helper functions
 # ----------------------------------------------------------------------
 def get_training_status():
-    report_path = 'training_report.joblib'
-    model_path = 'model.pkl'
     status = {
         'service_url': SERVICE_URL,
-        'production_model_exists': os.path.exists(model_path),
+        'production_model_exists': False,
         'last_training': None,
         'dataset_size': 0,
         'num_symbols': 0,
         'metrics': {},
         'fold_details': [],
         'model_version': None,
-        'training_in_progress': is_training_running()  # NEW: tell frontend if lock exists
+        'training_in_progress': is_training_running()  # per-instance lock file: correct as-is
     }
-    if os.path.exists(report_path):
-        try:
-            report = joblib.load(report_path)
-            status['last_training'] = report.get('timestamp')
-            status['dataset_size'] = report.get('dataset_size', 0)
-            status['num_symbols'] = report.get('num_symbols', 0)
-            status['metrics'] = convert_numpy(report.get('walk_forward_metrics', {}))
-            status['fold_details'] = convert_numpy(report.get('fold_details', []))
-            status['model_version'] = report.get('model_version')
-        except Exception as e:
-            logger.error(f"Error loading report: {e}")
+
+    # Latest run history: the TrainingRun table, not a local joblib file.
+    # training_report.joblib lives in the container's CWD, which is not
+    # part of any mounted volume — it's gone on every restart/redeploy.
+    # save_training_run_to_db() in train.py already writes this same data
+    # here on every run, so read it from there instead.
+    db = SessionLocal()
+    try:
+        latest_run = db.query(TrainingRun).order_by(TrainingRun.run_timestamp.desc()).first()
+        if latest_run:
+            status['last_training'] = latest_run.run_timestamp.isoformat()
+            status['dataset_size'] = latest_run.dataset_size or 0
+            status['num_symbols'] = latest_run.num_symbols or 0
+            status['metrics'] = convert_numpy(
+                json.loads(latest_run.walk_forward_metrics) if latest_run.walk_forward_metrics else {}
+            )
+            status['fold_details'] = convert_numpy(
+                json.loads(latest_run.fold_details) if latest_run.fold_details else []
+            )
+            status['model_version'] = latest_run.model_version
+    except Exception as e:
+        logger.error(f"Error reading latest training run from DB: {e}")
+    finally:
+        db.close()
+
+    # Production model existence: the DB-backed ModelRegistry, not
+    # os.path.exists('model.pkl'). train.py's ModelRegistry path never
+    # writes model.pkl at all when HAS_MODEL_REGISTRY is True (the normal
+    # case), so that check was permanently False even after a fully
+    # successful, DB-persisted training run.
     if HAS_MODEL_REGISTRY:
         try:
             registry = ModelRegistry(SessionLocal)
             prod = registry.get_production_model()
             if prod:
+                status['production_model_exists'] = True
                 status['model_version'] = prod[2]['version']
         except Exception as e:
             logger.warning(f"Could not read model registry: {e}")
+
     return convert_numpy(status)
 
 def get_models_list():
@@ -280,7 +316,7 @@ async def api_trigger_training(background_tasks: BackgroundTasks):
 
 @app.get("/api/report")
 async def api_report():
-    report_path = 'training_report.joblib'
+    report_path = os.path.join(MODEL_STORE_PATH, 'training_report.joblib')
     if not os.path.exists(report_path):
         raise HTTPException(status_code=404, detail="No report found")
     try:
@@ -393,6 +429,16 @@ async def store_prediction(pred: PredictionSnapshotCreate, background_tasks: Bac
         db.add(snapshot)
         db.commit()
         logger.info(f"Stored prediction {pred_id} for {pred.symbol}")
+
+        # Without this, predictions were never evaluated unless someone
+        # manually hit /api/evaluate/t1 or /api/evaluate/t5 — and those
+        # were themselves broken (see below). evaluate_t1/evaluate_t5 no-op
+        # if it's too early for T+1/T+5 data to exist yet; they're cheap
+        # to schedule now and safe to have scheduler-service re-trigger
+        # later via /api/evaluate/{t1,t5} for anything still pending.
+        background_tasks.add_task(_evaluate_t1_prediction, pred_id)
+        background_tasks.add_task(_evaluate_t5_prediction, pred_id)
+
         return JSONResponse(content={"status": "stored", "prediction_id": pred_id})
     except Exception as e:
         db.rollback()
@@ -402,11 +448,14 @@ async def store_prediction(pred: PredictionSnapshotCreate, background_tasks: Bac
         db.close()
 
 @app.post("/api/evaluate/t1")
-async def evaluate_t1(background_tasks: BackgroundTasks):
-    """Trigger T+1 evaluation of pending predictions."""
+async def api_evaluate_t1(background_tasks: BackgroundTasks):
+    """Trigger T+1 evaluation of all pending predictions (catch-up sweep;
+    normal predictions are already scheduled individually in
+    store_prediction). Renamed from evaluate_t1 to api_evaluate_t1 so it
+    no longer shares a name with the per-prediction evaluate_t1 imported
+    from evaluate.py."""
     def run_eval():
         try:
-            from evaluator import evaluate_pending_predictions
             evaluate_pending_predictions('T+1')
         except Exception as e:
             logger.error(f"T+1 evaluation failed: {e}")
@@ -414,11 +463,10 @@ async def evaluate_t1(background_tasks: BackgroundTasks):
     return JSONResponse(content={"status": "T+1 evaluation triggered"})
 
 @app.post("/api/evaluate/t5")
-async def evaluate_t5(background_tasks: BackgroundTasks):
-    """Trigger T+5 evaluation of pending predictions."""
+async def api_evaluate_t5(background_tasks: BackgroundTasks):
+    """Trigger T+5 evaluation of all pending predictions (catch-up sweep)."""
     def run_eval():
         try:
-            from evaluator import evaluate_pending_predictions
             evaluate_pending_predictions('T+5')
         except Exception as e:
             logger.error(f"T+5 evaluation failed: {e}")
