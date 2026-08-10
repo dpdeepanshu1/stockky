@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.11 – moderated sensitivity for /market/indices (±0.3% → 0–100), always includes fetched_at.
+v2.5.12 – fixed market score sensitivity (0.3 percentage points → 0–100).
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.11")
+app = FastAPI(title="Stockky API Gateway", version="2.5.12")
 
 # --- CORS ---
 app.add_middleware(
@@ -911,7 +911,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.11",
+        "version": "2.5.12",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -934,7 +934,7 @@ def root():
             "/market/top-losers": "GET – top 10 losers",
             "/market/most-active": "GET – top 10 most active by volume",
             "/market/trending": "GET – trending stocks (momentum + news)",
-            "/market/indices": "GET – live NIFTY 50 & SENSEX (moderated score, fetched_at)",
+            "/market/indices": "GET – live NIFTY 50 & SENSEX (corrected score, fetched_at)",
             "/notifications/health": "GET – notification service health",
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
@@ -1489,19 +1489,18 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
-# ── MODERATED /market/indices with sensitivity 0.3% ──────────────────────────
+# ── CORRECTED /market/indices with sensitivity 0.3 percentage points ──────────
 @app.get("/market/indices")
 def get_market_indices(force_refresh: bool = False):
     """
     Fetch real-time NIFTY 50 and SENSEX index values with a moderated market score.
-    - Uses mapping: -0.3% -> 0, 0% -> 50, +0.3% -> 100.
+    - Uses mapping: -0.3 percentage points -> 0, 0% -> 50, +0.3 percentage points -> 100.
     - Always returns fetched_at.
     - Stores last known values in Redis.
     """
     if not force_refresh:
         cached = _redis_get(INDICES_CACHE_KEY)
         if cached and isinstance(cached, dict):
-            # Ensure fetched_at exists
             if "fetched_at" not in cached:
                 cached["fetched_at"] = cached.get("timestamp", datetime.now().isoformat())
             return cached
@@ -1526,9 +1525,9 @@ def get_market_indices(force_refresh: bool = False):
         sensex_change = sensex_close - sensex_prev_close
         sensex_change_pct = (sensex_change / sensex_prev_close) * 100
 
-        # Moderated: -0.3% -> 0, 0% -> 50, +0.3% -> 100
+        # Corrected sensitivity: 0.3 percentage points -> 0-100
         avg_change = (nifty_change_pct + sensex_change_pct) / 2
-        sensitivity = 0.003  # 0.3%
+        sensitivity = 0.3  # percentage points
         raw_score = 50 + (avg_change / sensitivity) * 50
         market_score = max(0, min(100, raw_score))
 
@@ -1821,8 +1820,10 @@ async def training_other_proxy(path: str, request: Request):
 @app.on_event("startup")
 async def startup_event():
     try:
-        logger.info("Pre-populating market indices cache on startup...")
-        result = get_market_indices()
+        # Clear the old cache to force fresh data with corrected sensitivity
+        _redis.delete(INDICES_CACHE_KEY)
+        logger.info("Cleared old indices cache on startup")
+        result = get_market_indices(force_refresh=True)
         logger.info("Market indices cache pre-populated successfully")
     except Exception as e:
         logger.warning(f"Could not pre-populate indices cache: {e}")
