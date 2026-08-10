@@ -145,13 +145,15 @@ _abort_flag = False   # global abort signal
 def request_abort():
     """Set the global abort flag to True. Called by the API to stop training."""
     global _abort_flag
+    logger.info("request_abort() called – setting _abort_flag = True")
     _abort_flag = True
     # Optionally remove the lock file to release the lock for future runs
     if os.path.exists(LOCK_FILE):
         try:
             os.remove(LOCK_FILE)
-        except:
-            pass
+            logger.info("Lock file removed by request_abort()")
+        except Exception as e:
+            logger.warning(f"Could not remove lock file in request_abort: {e}")
 
 def write_progress(current_fold, total_folds, elapsed_seconds=None):
     """Write current progress to a JSON file."""
@@ -181,9 +183,11 @@ def check_abort():
     """Check if abort flag is set or lock file is missing; raise KeyboardInterrupt."""
     global _abort_flag
     if _abort_flag:
+        logger.info("check_abort() raising KeyboardInterrupt because _abort_flag is True")
         raise KeyboardInterrupt("Training aborted by user.")
     if not os.path.exists(LOCK_FILE):
         # If lock file is missing, raise immediately
+        logger.warning("check_abort() raising KeyboardInterrupt because lock file is missing")
         raise KeyboardInterrupt("Lock file removed – training aborted.")
 
 # ---------- Helpers ----------
@@ -275,6 +279,7 @@ def run_training_pipeline(
 
     # Reset abort flag at start
     _abort_flag = False
+    logger.info("run_training_pipeline started, _abort_flag reset to False")
 
     # Start the lock‑checking thread
     checker_thread = threading.Thread(target=lock_checker, daemon=True)
