@@ -2,16 +2,16 @@
 Scheduler — single-shot mode, driven by GitHub Actions cron.
 
 Enhanced with timed notifications:
-  - 08:15 IST: "Market opens in 1 hour"
+  - 08:15 IST: "Market opens in 1 hour" + top picks from previous day.
   - 09:15 IST: "Market is open now"
-  - 30-min scans (08:30..15:30) with top picks
+  - Hourly scans (08:30..15:30) with top picks
   - 15:30 IST: Market close summary
   - 16:30 IST: "Going to sleep" + preview for tomorrow
 Uses Redis to track sent messages (so each event fires only once per day).
 
 Coordination with Render scheduler service:
   - Before performing a scan, we check Redis key "stockky:scheduler:last_scan_timestamp"
-  - If the timestamp is within the last SCAN_INTERVAL_MINUTES (30 min), we skip
+  - If the timestamp is within the last SCAN_INTERVAL_MINUTES (60 min), we skip
     the scan and its notifications to avoid duplication.
   - Otherwise, we run the scan (fallback) and send top picks / decision changes.
 
@@ -21,7 +21,6 @@ the entire pipeline (market data, technicals, fundamentals, decision engine).
 import os
 import json
 import logging
-import time
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any
@@ -42,13 +41,12 @@ MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
 SCAN_START = dtime(8, 30)   # first scan
 SCAN_END = dtime(15, 30)    # last scan (at close)
-OPEN_ANNOUNCE_TIME = dtime(8, 15)
+OPEN_ANNOUNCE_TIME = dtime(8, 15)   # 1 hour before open
 CLOSE_SUMMARY_TIME = dtime(15, 30)
 SLEEP_TIME = dtime(16, 30)
 
 # Redis keys
 STATE_KEY = "stockky:scheduler:last_decisions"
-EOD_KEY_PREFIX = "stockky:scheduler:eod:"        # + date
 OPEN_MSG_KEY = "stockky:scheduler:open_msg:"     # + date (sent open-in-1h)
 OPEN_NOW_KEY = "stockky:scheduler:open_now:"     # + date (sent market-open)
 CLOSE_MSG_KEY = "stockky:scheduler:close_msg:"   # + date (sent close summary)
@@ -58,19 +56,9 @@ LAST_SCAN_KEY = "stockky:scheduler:last_scan_timestamp"   # written by scheduler
 
 # NSE holidays 2026 (static; can be extended or fetched from API)
 HOLIDAYS_2026 = [
-    "2026-01-26",  # Republic Day
-    "2026-03-02",  # Holi
-    "2026-03-31",  # Eid ul-Fitr
-    "2026-04-02",  # Ram Navami
-    "2026-04-10",  # Good Friday
-    "2026-04-14",  # Dr. Ambedkar Jayanti
-    "2026-05-01",  # Maharashtra Day / Labour Day
-    "2026-08-15",  # Independence Day
-    "2026-10-02",  # Gandhi Jayanti
-    "2026-10-22",  # Dussehra
-    "2026-11-14",  # Diwali
-    "2026-11-15",  # Diwali (Balipratipada)
-    "2026-12-25",  # Christmas
+    "2026-01-26", "2026-03-02", "2026-03-31", "2026-04-02",
+    "2026-04-10", "2026-04-14", "2026-05-01", "2026-08-15",
+    "2026-10-02", "2026-10-22", "2026-11-14", "2026-11-15", "2026-12-25",
 ]
 
 _redis = Redis(
@@ -80,19 +68,17 @@ _redis = Redis(
 
 BUY_FAMILY = {"BUY NOW", "PREPARE TO BUY", "HOLD"}
 
-# Default interval (should match scheduler service)
-SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
+# Now scans run every hour (60 minutes)
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
 # Timeout for the full scan – 30 minutes (1800 seconds)
 SCAN_TIMEOUT_SECONDS = int(os.getenv("SCAN_TIMEOUT_SECONDS", "1800"))
 
 
 def is_holiday(today: datetime) -> bool:
     date_str = today.strftime("%Y-%m-%d")
-    if today.weekday() >= 5:  # weekend
+    if today.weekday() >= 5:
         return True
-    if date_str in HOLIDAYS_2026:
-        return True
-    return False
+    return date_str in HOLIDAYS_2026
 
 
 def _notify(title: str, message: str, channel: str = "telegram"):
@@ -163,11 +149,6 @@ def run_event_check():
 
 
 def run_scan_and_diff(timeout: int = SCAN_TIMEOUT_SECONDS) -> Dict[str, Any]:
-    """
-    Fetch scan results, notify on decision changes, and return the scan result.
-    The timeout is set to SCAN_TIMEOUT_SECONDS (default 1800s = 30 min) to allow
-    the entire pipeline to complete.
-    """
     try:
         resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=timeout)
         resp.raise_for_status()
@@ -230,7 +211,18 @@ def get_daily_picks(date_str: str) -> List[Dict]:
 
 
 def send_market_open_announcement():
-    _notify("\U0001F55B Market opens in 1 hour", "The market will open at 09:15 IST. Get ready!")
+    """Send 'Market opens in 1 hour' along with the top picks from the previous day."""
+    # Get previous day's picks
+    yesterday = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
+    picks = get_daily_picks(yesterday)
+
+    if picks:
+        picks_msg = format_stock_picks(picks)
+        msg = f"The market will open at 09:15 IST. Get ready!\n\n{picks_msg}"
+    else:
+        msg = "The market will open at 09:15 IST. Get ready!"
+
+    _notify("\U0001F55B Market opens in 1 hour", msg)
 
 
 def send_market_open_now():
@@ -307,29 +299,33 @@ def main():
 
     sync_event_subscriptions()
 
-    # Timed notifications
+    # Timed notifications (each once per day, de‑duplicated by Redis)
+    # 08:15 – Market opens in 1 hour + previous day's picks
     if time_now == OPEN_ANNOUNCE_TIME:
         if not _redis.get(OPEN_MSG_KEY + today_str):
             send_market_open_announcement()
             _redis.set(OPEN_MSG_KEY + today_str, "1", ex=86400)
 
+    # 09:15 – Market open
     if time_now == MARKET_OPEN:
         if not _redis.get(OPEN_NOW_KEY + today_str):
             send_market_open_now()
             _redis.set(OPEN_NOW_KEY + today_str, "1", ex=86400)
 
+    # 15:30 – Close summary
     if time_now == CLOSE_SUMMARY_TIME:
         if not _redis.get(CLOSE_MSG_KEY + today_str):
             send_close_summary(today_str)
             _redis.set(CLOSE_MSG_KEY + today_str, "1", ex=86400)
 
+    # 16:30 – Sleep
     if time_now == SLEEP_TIME:
         if not _redis.get(SLEEP_MSG_KEY + today_str):
             send_sleep_message()
             _redis.set(SLEEP_MSG_KEY + today_str, "1", ex=86400)
 
     # Regular scan – runs at ANY minute within the scan window,
-    # but only if the scheduler hasn't scanned recently.
+    # but only if the scheduler hasn't scanned recently (within 60 min).
     if SCAN_START <= time_now <= SCAN_END:
         if should_skip_scan():
             logger.info("Skipping GitHub scan because scheduler service handled it.")
@@ -338,19 +334,15 @@ def main():
             scan_result = run_scan_and_diff()
 
             if scan_result:
-                # Scan succeeded – process recommendations and send updates
                 picks = scan_result.get("recommendations", [])
                 if picks:
                     store_daily_picks(today_str, picks)
                     send_scan_picks(picks)
                 else:
-                    # Successful scan, but no picks
                     send_scan_picks([])
 
-                # Only check events if scan was successful
                 run_event_check()
             else:
-                # Scan failed (timeout, connection error, etc.)
                 logger.error("Scan failed – no results available.")
                 _notify(
                     "⚠️ Scan Failed",
