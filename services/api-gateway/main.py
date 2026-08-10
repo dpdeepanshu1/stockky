@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.5 – robust fallback for /market/indices; market-sentiment optional.
+v2.5.6 – reduced parallel workers to 10, fewer retries, longer timeouts.
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.5")
+app = FastAPI(title="Stockky API Gateway", version="2.5.6")
 
 # --- CORS ---
 app.add_middleware(
@@ -105,9 +105,8 @@ IPO_CACHE_KEY       = "stockky:ipos:recent"
 KNOWN_SYMBOLS_KEY   = "stockky:known_symbols"
 SCAN_TASK_PREFIX    = "stockky:scan_task:"
 MARKET_MOVERS_CACHE_PREFIX = "stockky:market_movers:"
-INDICES_CACHE_KEY   = "stockky:indices"          # NEW for indices caching
+INDICES_CACHE_KEY   = "stockky:indices"
 
-# Cache keys for fundamental and events
 FUNDAMENTAL_CACHE_PREFIX = "stockky:fundamental:"
 EVENT_CACHE_PREFIX = "stockky:event:"
 
@@ -162,7 +161,7 @@ def _add_searched(symbol: str):
         searched.append(sym)
         _redis_set(SEARCHED_KEY, searched[-200:])
 
-# ── Dynamic Universe Sources (unchanged) ──────────────────────────────────
+# ── Dynamic Universe Sources ──────────────────────────────────────────────────
 _nse_client = None
 
 def _get_nse_client() -> httpx.Client:
@@ -660,12 +659,12 @@ def _wake_notification_service() -> bool:
         return False
 
 # ============================================================================
-# ⚡ ULTRA-FAST PARALLEL SCAN with internal parallelism and caching
+# ⚡ PARALLEL SCAN with reduced workers and retries
 # ============================================================================
 
-MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "20"))
-MAX_RETRIES = 2
-RETRY_BACKOFF = 1.5
+MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "10"))   # Reduced from 20
+MAX_RETRIES = 1                                                           # Reduced from 2
+RETRY_BACKOFF = 1.0
 
 async def _analyze_one_symbol_ultra(
     symbol: str,
@@ -674,13 +673,13 @@ async def _analyze_one_symbol_ultra(
 ) -> dict:
     """
     Analyse one symbol with parallel internal calls and caching.
-    All timeouts increased to 60s for reliability.
+    Timeouts: decision 90s, others 60s.
     """
     async with sem:
         for attempt in range(MAX_RETRIES + 1):
             try:
                 # === 1. Fetch decision engine (primary) ===
-                decision_resp = await client.get(f"{DECISION_URL}/decide/{symbol}", timeout=60)
+                decision_resp = await client.get(f"{DECISION_URL}/decide/{symbol}", timeout=90)
                 decision_resp.raise_for_status()
                 raw = decision_resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
@@ -761,7 +760,7 @@ async def _analyze_one_symbol_ultra(
 async def run_scan_parallel(task_id: str, universe: List[str]):
     """
     Parallel scan with internal parallelisation per symbol.
-    Overall timeout increased to 180s.
+    Overall timeout increased to 240s.
     """
     start_time = time.time()
     total = len(universe)
@@ -780,7 +779,7 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
 
     sem = asyncio.Semaphore(MAX_PARALLEL_WORKERS)
     limits = httpx.Limits(max_keepalive_connections=200, max_connections=200)
-    async with httpx.AsyncClient(timeout=180, limits=limits) as client:
+    async with httpx.AsyncClient(timeout=240, limits=limits) as client:
         tasks = [
             _analyze_one_symbol_ultra(sym, client, sem)
             for sym in universe
@@ -911,7 +910,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.5",
+        "version": "2.5.6",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -949,12 +948,11 @@ def root():
 
 @app.get("/health")
 def health():
-    # Always return instantly – no blocking operations
     return {
         "status": "ok",
         "service": "api-gateway",
         "redis": bool(_redis),
-        "ready": True   # frontend expects this
+        "ready": True
     }
 
 @app.get("/ready")
@@ -963,11 +961,9 @@ def ready():
 
 @app.get("/system/health")
 async def system_health():
-    # Increase timeout for market-data to 15 seconds to avoid false negatives
     async def check(name: str, url: str, required: bool):
         if not url:
             return name, {"ok": False, "required": required, "status": "not_configured", "url": None}
-        # Longer timeout for market-data
         timeout = 15 if name == "market-data" else 10
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -1134,10 +1130,8 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Decision engine unreachable: {e}")
 
-# ── Legacy sync fallback helpers (kept for completeness) ──────────────────
+# ── Legacy sync fallback helpers ──────────────────────────────────────────
 def _merge_fundamentals(normalized: dict, symbol: str):
-    # This is the sync version used by /stock and legacy scan.
-    # We'll reuse the cached data if available.
     cache_key = f"{FUNDAMENTAL_CACHE_PREFIX}{symbol}"
     cached = _redis_get(cache_key)
     if cached and isinstance(cached, dict):
@@ -1148,7 +1142,6 @@ def _merge_fundamentals(normalized: dict, symbol: str):
             normalized["fundamental_fallback"] = fallback_used
             return
 
-    # Otherwise fetch synchronously
     try:
         resp = httpx.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=60)
         if resp.status_code == 200:
@@ -1504,13 +1497,11 @@ def get_market_indices():
     - If yfinance fails, return stale cache if available.
     - If no cache, return a sensible "market closed" fallback so the frontend never sees a 500.
     """
-    # First, try to serve from cache
     cached = _redis_get(INDICES_CACHE_KEY)
     if cached and isinstance(cached, dict):
         logger.info("Serving cached indices data")
         return cached
 
-    # If no cache, try to fetch fresh
     try:
         nifty = yf.Ticker("^NSEI")
         sensex = yf.Ticker("^BSESN")
@@ -1556,19 +1547,17 @@ def get_market_indices():
             "market_mood": mood,
             "market_score": round(market_score)
         }
-        _redis_set(INDICES_CACHE_KEY, result, ttl=300)  # 5 minutes
+        _redis_set(INDICES_CACHE_KEY, result, ttl=300)
         return result
 
     except Exception as e:
         logger.error(f"Error fetching indices: {e}")
-        # Check for stale cache again (in case it was set during the fetch attempt)
         stale = _redis_get(INDICES_CACHE_KEY)
         if stale and isinstance(stale, dict):
             logger.info("Returning stale cached indices data")
             stale["stale"] = True
             return stale
 
-        # No cache at all – return a fallback response so the frontend doesn't break
         logger.warning("No cache available, returning fallback indices data")
         fallback = {
             "nifty": {"price": 0, "change": 0, "change_pct": 0},
@@ -1578,7 +1567,6 @@ def get_market_indices():
             "stale": True,
             "fallback": True
         }
-        # Store this fallback for a short time to avoid repeated failures
         _redis_set(INDICES_CACHE_KEY, fallback, ttl=60)
         return fallback
 
@@ -1769,11 +1757,8 @@ async def training_other_proxy(path: str, request: Request):
 # ── Startup cache pre-population ──────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
-    """Pre-populate indices cache on startup to avoid first empty request."""
     try:
-        # Attempt to fetch indices and cache them
         logger.info("Pre-populating market indices cache on startup...")
-        # We'll just call the endpoint internally
         result = get_market_indices()
         logger.info("Market indices cache pre-populated successfully")
     except Exception as e:
