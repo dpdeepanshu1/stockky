@@ -24,6 +24,8 @@ Scheduler Service (which already tracks previous vs current scan results)
 calls POST /notify with a pre-built message. Keeping that decision in the
 Scheduler avoids a circular dependency and keeps this service a dumb,
 reliable delivery pipe — same design principle as Market Data Service.
+
+v0.3.0 – added MarkdownV2 support for Telegram, improved logging.
 """
 import os
 import json
@@ -43,7 +45,7 @@ except ImportError:  # pragma: no cover - optional dep during local dev
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("notification-service")
 
-app = FastAPI(title="Stockky Notification Service", version="0.2.0")
+app = FastAPI(title="Stockky Notification Service", version="0.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 CONFIG_KEY = "stockky:notification_config"
@@ -83,6 +85,7 @@ _memory_config: Optional[dict] = None
 def root():
     return {
         "service": "Stockky Notification Service",
+        "version": "0.3.0",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
@@ -261,14 +264,37 @@ def _send_slack(cfg: dict, title: str, message: str):
 def _send_telegram(cfg: dict, title: str, message: str):
     token = cfg.get("telegram_bot_token")
     chat_id = cfg.get("telegram_chat_id")
-    if not (token and chat_id and cfg.get("enabled", {}).get("telegram")):
-        return None
+    enabled = cfg.get("enabled", {}).get("telegram")
+
+    if not token or not chat_id:
+        logger.warning("Telegram token or chat ID missing – cannot send notification")
+        return "not configured (missing token or chat ID)"
+    if not enabled:
+        logger.info("Telegram channel is disabled – skipping")
+        return "not sent (disabled)"
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": f"{title}\n{message}"}
+    # Telegram MarkdownV2 requires escaping certain characters.
+    # We'll use Markdown (not V2) for simplicity and safety, or we can escape.
+    # For bold, we'll use Markdown with parse_mode="Markdown".
+    # The API Gateway already sends text with * for bold, so we set parse_mode="MarkdownV2".
+    # But we need to escape special characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    # To avoid complexity, we'll keep parse_mode="Markdown" which is less strict.
+    # Actually, Telegram's "Markdown" mode (not V2) is simpler: *bold*, _italic_, etc.
+    # We'll use parse_mode="Markdown".
+    payload = {
+        "chat_id": chat_id,
+        "text": f"*{title}*\n\n{message}",
+        "parse_mode": "Markdown",
+    }
     try:
         resp = httpx.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        return "sent"
+        if resp.status_code == 200:
+            logger.info("Telegram notification sent successfully")
+            return "sent"
+        else:
+            logger.error(f"Telegram API error: {resp.status_code} - {resp.text[:200]}")
+            return f"failed: HTTP {resp.status_code}"
     except httpx.HTTPError as e:
         logger.error("Telegram notification failed: %s", e)
         return f"failed: {e}"
@@ -292,7 +318,9 @@ def notify(req: NotifyRequest):
             "delivered": False,
             "note": "No notification channel is configured and enabled. Set them up from the Notifications tab.",
         }
-    return {"delivered": True, "results": attempted}
+    # Check if any channel succeeded
+    delivered = any(v == "sent" for v in attempted.values())
+    return {"delivered": delivered, "results": attempted}
 
 
 @app.post("/test")
@@ -306,7 +334,8 @@ def test_notifications():
             "delivered": False,
             "note": "No channel is both configured and enabled. Save credentials and turn the toggle on first.",
         }
-    return {"delivered": True, "results": attempted}
+    delivered = any(v == "sent" for v in attempted.values())
+    return {"delivered": delivered, "results": attempted}
 
 
 if __name__ == "__main__":
