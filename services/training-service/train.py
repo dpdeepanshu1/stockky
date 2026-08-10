@@ -127,6 +127,15 @@ DEFAULT_TRAINING_CONFIG = {
     }
 }
 
+# ---------- Lock file path (same as in app.py) ----------
+LOCK_FILE = 'training.lock'
+
+def check_lock_abort():
+    """If the lock file is missing, raise an exception to abort training."""
+    if not os.path.exists(LOCK_FILE):
+        logger.warning("Lock file missing – training aborted by user.")
+        raise RuntimeError("Training aborted – lock file removed.")
+
 # ---------- Helpers ----------
 def fetch_symbol_data(symbol, period="2y", max_retries=5):
     """Fetch OHLCV data with exponential backoff for rate limits."""
@@ -175,6 +184,8 @@ def build_multi_symbol_dataset(symbols, period="2y"):
         # Longer delay between symbols (3-5 seconds)
         delay = 3.0 + random.uniform(0, 2.0)
         time.sleep(delay)
+        # Check abort during data fetch
+        check_lock_abort()
     if not all_rows:
         raise ValueError("No data collected")
     full = pd.concat(all_rows, ignore_index=True)
@@ -211,6 +222,9 @@ def run_training_pipeline(
     np.random.seed(config['random_seed'])
     random.seed(config['random_seed'])
     os.makedirs(model_store_path, exist_ok=True)
+
+    # Check abort before heavy work
+    check_lock_abort()
 
     symbols = config['data']['symbols']
     logger.info(f"Fetching data for {len(symbols)} symbols...")
@@ -258,6 +272,9 @@ def run_training_pipeline(
     fold_reports = []
 
     for i, fold in enumerate(folds):
+        # Check lock before each fold – abort if missing
+        check_lock_abort()
+
         logger.info(f"\n--- Fold {i+1}/{len(folds)} ---")
         train_idx = list(range(fold.train_start, fold.train_end + 1))
         val_idx = list(range(fold.val_start, fold.val_end + 1))
@@ -310,6 +327,12 @@ def run_training_pipeline(
         del train_data, val_data, X_train, X_val, y_train, y_val, model
         gc.collect()
 
+        # Check lock after each fold as well
+        check_lock_abort()
+
+    # After folds, check lock before final training
+    check_lock_abort()
+
     all_preds = np.array(all_preds)
     all_actuals = np.array(all_actuals)
     all_strategy_returns = np.array(all_strategy_returns)
@@ -336,6 +359,9 @@ def run_training_pipeline(
         eval_metric='rmse'
     )
     final_model.fit(X_full_scaled, y_full)
+
+    # Check lock before saving model
+    check_lock_abort()
 
     model_version = None
     if HAS_MODEL_REGISTRY:
