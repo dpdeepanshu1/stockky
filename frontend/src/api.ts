@@ -227,7 +227,7 @@ export interface TrainingScore {
 }
 
 // ───────────────────────────────────────────────
-// Market Indices types
+// Market Indices types (updated with fetched_at & stale)
 // ───────────────────────────────────────────────
 
 export interface IndexData {
@@ -241,6 +241,8 @@ export interface MarketIndicesResponse {
   sensex: IndexData;
   market_mood: "BULLISH" | "BEARISH" | "NEUTRAL";
   market_score: number;
+  fetched_at?: string;   // ISO timestamp when data was fetched
+  stale?: boolean;       // true if data is from cache/stale
 }
 
 // ───────────────────────────────────────────────
@@ -358,8 +360,14 @@ export const api = {
   marketMostActive: () => request<MarketResponse>("/market/most-active", undefined, 2, 30000),
   marketTrending: () => request<MarketResponse>("/market/trending", undefined, 2, 30000),
 
-  // ── Market Indices ──
-  marketIndices: () => request<MarketIndicesResponse>("/market/indices", undefined, 2, 10000),
+  // ── Market Indices (accepts forceRefresh) ──
+  marketIndices: (forceRefresh = false) =>
+    request<MarketIndicesResponse>(
+      `/market/indices?force_refresh=${forceRefresh}`,
+      undefined,
+      2,
+      10000
+    ),
 
   getNotificationConfig: () => request<NotificationConfig>("/notifications/config", undefined, 2, 30000),
 

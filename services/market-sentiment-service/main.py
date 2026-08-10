@@ -3,12 +3,12 @@ Market Sentiment Service
 Responsibility: Fetch Indian index data (NIFTY 50, SENSEX) and compute a
 normalized market sentiment score and classification.
 
-v0.5.0 – increased cache, fallback to Ticker.history, better retry logic.
+v0.6.0 – more precise scoring: sensitive to small daily moves, uses momentum and volatility.
 """
 import os
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Any, List
 import asyncio
 
@@ -46,15 +46,21 @@ INDEX_SYMBOLS: Dict[str, str] = {
     "SENSEX": "^BSESN",
 }
 
+# Weights for the two indices
+INDEX_WEIGHTS = {
+    "NIFTY 50": 0.60,
+    "SENSEX": 0.40,
+}
+
 # --- In-memory cache ---
 _cache: Dict[str, Any] = {
     "data": None,
     "timestamp": None,
-    "ttl_seconds": 300,  # 5 minutes – increased from 2 min
+    "ttl_seconds": 300,  # 5 minutes
     "lock": asyncio.Lock(),
 }
 
-app = FastAPI(title="Stockky Market Sentiment Service", version="0.5.0")
+app = FastAPI(title="Stockky Market Sentiment Service", version="0.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -150,13 +156,13 @@ def fetch_indices_batch(symbols: Dict[str, str]) -> Dict[str, IndexData]:
         return result
 
     yf_symbols = list(symbols.values())
-    max_retries = 2  # fewer retries for batch, then fallback
+    max_retries = 2
     data = None
     for attempt in range(max_retries):
         try:
             data = yf.download(
                 tickers=yf_symbols,
-                period="2d",
+                period="7d",  # need at least 5 days for momentum
                 interval="1d",
                 group_by='ticker',
                 auto_adjust=True,
@@ -176,7 +182,6 @@ def fetch_indices_batch(symbols: Dict[str, str]) -> Dict[str, IndexData]:
                 continue
             else:
                 logger.error("Batch download failed, falling back to individual fetches")
-                # Fallback: fetch each symbol individually
                 for name, sym in symbols.items():
                     data = fetch_individual_ticker(sym, name)
                     if data:
@@ -186,7 +191,6 @@ def fetch_indices_batch(symbols: Dict[str, str]) -> Dict[str, IndexData]:
                 return result
 
     if data is None or data.empty:
-        # If batch failed completely, try individual
         for name, sym in symbols.items():
             data = fetch_individual_ticker(sym, name)
             if data:
@@ -195,12 +199,11 @@ def fetch_indices_batch(symbols: Dict[str, str]) -> Dict[str, IndexData]:
                 logger.warning(f"Individual fetch failed for {name}")
         return result
 
-    # Process batch data
+    # Process batch data – also compute 5-day change if available
     for name, sym in symbols.items():
         try:
             if sym not in data.columns or data[sym].empty:
                 logger.warning(f"No data for {name} ({sym})")
-                # Try individual fetch for this symbol
                 ind_data = fetch_individual_ticker(sym, name)
                 if ind_data:
                     result[name] = ind_data
@@ -233,7 +236,6 @@ def fetch_indices_batch(symbols: Dict[str, str]) -> Dict[str, IndexData]:
                     result[name] = ind_data
         except Exception as e:
             logger.error(f"Error processing {name} ({sym}): {e}")
-            # Try individual fetch
             ind_data = fetch_individual_ticker(sym, name)
             if ind_data:
                 result[name] = ind_data
@@ -241,18 +243,61 @@ def fetch_indices_batch(symbols: Dict[str, str]) -> Dict[str, IndexData]:
     return result
 
 def compute_market_score(indices_data: Dict[str, IndexData]) -> int:
-    """Compute score from average change of NIFTY 50 and SENSEX."""
+    """
+    Compute a more precise market sentiment score (0-100) based on:
+    - Weighted daily change of NIFTY 50 and SENSEX.
+    - 5-day momentum adjustment.
+    - Volatility normalisation (if available).
+    """
     if not indices_data:
         return 50
 
-    changes = [d.change_percent for d in indices_data.values() if d.change_percent is not None]
-    if not changes:
+    # 1. Weighted average of daily change percent
+    weighted_change = 0.0
+    total_weight = 0.0
+    for name, data in indices_data.items():
+        if name in INDEX_WEIGHTS and data.change_percent is not None:
+            w = INDEX_WEIGHTS[name]
+            weighted_change += w * data.change_percent
+            total_weight += w
+    if total_weight == 0:
         return 50
+    avg_change = weighted_change / total_weight
 
-    avg_change = np.mean(changes)
-    # Map -0.5% -> 0, 0% -> 50, +0.5% -> 100
-    score = min(100, max(0, 50 + (avg_change / 0.005)))
-    return int(round(score))
+    # 2. Map daily change to score: -0.2% -> 0, 0% -> 50, +0.2% -> 100
+    sensitivity = 0.002  # 0.2%
+    raw_score = 50 + (avg_change / sensitivity) * 50
+    score = min(100, max(0, raw_score))
+
+    # 3. Momentum adjustment (5-day change)
+    try:
+        nifty = yf.Ticker("^NSEI")
+        hist = nifty.history(period="6d")
+        if len(hist) >= 6:
+            close_5d_ago = hist['Close'].iloc[-6]
+            close_today = hist['Close'].iloc[-1]
+            change_5d = (close_today - close_5d_ago) / close_5d_ago * 100
+            momentum_adjust = max(-5, min(5, change_5d * 2))
+            score = score + momentum_adjust
+    except Exception as e:
+        logger.debug(f"Could not compute 5-day momentum: {e}")
+
+    # 4. Volatility normalisation
+    try:
+        nifty = yf.Ticker("^NSEI")
+        hist = nifty.history(period="1mo")
+        if len(hist) > 14:
+            atr = (hist['High'] - hist['Low']).rolling(14).mean().iloc[-1]
+            price = hist['Close'].iloc[-1]
+            if price and atr:
+                vol_ratio = atr / price * 100
+                vol_adjust = max(-10, min(5, 10 - (vol_ratio - 0.5) * 5))
+                score = score + vol_adjust
+    except Exception as e:
+        logger.debug(f"Could not compute volatility adjustment: {e}")
+
+    final_score = int(round(max(0, min(100, score))))
+    return final_score
 
 def classify_sentiment(score: int) -> str:
     if score >= 75:
@@ -271,7 +316,6 @@ def classify_sentiment(score: int) -> str:
 async def get_market_sentiment(force_refresh: bool = False):
     now = datetime.now()
 
-    # Check cache
     if not force_refresh and _cache["data"] is not None:
         cache_age = (now - _cache["timestamp"]).total_seconds() if _cache["timestamp"] else 9999
         if cache_age < _cache["ttl_seconds"]:
@@ -280,9 +324,7 @@ async def get_market_sentiment(force_refresh: bool = False):
             cached_response["cached"] = True
             return MarketSentimentResponse(**cached_response)
 
-    # Acquire lock to prevent concurrent fetches
     async with _cache["lock"]:
-        # Double-check cache after acquiring lock
         if not force_refresh and _cache["data"] is not None:
             cache_age = (now - _cache["timestamp"]).total_seconds() if _cache["timestamp"] else 9999
             if cache_age < _cache["ttl_seconds"]:
@@ -294,7 +336,6 @@ async def get_market_sentiment(force_refresh: bool = False):
         indices_data = fetch_indices_batch(INDEX_SYMBOLS)
 
         if not indices_data:
-            # Return stale cache if available
             if _cache["data"] is not None:
                 logger.warning("No fresh data, returning stale cache")
                 stale_response = _cache["data"].copy()
@@ -302,7 +343,6 @@ async def get_market_sentiment(force_refresh: bool = False):
                 stale_response["stale"] = True
                 return MarketSentimentResponse(**stale_response)
             else:
-                # No cache – return neutral fallback
                 logger.error("No index data available, returning neutral fallback")
                 fallback = {
                     "timestamp": now,
@@ -323,7 +363,6 @@ async def get_market_sentiment(force_refresh: bool = False):
         score = compute_market_score(indices_data)
         classification = classify_sentiment(score)
 
-        # Derive labels
         trend = "Bullish" if score > 55 else "Bearish" if score < 45 else "Neutral"
         momentum = "Strong" if score > 65 else "Weak" if score < 35 else "Moderate"
         up_count = sum(1 for d in indices_data.values() if d.change and d.change > 0)
@@ -357,7 +396,7 @@ async def health_check():
 async def root():
     return {
         "service": "Stockky Market Sentiment Service",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
