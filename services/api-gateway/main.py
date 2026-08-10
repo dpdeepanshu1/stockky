@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.11 – moderated sensitivity for /market/indices (±0.3% → 0–100).
+v2.5.11 – moderated sensitivity for /market/indices (±0.3% → 0–100), always includes fetched_at.
 """
 import os
 import json
@@ -1489,18 +1489,19 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
-# ── IMPROVED /market/indices with moderated scoring and fetched_at ──────────
+# ── MODERATED /market/indices with sensitivity 0.3% ──────────────────────────
 @app.get("/market/indices")
 def get_market_indices(force_refresh: bool = False):
     """
     Fetch real-time NIFTY 50 and SENSEX index values with a moderated market score.
     - Uses mapping: -0.3% -> 0, 0% -> 50, +0.3% -> 100.
-    - Returns fetched_at timestamp.
+    - Always returns fetched_at.
     - Stores last known values in Redis.
     """
     if not force_refresh:
         cached = _redis_get(INDICES_CACHE_KEY)
         if cached and isinstance(cached, dict):
+            # Ensure fetched_at exists
             if "fetched_at" not in cached:
                 cached["fetched_at"] = cached.get("timestamp", datetime.now().isoformat())
             return cached
@@ -1525,13 +1526,12 @@ def get_market_indices(force_refresh: bool = False):
         sensex_change = sensex_close - sensex_prev_close
         sensex_change_pct = (sensex_change / sensex_prev_close) * 100
 
-        # Moderated score mapping: -0.3% -> 0, 0% -> 50, +0.3% -> 100
+        # Moderated: -0.3% -> 0, 0% -> 50, +0.3% -> 100
         avg_change = (nifty_change_pct + sensex_change_pct) / 2
         sensitivity = 0.003  # 0.3%
         raw_score = 50 + (avg_change / sensitivity) * 50
         market_score = max(0, min(100, raw_score))
 
-        # Mood based on score
         if market_score >= 60:
             mood = "BULLISH"
         elif market_score <= 40:
