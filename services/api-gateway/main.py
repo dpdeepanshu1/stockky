@@ -2,11 +2,11 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.0 – massively speeds up scans by:
-- Caching fundamental & event data in Redis (6h TTL)
-- Parallelising service calls per symbol (asyncio.gather)
-- Increasing parallel workers to 30
-- Better timeout handling
+v2.5.1 – tuned for free‑tier Render performance:
+- Parallel workers: 20 (reduced from 30 to avoid timeouts)
+- Increased timeouts (60s per call, 180s total)
+- Added caching for /market/indices
+- Robust retry with exponential backoff
 """
 import os
 import json
@@ -58,7 +58,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.0")
+app = FastAPI(title="Stockky API Gateway", version="2.5.1")
 
 # --- CORS ---
 app.add_middleware(
@@ -109,8 +109,9 @@ IPO_CACHE_KEY       = "stockky:ipos:recent"
 KNOWN_SYMBOLS_KEY   = "stockky:known_symbols"
 SCAN_TASK_PREFIX    = "stockky:scan_task:"
 MARKET_MOVERS_CACHE_PREFIX = "stockky:market_movers:"
+INDICES_CACHE_KEY   = "stockky:indices"          # NEW for indices caching
 
-# New cache keys for fundamental and events
+# Cache keys for fundamental and events
 FUNDAMENTAL_CACHE_PREFIX = "stockky:fundamental:"
 EVENT_CACHE_PREFIX = "stockky:event:"
 
@@ -506,19 +507,17 @@ def _fetch_price_from_quote(symbol: str) -> Optional[float]:
     return None
 
 async def _fetch_fundamental_cached(symbol: str, client: httpx.AsyncClient) -> tuple[Optional[dict], bool]:
-    """Fetch fundamentals with Redis cache (6h TTL)."""
     cache_key = f"{FUNDAMENTAL_CACHE_PREFIX}{symbol}"
     cached = _redis_get(cache_key)
     if cached and isinstance(cached, dict):
         return cached.get("metrics"), cached.get("fallback", False)
 
     try:
-        resp = await client.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=15)
+        resp = await client.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=60)
         if resp.status_code == 200:
             data = resp.json()
             metrics = data.get("metrics")
             fallback_used = data.get("fallback_used", False)
-            # Cache even if metrics are None (to avoid repeated failed calls)
             _redis_set(cache_key, {"metrics": metrics, "fallback": fallback_used}, ttl=21600)
             return metrics, fallback_used
     except Exception as e:
@@ -526,14 +525,13 @@ async def _fetch_fundamental_cached(symbol: str, client: httpx.AsyncClient) -> t
     return {}, True
 
 async def _fetch_events_cached(symbol: str, client: httpx.AsyncClient) -> Optional[dict]:
-    """Fetch events with Redis cache (6h TTL)."""
     cache_key = f"{EVENT_CACHE_PREFIX}{symbol}"
     cached = _redis_get(cache_key)
     if cached and isinstance(cached, dict):
         return cached
 
     try:
-        resp = await client.get(f"{EVENT_URL}/events/{symbol}", timeout=15)
+        resp = await client.get(f"{EVENT_URL}/events/{symbol}", timeout=60)
         if resp.status_code == 200:
             data = resp.json()
             if data and isinstance(data, dict):
@@ -545,7 +543,7 @@ async def _fetch_events_cached(symbol: str, client: httpx.AsyncClient) -> Option
 
 async def _fetch_news_cached(symbol: str, client: httpx.AsyncClient) -> Optional[dict]:
     try:
-        resp = await client.get(f"{NEWS_URL}/analyze/{symbol}", timeout=10)
+        resp = await client.get(f"{NEWS_URL}/analyze/{symbol}", timeout=30)
         if resp.status_code == 200:
             data = resp.json()
             if data and isinstance(data, dict):
@@ -556,7 +554,7 @@ async def _fetch_news_cached(symbol: str, client: httpx.AsyncClient) -> Optional
 
 async def _fetch_prediction_cached(symbol: str, client: httpx.AsyncClient) -> tuple[Optional[float], Optional[str]]:
     try:
-        resp = await client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=15)
+        resp = await client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=60)
         if resp.status_code == 200:
             data = resp.json()
             if data.get("model_loaded"):
@@ -669,7 +667,7 @@ def _wake_notification_service() -> bool:
 # ⚡ ULTRA-FAST PARALLEL SCAN with internal parallelism and caching
 # ============================================================================
 
-MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "30"))
+MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "20"))  # reduced from 30
 MAX_RETRIES = 2
 RETRY_BACKOFF = 1.5
 
@@ -680,12 +678,13 @@ async def _analyze_one_symbol_ultra(
 ) -> dict:
     """
     Analyse one symbol with parallel internal calls and caching.
+    All timeouts increased to 60s for reliability.
     """
     async with sem:
         for attempt in range(MAX_RETRIES + 1):
             try:
                 # === 1. Fetch decision engine (primary) ===
-                decision_resp = await client.get(f"{DECISION_URL}/decide/{symbol}", timeout=45)
+                decision_resp = await client.get(f"{DECISION_URL}/decide/{symbol}", timeout=60)
                 decision_resp.raise_for_status()
                 raw = decision_resp.json()
                 normalized = _normalize_decision_response(raw, symbol)
@@ -715,7 +714,6 @@ async def _analyze_one_symbol_ultra(
                 if fund_metrics:
                     normalized["fundamental_metrics"] = fund_metrics
                     normalized["fundamental_fallback"] = fund_fallback
-                    # Also set fundamental_score from decision engine if present, but we keep as is
 
                 if event_data and event_data.get("next_earnings_date"):
                     normalized["event_risk"] = True
@@ -767,6 +765,7 @@ async def _analyze_one_symbol_ultra(
 async def run_scan_parallel(task_id: str, universe: List[str]):
     """
     Parallel scan with internal parallelisation per symbol.
+    Overall timeout increased to 180s.
     """
     start_time = time.time()
     total = len(universe)
@@ -785,7 +784,7 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
 
     sem = asyncio.Semaphore(MAX_PARALLEL_WORKERS)
     limits = httpx.Limits(max_keepalive_connections=200, max_connections=200)
-    async with httpx.AsyncClient(timeout=150, limits=limits) as client:
+    async with httpx.AsyncClient(timeout=180, limits=limits) as client:
         tasks = [
             _analyze_one_symbol_ultra(sym, client, sem)
             for sym in universe
@@ -916,7 +915,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.0",
+        "version": "2.5.1",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -938,7 +937,7 @@ def root():
             "/market/top-losers": "GET – top 10 losers",
             "/market/most-active": "GET – top 10 most active by volume",
             "/market/trending": "GET – trending stocks (momentum + news)",
-            "/market/indices": "GET – live NIFTY 50 & SENSEX points",
+            "/market/indices": "GET – live NIFTY 50 & SENSEX points (cached)",
             "/notifications/health": "GET – notification service health",
             "/notifications/config": "GET/POST – get/update notification config",
             "/notifications/config/{channel}": "DELETE – clear a channel",
@@ -1094,7 +1093,10 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
                 if result.get("resistance") is None:
                     result["resistance"] = round(price * 1.05, 2)
 
-        _merge_fundamentals(result, symbol_to_use)
+        # Use synchronous fallbacks (calls async? We keep sync for simplicity)
+        # We'll call the async versions but we're in sync context – keep old approach.
+        # This route is not part of the parallel scan, so it's fine to keep sync.
+        _merge_fundamentals(result, symbol_to_use)  # this is sync
 
         if result.get("news_score") is None:
             news = _fetch_news(symbol_to_use)
@@ -1140,6 +1142,60 @@ def get_stock_decision(symbol: str, already_owned: bool = False):
             raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Decision engine unreachable: {e}")
+
+# ── Legacy sync fallback helpers (kept for completeness) ──────────────────
+def _merge_fundamentals(normalized: dict, symbol: str):
+    # This is the sync version used by /stock and legacy scan.
+    # We'll reuse the cached data if available.
+    cache_key = f"{FUNDAMENTAL_CACHE_PREFIX}{symbol}"
+    cached = _redis_get(cache_key)
+    if cached and isinstance(cached, dict):
+        metrics = cached.get("metrics")
+        fallback_used = cached.get("fallback", False)
+        if metrics:
+            normalized["fundamental_metrics"] = metrics
+            normalized["fundamental_fallback"] = fallback_used
+            return
+
+    # Otherwise fetch synchronously
+    try:
+        resp = httpx.get(f"{FUNDAMENTAL_URL}/analyze/{symbol}", timeout=60)
+        if resp.status_code == 200:
+            data = resp.json()
+            metrics = data.get("metrics")
+            fallback_used = data.get("fallback_used", False)
+            _redis_set(cache_key, {"metrics": metrics, "fallback": fallback_used}, ttl=21600)
+            normalized["fundamental_metrics"] = metrics if metrics else {}
+            normalized["fundamental_fallback"] = fallback_used
+    except Exception as e:
+        logger.warning(f"Fundamental fetch failed for {symbol}: {e}")
+
+def _fetch_news(symbol: str) -> Optional[dict]:
+    try:
+        resp = httpx.get(f"{NEWS_URL}/analyze/{symbol}", timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and isinstance(data, dict):
+                return data
+    except Exception as e:
+        logger.warning(f"News fetch failed for {symbol}: {e}")
+    return None
+
+def _fetch_events(symbol: str) -> Optional[dict]:
+    cache_key = f"{EVENT_CACHE_PREFIX}{symbol}"
+    cached = _redis_get(cache_key)
+    if cached and isinstance(cached, dict):
+        return cached
+    try:
+        resp = httpx.get(f"{EVENT_URL}/events/{symbol}", timeout=60)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and isinstance(data, dict):
+                _redis_set(cache_key, data, ttl=21600)
+                return data
+    except Exception as e:
+        logger.warning(f"Events fetch failed for {symbol}: {e}")
+    return None
 
 # ── Legacy synchronous scan ──────────────────────────────────────────────────
 @app.get("/scan")
@@ -1192,7 +1248,7 @@ def run_scan(force_refresh: bool = False):
 
                 if normalized.get("prediction_score") is None:
                     try:
-                        pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=25)
+                        pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=60)
                         if pred_resp.status_code == 200:
                             pred_data = pred_resp.json()
                             if pred_data.get("model_loaded"):
@@ -1312,7 +1368,7 @@ def scan_watchlist():
     results = []
     errors = []
 
-    with httpx.Client(timeout=120) as client:
+    with httpx.Client(timeout=180) as client:
         for symbol in watchlist:
             try:
                 resp = client.get(f"{DECISION_URL}/decide/{symbol}")
@@ -1350,7 +1406,7 @@ def scan_watchlist():
 
                 if normalized.get("prediction_score") is None:
                     try:
-                        pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=25)
+                        pred_resp = client.get(f"{PREDICTION_URL}/predict/{symbol}", timeout=60)
                         if pred_resp.status_code == 200:
                             pred_data = pred_resp.json()
                             if pred_data.get("model_loaded"):
@@ -1448,8 +1504,18 @@ def market_trending():
             pass
     return {"data": trending_data, "count": len(trending_data)}
 
+# ── Market Indices endpoint with caching ──────────────────────────────────
 @app.get("/market/indices")
 def get_market_indices():
+    """
+    Fetch real-time NIFTY 50 and SENSEX index values with point changes.
+    Cached for 5 minutes to avoid rate limits.
+    """
+    cached = _redis_get(INDICES_CACHE_KEY)
+    if cached and isinstance(cached, dict):
+        logger.info("Serving cached indices data")
+        return cached
+
     try:
         nifty = yf.Ticker("^NSEI")
         sensex = yf.Ticker("^BSESN")
@@ -1481,7 +1547,7 @@ def get_market_indices():
         market_score = 50 + (avg_change_pct * 10)
         market_score = max(0, min(100, market_score))
 
-        return {
+        result = {
             "nifty": {
                 "price": round(nifty_close, 2),
                 "change": round(nifty_change, 2),
@@ -1495,6 +1561,8 @@ def get_market_indices():
             "market_mood": mood,
             "market_score": round(market_score)
         }
+        _redis_set(INDICES_CACHE_KEY, result, ttl=300)  # 5 minutes
+        return result
     except Exception as e:
         logger.error(f"Error fetching indices: {e}")
         raise HTTPException(status_code=500, detail=str(e))
