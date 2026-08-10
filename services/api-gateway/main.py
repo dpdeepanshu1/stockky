@@ -2,7 +2,7 @@
 API Gateway
 ------------
 Single entry point for the React frontend.
-v2.5.3 – adds stale cache fallback for /market/indices to avoid 500s on rate limit.
+v2.5.4 – increased health check timeout for market-data to 15 seconds.
 """
 import os
 import json
@@ -54,7 +54,7 @@ SYSTEM_SERVICES = {
     "training": {"url": TRAINING_URL, "required": False},
 }
 
-app = FastAPI(title="Stockky API Gateway", version="2.5.3")
+app = FastAPI(title="Stockky API Gateway", version="2.5.4")
 
 # --- CORS ---
 app.add_middleware(
@@ -911,7 +911,7 @@ class NotificationChannelUpdate(BaseModel):
 def root():
     return {
         "service": "Stockky API Gateway",
-        "version": "2.5.3",
+        "version": "2.5.4",
         "status": "running",
         "parallel_workers": MAX_PARALLEL_WORKERS,
         "endpoints": {
@@ -963,12 +963,14 @@ def ready():
 
 @app.get("/system/health")
 async def system_health():
-    # Reduce timeout to 10 seconds per service to avoid hanging
+    # Increase timeout for market-data to 15 seconds to avoid false negatives
     async def check(name: str, url: str, required: bool):
         if not url:
             return name, {"ok": False, "required": required, "status": "not_configured", "url": None}
+        # Longer timeout for market-data
+        timeout = 15 if name == "market-data" else 10
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.get(f"{url.rstrip('/')}/health")
             if resp.status_code == 200:
                 return name, {"ok": True, "required": required, "status": "up", "url": url}

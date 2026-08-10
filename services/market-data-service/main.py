@@ -6,6 +6,8 @@ for Indian equities from free public sources (yfinance) and serve over REST.
 All data is cached with TTL that depends on market hours:
 - During NSE trading hours (09:15-15:30 IST, Mon-Fri): TTL = 300 seconds (5 min)
 - Outside: TTL = 21600 seconds (6 hours)
+
+v2.2 – reduced retries and timeouts for faster responses.
 """
 import os
 import time
@@ -71,7 +73,8 @@ def _compute_growth(current, previous):
         return None
     return ((current - previous) / previous) * 100
 
-def _with_retry(func, max_retries=5, base_delay=3):
+def _with_retry(func, max_retries=2, base_delay=0.5):
+    """Retry with exponential backoff – reduced retries for speed."""
     for attempt in range(max_retries):
         try:
             return func()
@@ -102,7 +105,7 @@ ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 
-app = FastAPI(title="Stockky Market Data Service", version="0.2.0")
+app = FastAPI(title="Stockky Market Data Service", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -181,7 +184,7 @@ class QuoteResponse(BaseModel):
 async def root():
     return {
         "service": "Stockky Market Data Service",
-        "version": "0.2.0",
+        "version": "2.2.0",
         "status": "running",
         "cache_enabled": bool(cache),
         "endpoints": {
@@ -194,6 +197,7 @@ async def root():
 
 @app.get("/health")
 def health():
+    # Lightweight – returns instantly
     return {"status": "ok", "service": "market-data-service", "cache": bool(cache)}
 
 # ── NSE India Official API (Primary) ─────────────────────────────────────────
@@ -208,9 +212,9 @@ _nse_headers = {
 def _fetch_nse_quote(symbol: str) -> Optional[dict]:
     try:
         clean_sym = symbol.replace(".NS", "").replace(".BO", "")
-        with httpx.Client(headers=_nse_headers, timeout=15) as client:
+        with httpx.Client(headers=_nse_headers, timeout=10) as client:
             client.get("https://www.nseindia.com")
-            time.sleep(0.5)
+            time.sleep(0.3)
             url = f"https://www.nseindia.com/api/quote-equity?symbol={clean_sym}"
             resp = client.get(url)
             if resp.status_code == 200:
@@ -224,7 +228,7 @@ def _fetch_nse_quote(symbol: str) -> Optional[dict]:
 def _fetch_nse_fundamentals(symbol: str) -> Optional[dict]:
     try:
         clean_sym = symbol.replace(".NS", "").replace(".BO", "")
-        with httpx.Client(headers=_nse_headers, timeout=15) as client:
+        with httpx.Client(headers=_nse_headers, timeout=10) as client:
             client.get("https://www.nseindia.com")
             url = f"https://www.nseindia.com/api/quote-equity?symbol={clean_sym}&section=secinfo"
             resp = client.get(url)
@@ -290,7 +294,7 @@ def get_quote(symbol: str):
         for alpha_sym in possible_symbols:
             try:
                 alpha_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={alpha_sym}&apikey={ALPHA_VANTAGE_API_KEY}"
-                alpha_resp = httpx.get(alpha_url, timeout=10)
+                alpha_resp = httpx.get(alpha_url, timeout=8)
                 if alpha_resp.status_code == 200:
                     alpha_data = alpha_resp.json()
                     quote = alpha_data.get("Global Quote", {})
@@ -307,7 +311,7 @@ def get_quote(symbol: str):
         try:
             clean_sym = sym.replace(".NS", "").replace(".BO", "")
             url = f"https://api.twelvedata.com/price?symbol={clean_sym}&apikey={TWELVE_DATA_API_KEY}"
-            resp = httpx.get(url, timeout=10)
+            resp = httpx.get(url, timeout=8)
             if resp.status_code == 200:
                 data = resp.json()
                 price = _safe(data.get("price"))
@@ -321,7 +325,7 @@ def get_quote(symbol: str):
         try:
             clean_sym = sym.replace(".NS", "").replace(".BO", "")
             url = f"https://api.polygon.io/v1/open-close/{clean_sym}/latest?apiKey={POLYGON_API_KEY}"
-            resp = httpx.get(url, timeout=10)
+            resp = httpx.get(url, timeout=8)
             if resp.status_code == 200:
                 data = resp.json()
                 price = _safe(data.get("close"))
@@ -336,35 +340,34 @@ def get_quote(symbol: str):
 
     # 6. yfinance final fallback
     if price is None:
-        ticker = yf.Ticker(sym)
-        ticker._tz = "Asia/Kolkata"
         try:
-            info = ticker.info
-        except Exception:
-            info = {}
+            ticker = yf.Ticker(sym)
+            ticker._tz = "Asia/Kolkata"
+            info = _with_retry(lambda: ticker.info, max_retries=2, base_delay=0.5)
+            if info:
+                price = info.get("regularMarketPrice") or info.get("last_price")
+                prev_close = info.get("previousClose")
+                change_pct = None
+                if price and prev_close:
+                    change_pct = round(((price - prev_close) / prev_close) * 100, 2)
 
-        if info:
-            price = info.get("regularMarketPrice") or info.get("last_price")
-            prev_close = info.get("previousClose")
-            change_pct = None
-            if price and prev_close:
-                change_pct = round(((price - prev_close) / prev_close) * 100, 2)
-
-            result = {
-                "symbol": sym,
-                "name": info.get("longName") or info.get("shortName") or sym,
-                "price": price,
-                "previous_close": prev_close,
-                "day_change_pct": change_pct,
-                "day_high": info.get("dayHigh"),
-                "day_low": info.get("dayLow"),
-                "volume": info.get("volume"),
-                "market_cap": info.get("marketCap"),
-                "pe_ratio": info.get("trailingPE"),
-                "fetched_at": datetime.utcnow().isoformat(),
-            }
-            _cache_set(cache_key, result)
-            return result
+                result = {
+                    "symbol": sym,
+                    "name": info.get("longName") or info.get("shortName") or sym,
+                    "price": price,
+                    "previous_close": prev_close,
+                    "day_change_pct": change_pct,
+                    "day_high": info.get("dayHigh"),
+                    "day_low": info.get("dayLow"),
+                    "volume": info.get("volume"),
+                    "market_cap": info.get("marketCap"),
+                    "pe_ratio": info.get("trailingPE"),
+                    "fetched_at": datetime.utcnow().isoformat(),
+                }
+                _cache_set(cache_key, result)
+                return result
+        except Exception as e:
+            logger.warning(f"yfinance quote failed for {sym}: {e}")
 
     # If we have a price from one of the APIs, build minimal response
     if price is not None:
@@ -419,8 +422,8 @@ def get_history(
         ticker._tz = "Asia/Kolkata"
         df = _with_retry(
             lambda: ticker.history(period=period, interval=interval, auto_adjust=True),
-            max_retries=4,
-            base_delay=2,
+            max_retries=2,
+            base_delay=0.5,
         )
         if df.empty:
             raise HTTPException(status_code=404, detail=f"No history found for {sym}")
@@ -466,7 +469,7 @@ def get_fundamentals_raw(symbol: str):
 
         info = {}
         try:
-            info = _with_retry(lambda: ticker.info, max_retries=5, base_delay=3)
+            info = _with_retry(lambda: ticker.info, max_retries=2, base_delay=0.5)
         except Exception as e:
             logger.warning(f"Could not fetch info for {sym}: {e}")
 
@@ -477,15 +480,15 @@ def get_fundamentals_raw(symbol: str):
         balance = None
         cashflow = None
         try:
-            financials = _with_retry(lambda: ticker.financials, max_retries=3, base_delay=2)
+            financials = _with_retry(lambda: ticker.financials, max_retries=2, base_delay=0.5)
         except Exception as e:
             logger.warning(f"Could not fetch financials for {sym}: {e}")
         try:
-            balance = _with_retry(lambda: ticker.balance_sheet, max_retries=3, base_delay=2)
+            balance = _with_retry(lambda: ticker.balance_sheet, max_retries=2, base_delay=0.5)
         except Exception as e:
             logger.warning(f"Could not fetch balance sheet for {sym}: {e}")
         try:
-            cashflow = _with_retry(lambda: ticker.cashflow, max_retries=3, base_delay=2)
+            cashflow = _with_retry(lambda: ticker.cashflow, max_retries=2, base_delay=0.5)
         except Exception as e:
             logger.warning(f"Could not fetch cashflow for {sym}: {e}")
 
