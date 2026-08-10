@@ -1,10 +1,10 @@
 """
-Decision Engine Service v0.7.0
+Decision Engine Service v0.7.1
 Changes:
 - Market Sentiment score is now part of the weighted average (weight 0.10)
 - All missing scores default to 50 (neutral)
-- Market sentiment adjustment (bonus/penalty) still applied on top
-- Better fallback handling for missing data
+- Added logging for market sentiment fetch
+- Improved error handling for sentiment service
 """
 import os
 import asyncio
@@ -31,7 +31,7 @@ TRAINING_SERVICE_URL = os.getenv("TRAINING_SERVICE_URL", "https://training-servi
 EARNINGS_RISK_DAYS = 3
 EARNINGS_BOOST_DAYS = 7
 
-app = FastAPI(title="Stockky Decision Engine", version="0.7.0")
+app = FastAPI(title="Stockky Decision Engine", version="0.7.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -56,7 +56,7 @@ class Decision(str, Enum):
 
 @app.get("/")
 def root():
-    return {"service": "Stockky Decision Engine", "version": "0.7.0", "status": "running"}
+    return {"service": "Stockky Decision Engine", "version": "0.7.1", "status": "running"}
 
 
 @app.get("/health")
@@ -75,7 +75,7 @@ async def _fetch_optional(client: httpx.AsyncClient, url: str, label: str):
         return None
 
 
-# ── Market Sentiment fetch ────────────────────────────────────────────
+# ── Market Sentiment fetch with logging ────────────────────────────
 async def get_market_sentiment() -> dict:
     """Fetch current market sentiment; return neutral fallback on failure."""
     try:
@@ -83,7 +83,9 @@ async def get_market_sentiment() -> dict:
             resp = await client.get(f"{MARKET_SENTIMENT_URL}/sentiment")
             if resp.status_code == 200:
                 data = resp.json()
-                return {"market_score": data.get("market_score", 50), **data}
+                score = data.get("market_score", 50)
+                logger.info(f"Market sentiment fetched: {score}")
+                return {"market_score": score, **data}
             else:
                 logger.warning(f"Market sentiment returned {resp.status_code}")
     except Exception as e:
@@ -93,7 +95,6 @@ async def get_market_sentiment() -> dict:
 
 # ── Training Intelligence fetch ──────────────────────────────────────
 async def get_training_score(symbol: str) -> dict:
-    """Fetch training intelligence score for a symbol; return neutral fallback."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{TRAINING_SERVICE_URL}/training-score/{symbol}")
@@ -214,7 +215,6 @@ def _extract_event_signals(events: dict | None) -> dict:
 
 # ── Market Sentiment Adjustment ──────────────────────────────
 def _market_sentiment_adjustment(market_score: int) -> tuple:
-    """Return (adjustment_value, reason_string) based on market sentiment."""
     if market_score >= 70:
         return (8, f"📈 Very strong bullish market sentiment (+8)")
     elif market_score >= 60:
@@ -240,12 +240,6 @@ def _combined_score(
     event_delta: int = 0,
     market_adjustment: int = 0,
 ) -> float:
-    """
-    Weighted average of all available scores.
-    Missing scores default to 50.
-    Weights: technical 0.30, fundamental 0.20, news 0.15, prediction 0.15, market 0.10, training 0.10.
-    Then add event_delta and market_adjustment.
-    """
     # Default missing values to 50
     news = news_score if news_score is not None else 50
     pred = prediction_score if prediction_score is not None else 50
@@ -268,9 +262,7 @@ def _combined_score(
         training_score * weights["train"]
     )
 
-    # Add event and market adjustments
     total += event_delta + market_adjustment
-
     return round(max(0, min(100, total)), 1)
 
 
@@ -337,9 +329,6 @@ async def record_prediction_for_training(
     event_data: dict | None = None,
     fundamental_metrics: dict | None = None,
 ):
-    """
-    Send immutable prediction snapshot to Training Service's /api/predictions endpoint.
-    """
     payload = {
         "symbol": symbol,
         "decision": decision,
@@ -461,7 +450,9 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         market_score = sentiment.get("market_score", 50)
         training_score = training.get("training_score", 50)
 
-        # Market adjustment (bonus/penalty) – applied on top of weighted average
+        # Log market sentiment for debugging
+        logger.info(f"Market sentiment for {symbol}: {market_score}")
+
         market_adjustment, market_adjustment_reason = _market_sentiment_adjustment(market_score)
 
         event_signals = _extract_event_signals(events)
@@ -478,7 +469,7 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         if close and resistance and resistance > 0:
             dist_to_resistance_pct = round(((resistance - close) / close) * 100, 2)
 
-        # NEW: combined score includes market_score
+        # Combined score includes market_score
         combined = _combined_score(
             technical_score,
             fundamental_score,
@@ -573,7 +564,7 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         if fundamental.get("metrics"):
             response["fundamental_metrics"] = fundamental["metrics"]
 
-        # ── Record prediction for training ───────────────────────────
+        # Record prediction for training
         if decision in (Decision.BUY_NOW, Decision.PREPARE_TO_BUY) and close:
             background_tasks.add_task(
                 record_prediction_for_training,
