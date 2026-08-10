@@ -27,7 +27,7 @@ from evaluate import (
     evaluate_t5 as _evaluate_t5_prediction,
     evaluate_pending_predictions,
 )
-from train import request_abort   # <-- Added
+from train import request_abort   # <-- Use the new abort function
 
 # Optional imports
 try:

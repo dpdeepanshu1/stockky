@@ -140,13 +140,14 @@ DEFAULT_TRAINING_CONFIG = {
 # ---------- Lock and progress files ----------
 LOCK_FILE = 'training.lock'
 PROGRESS_FILE = 'training_progress.json'
-_abort_flag = False   # global abort signal
+
+# Thread-safe abort event
+abort_event = threading.Event()
 
 def request_abort():
-    """Set the global abort flag to True. Called by the API to stop training."""
-    global _abort_flag
-    logger.info("request_abort() called – setting _abort_flag = True")
-    _abort_flag = True
+    """Set the abort event. Called by the API to stop training."""
+    logger.info("request_abort() called – setting abort_event")
+    abort_event.set()
     # Optionally remove the lock file to release the lock for future runs
     if os.path.exists(LOCK_FILE):
         try:
@@ -170,23 +171,20 @@ def write_progress(current_fold, total_folds, elapsed_seconds=None):
         pass
 
 def lock_checker():
-    """Background thread that checks the lock file and sets abort flag if missing."""
-    global _abort_flag
-    while not _abort_flag:
+    """Background thread that checks the lock file and sets abort event if missing."""
+    while not abort_event.is_set():
         time.sleep(2.0)  # Check every 2 seconds
         if not os.path.exists(LOCK_FILE):
             logger.warning("Lock file missing – aborting training.")
-            _abort_flag = True
+            abort_event.set()
             break
 
 def check_abort():
-    """Check if abort flag is set or lock file is missing; raise KeyboardInterrupt."""
-    global _abort_flag
-    if _abort_flag:
-        logger.info("check_abort() raising KeyboardInterrupt because _abort_flag is True")
+    """Check if abort event is set or lock file is missing; raise KeyboardInterrupt."""
+    if abort_event.is_set():
+        logger.info("check_abort() raising KeyboardInterrupt because abort_event is set")
         raise KeyboardInterrupt("Training aborted by user.")
     if not os.path.exists(LOCK_FILE):
-        # If lock file is missing, raise immediately
         logger.warning("check_abort() raising KeyboardInterrupt because lock file is missing")
         raise KeyboardInterrupt("Lock file removed – training aborted.")
 
@@ -272,14 +270,13 @@ def run_training_pipeline(
     db_session: Optional[Session] = None,
     model_store_path: str = "./model-store",
 ) -> Dict[str, Any]:
-    global _abort_flag
     np.random.seed(config['random_seed'])
     random.seed(config['random_seed'])
     os.makedirs(model_store_path, exist_ok=True)
 
-    # Reset abort flag at start
-    _abort_flag = False
-    logger.info("run_training_pipeline started, _abort_flag reset to False")
+    # Ensure abort event is cleared at start
+    abort_event.clear()
+    logger.info("run_training_pipeline started, abort_event cleared")
 
     # Start the lock‑checking thread
     checker_thread = threading.Thread(target=lock_checker, daemon=True)
@@ -489,8 +486,8 @@ def run_training_pipeline(
         logger.error(f"Training pipeline error: {e}")
         raise
     finally:
-        # Stop the checker thread
-        _abort_flag = True
+        # Signal the checker thread to stop
+        abort_event.set()
         # Clean up progress file
         try:
             if os.path.exists(PROGRESS_FILE):
