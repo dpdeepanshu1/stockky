@@ -17,7 +17,10 @@ import joblib
 import gc
 import time
 import random
+import threading
+import signal
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional
 
 # Import our modules
@@ -66,6 +69,13 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("training-service")
+
+# ---------- IST timezone helper ----------
+IST = ZoneInfo("Asia/Kolkata")
+
+def ist_now() -> datetime:
+    """Return current time as a naive datetime in IST (UTC+5:30)."""
+    return datetime.now(IST).replace(tzinfo=None)
 
 # ---------- Numpy conversion helper ----------
 def convert_numpy(obj):
@@ -127,14 +137,52 @@ DEFAULT_TRAINING_CONFIG = {
     }
 }
 
-# ---------- Lock file path (same as in app.py) ----------
+# ---------- Lock and progress files ----------
 LOCK_FILE = 'training.lock'
+PROGRESS_FILE = 'training_progress.json'
+_abort_flag = False
 
-def check_lock_abort():
-    """If the lock file is missing, raise an exception to abort training."""
+def write_progress(current_fold, total_folds, elapsed_seconds=None):
+    """Write current progress to a JSON file."""
+    data = {
+        'current_fold': current_fold,
+        'total_folds': total_folds,
+        'timestamp': time.time(),
+        'elapsed': elapsed_seconds
+    }
+    try:
+        with open(PROGRESS_FILE, 'w') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def lock_checker():
+    """Background thread that checks the lock file and raises KeyboardInterrupt if missing."""
+    global _abort_flag
+    while not _abort_flag:
+        time.sleep(2.0)  # Check every 2 seconds
+        if not os.path.exists(LOCK_FILE):
+            logger.warning("Lock file missing – aborting training immediately.")
+            # Raise an exception in the main thread
+            import threading
+            main_thread = threading.main_thread()
+            if main_thread.is_alive():
+                # Use signal to interrupt the main thread if possible
+                try:
+                    signal.raise_signal(signal.SIGINT)  # Sends KeyboardInterrupt
+                except Exception:
+                    # Fallback: set a flag and check it inside the loop
+                    _abort_flag = True
+                    break
+
+def check_abort():
+    """Check if abort flag is set; raise KeyboardInterrupt."""
+    global _abort_flag
+    if _abort_flag:
+        raise KeyboardInterrupt("Training aborted by user.")
     if not os.path.exists(LOCK_FILE):
-        logger.warning("Lock file missing – training aborted by user.")
-        raise RuntimeError("Training aborted – lock file removed.")
+        # If lock file is missing, raise immediately
+        raise KeyboardInterrupt("Lock file removed – training aborted.")
 
 # ---------- Helpers ----------
 def fetch_symbol_data(symbol, period="2y", max_retries=5):
@@ -165,6 +213,7 @@ def build_multi_symbol_dataset(symbols, period="2y"):
     total = len(symbols)
     for idx, sym in enumerate(symbols):
         logger.info(f"Fetching {sym} ({idx+1}/{total})...")
+        check_abort()
         df = fetch_symbol_data(sym, period)
         if df.empty:
             logger.warning(f"No data for {sym}")
@@ -184,8 +233,6 @@ def build_multi_symbol_dataset(symbols, period="2y"):
         # Longer delay between symbols (3-5 seconds)
         delay = 3.0 + random.uniform(0, 2.0)
         time.sleep(delay)
-        # Check abort during data fetch
-        check_lock_abort()
     if not all_rows:
         raise ValueError("No data collected")
     full = pd.concat(all_rows, ignore_index=True)
@@ -198,7 +245,7 @@ def save_training_run_to_db(session, config, metrics, fold_details, model_versio
         return
     try:
         run = db_models.TrainingRun(
-            run_timestamp=datetime.now(),
+            run_timestamp=ist_now(),
             config=json.dumps(convert_numpy(config)),
             dataset_size=dataset_size,
             num_symbols=num_symbols,
@@ -223,186 +270,223 @@ def run_training_pipeline(
     random.seed(config['random_seed'])
     os.makedirs(model_store_path, exist_ok=True)
 
-    # Check abort before heavy work
-    check_lock_abort()
+    # Start the lock‑checking thread
+    checker_thread = threading.Thread(target=lock_checker, daemon=True)
+    checker_thread.start()
 
-    symbols = config['data']['symbols']
-    logger.info(f"Fetching data for {len(symbols)} symbols...")
-    df = build_multi_symbol_dataset(symbols, period=config['data']['period'])
-    logger.info(f"Total dataset shape: {df.shape}")
+    try:
+        # Check abort before heavy work
+        check_abort()
 
-    feature_cols = FEATURE_COLUMNS
-    target_gen = TargetGenerator(
-        target_type=config['target_type'],
-        forecast_horizon=config['forecast_horizon_days'],
-        price_col='close'
-    )
+        symbols = config['data']['symbols']
+        logger.info(f"Fetching data for {len(symbols)} symbols...")
+        df = build_multi_symbol_dataset(symbols, period=config['data']['period'])
+        logger.info(f"Total dataset shape: {df.shape}")
 
-    def apply_targets(group):
-        t, g = target_gen.generate(group, inplace=False)
-        group['target'] = t
-        group['pct_return'] = g['pct_return']
-        group['log_return'] = g['log_return']
-        return group
+        feature_cols = FEATURE_COLUMNS
+        target_gen = TargetGenerator(
+            target_type=config['target_type'],
+            forecast_horizon=config['forecast_horizon_days'],
+            price_col='close'
+        )
 
-    df = df.groupby('symbol', group_keys=False).apply(apply_targets)
-    df = df.dropna(subset=['target'])
-    logger.info(f"After target generation: {df.shape}")
+        def apply_targets(group):
+            t, g = target_gen.generate(group, inplace=False)
+            group['target'] = t
+            group['pct_return'] = g['pct_return']
+            group['log_return'] = g['log_return']
+            return group
 
-    vc = config['validation_strategy']
-    splitter = WalkForwardSplitter(
-        train_window=vc['train_window_size'],
-        val_window=vc['validation_window_size'],
-        step_size=vc.get('step_size', vc['validation_window_size']),
-        embargo_days=vc.get('embargo_days', config['forecast_horizon_days']),
-        forecast_horizon=config['forecast_horizon_days'],
-        method=vc['method']
-    )
+        df = df.groupby('symbol', group_keys=False).apply(apply_targets)
+        df = df.dropna(subset=['target'])
+        logger.info(f"After target generation: {df.shape}")
 
-    df = df.sort_values('date').reset_index(drop=True)
-    folds = splitter.split(df)
-    logger.info(f"Number of folds: {len(folds)}")
-    if not folds:
-        logger.error("No folds generated – insufficient data.")
-        return None
+        vc = config['validation_strategy']
+        splitter = WalkForwardSplitter(
+            train_window=vc['train_window_size'],
+            val_window=vc['validation_window_size'],
+            step_size=vc.get('step_size', vc['validation_window_size']),
+            embargo_days=vc.get('embargo_days', config['forecast_horizon_days']),
+            forecast_horizon=config['forecast_horizon_days'],
+            method=vc['method']
+        )
 
-    all_preds = []
-    all_actuals = []
-    all_strategy_returns = []
-    fold_reports = []
+        df = df.sort_values('date').reset_index(drop=True)
+        folds = splitter.split(df)
+        total_folds = len(folds)
+        logger.info(f"Number of folds: {total_folds}")
+        if not folds:
+            logger.error("No folds generated – insufficient data.")
+            return None
 
-    for i, fold in enumerate(folds):
-        # Check lock before each fold – abort if missing
-        check_lock_abort()
+        # Write initial progress
+        write_progress(0, total_folds)
 
-        logger.info(f"\n--- Fold {i+1}/{len(folds)} ---")
-        train_idx = list(range(fold.train_start, fold.train_end + 1))
-        val_idx = list(range(fold.val_start, fold.val_end + 1))
+        all_preds = []
+        all_actuals = []
+        all_strategy_returns = []
+        fold_reports = []
+        start_time = time.time()
 
-        train_data = df.iloc[train_idx].copy()
-        val_data = df.iloc[val_idx].copy()
+        for i, fold in enumerate(folds):
+            # Check abort before each fold
+            check_abort()
 
-        X_train = train_data[feature_cols].values.astype(np.float32)
-        y_train = train_data['target'].values.astype(np.float32)
-        X_val = val_data[feature_cols].values.astype(np.float32)
-        y_val = val_data['target'].values.astype(np.float32)
+            logger.info(f"\n--- Fold {i+1}/{total_folds} ---")
+            train_idx = list(range(fold.train_start, fold.train_end + 1))
+            val_idx = list(range(fold.val_start, fold.val_end + 1))
 
-        scaler = TimeAwareScaler(config['preprocessing']['scaler_type'])
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_val_scaled = scaler.transform(X_val)
+            train_data = df.iloc[train_idx].copy()
+            val_data = df.iloc[val_idx].copy()
 
-        model = xgb.XGBRegressor(
+            X_train = train_data[feature_cols].values.astype(np.float32)
+            y_train = train_data['target'].values.astype(np.float32)
+            X_val = val_data[feature_cols].values.astype(np.float32)
+            y_val = val_data['target'].values.astype(np.float32)
+
+            scaler = TimeAwareScaler(config['preprocessing']['scaler_type'])
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_val_scaled = scaler.transform(X_val)
+
+            model = xgb.XGBRegressor(
+                **config['model'],
+                random_state=config['random_seed'],
+                eval_metric='rmse'
+            )
+            # Check abort before fit
+            check_abort()
+            model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)], verbose=False)
+
+            pred_val = model.predict(X_val_scaled)
+
+            trade_cfg = config['trading']
+            trade_sim = TradingSimulator(
+                long_threshold=trade_cfg['long_threshold'],
+                short_threshold=trade_cfg['short_threshold'],
+                transaction_cost_bps=trade_cfg['transaction_cost_bps'],
+                slippage_bps=trade_cfg['slippage_bps'],
+                allow_short=trade_cfg['allow_short']
+            )
+            signals, costs, strategy_ret = trade_sim.simulate(pred_val, y_val)
+
+            all_preds.extend(pred_val)
+            all_actuals.extend(y_val)
+            all_strategy_returns.extend(strategy_ret)
+
+            fold_reports.append({
+                'fold': i+1,
+                'train_start': df.iloc[fold.train_start]['date'].strftime('%Y-%m-%d'),
+                'train_end': df.iloc[fold.train_end]['date'].strftime('%Y-%m-%d'),
+                'val_start': df.iloc[fold.val_start]['date'].strftime('%Y-%m-%d'),
+                'val_end': df.iloc[fold.val_end]['date'].strftime('%Y-%m-%d'),
+                'train_samples': len(train_data),
+                'val_samples': len(val_data)
+            })
+
+            del train_data, val_data, X_train, X_val, y_train, y_val, model
+            gc.collect()
+
+            # Write progress after each fold
+            elapsed = int(time.time() - start_time)
+            write_progress(i+1, total_folds, elapsed)
+
+            # Check abort after fold (in case lock was removed during fit)
+            check_abort()
+
+        # After folds, check abort before final training
+        check_abort()
+
+        all_preds = np.array(all_preds)
+        all_actuals = np.array(all_actuals)
+        all_strategy_returns = np.array(all_strategy_returns)
+
+        metrics = compute_all_metrics(all_preds, all_actuals, all_strategy_returns)
+
+        logger.info("\n" + "="*50)
+        logger.info("WALK‑FORWARD OOS PERFORMANCE")
+        for k,v in metrics.items():
+            logger.info(f"{k:>20}: {v:.4f}" if isinstance(v, float) else f"{k:>20}: {v}")
+        logger.info("="*50)
+
+        # Train final production model
+        logger.info("Training production model on full dataset...")
+        X_full = df[feature_cols].values.astype(np.float32)
+        y_full = df['target'].values.astype(np.float32)
+
+        final_scaler = TimeAwareScaler(config['preprocessing']['scaler_type'])
+        X_full_scaled = final_scaler.fit_transform(X_full)
+
+        final_model = xgb.XGBRegressor(
             **config['model'],
             random_state=config['random_seed'],
             eval_metric='rmse'
         )
-        model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)], verbose=False)
+        # Check abort before final fit
+        check_abort()
+        final_model.fit(X_full_scaled, y_full)
 
-        pred_val = model.predict(X_val_scaled)
+        # Check abort before saving model
+        check_abort()
 
-        trade_cfg = config['trading']
-        trade_sim = TradingSimulator(
-            long_threshold=trade_cfg['long_threshold'],
-            short_threshold=trade_cfg['short_threshold'],
-            transaction_cost_bps=trade_cfg['transaction_cost_bps'],
-            slippage_bps=trade_cfg['slippage_bps'],
-            allow_short=trade_cfg['allow_short']
-        )
-        signals, costs, strategy_ret = trade_sim.simulate(pred_val, y_val)
+        model_version = None
+        if HAS_MODEL_REGISTRY:
+            registry = ModelRegistry()
+            model_version = registry.save_production_model(final_model, final_scaler, config, metrics)
+            logger.info(f"Production model saved with version: {model_version}")
+        else:
+            joblib.dump(final_model, os.path.join(model_store_path, 'model.pkl'))
+            joblib.dump(final_scaler, os.path.join(model_store_path, 'scaler.pkl'))
+            with open(os.path.join(model_store_path, 'training_config.json'), 'w') as f:
+                json.dump(convert_numpy(config), f, indent=2)
+            logger.info(f"Production model saved under {model_store_path} (legacy mode)")
 
-        all_preds.extend(pred_val)
-        all_actuals.extend(y_val)
-        all_strategy_returns.extend(strategy_ret)
+        report = {
+            'timestamp': ist_now().isoformat(),
+            'dataset_size': len(df),
+            'num_symbols': len(df['symbol'].unique()),
+            'walk_forward_metrics': convert_numpy(metrics),
+            'fold_details': convert_numpy(fold_reports),
+            'production_model_saved': True,
+            'model_version': model_version,
+            'config': convert_numpy(config)
+        }
 
-        fold_reports.append({
-            'fold': i+1,
-            'train_start': df.iloc[fold.train_start]['date'].strftime('%Y-%m-%d'),
-            'train_end': df.iloc[fold.train_end]['date'].strftime('%Y-%m-%d'),
-            'val_start': df.iloc[fold.val_start]['date'].strftime('%Y-%m-%d'),
-            'val_end': df.iloc[fold.val_end]['date'].strftime('%Y-%m-%d'),
-            'train_samples': len(train_data),
-            'val_samples': len(val_data)
-        })
+        report_path = os.path.join(model_store_path, 'training_report.joblib')
+        joblib.dump(report, report_path)
+        logger.info(f"Training report saved to {report_path}")
 
-        del train_data, val_data, X_train, X_val, y_train, y_val, model
-        gc.collect()
+        # Log training run to DB if session provided
+        if HAS_DB and db_session is not None:
+            save_training_run_to_db(
+                db_session,
+                config,
+                metrics,
+                fold_reports,
+                model_version,
+                len(df),
+                len(df['symbol'].unique())
+            )
 
-        # Check lock after each fold as well
-        check_lock_abort()
+        return report
 
-    # After folds, check lock before final training
-    check_lock_abort()
-
-    all_preds = np.array(all_preds)
-    all_actuals = np.array(all_actuals)
-    all_strategy_returns = np.array(all_strategy_returns)
-
-    metrics = compute_all_metrics(all_preds, all_actuals, all_strategy_returns)
-
-    logger.info("\n" + "="*50)
-    logger.info("WALK‑FORWARD OOS PERFORMANCE")
-    for k,v in metrics.items():
-        logger.info(f"{k:>20}: {v:.4f}" if isinstance(v, float) else f"{k:>20}: {v}")
-    logger.info("="*50)
-
-    # Train final production model
-    logger.info("Training production model on full dataset...")
-    X_full = df[feature_cols].values.astype(np.float32)
-    y_full = df['target'].values.astype(np.float32)
-
-    final_scaler = TimeAwareScaler(config['preprocessing']['scaler_type'])
-    X_full_scaled = final_scaler.fit_transform(X_full)
-
-    final_model = xgb.XGBRegressor(
-        **config['model'],
-        random_state=config['random_seed'],
-        eval_metric='rmse'
-    )
-    final_model.fit(X_full_scaled, y_full)
-
-    # Check lock before saving model
-    check_lock_abort()
-
-    model_version = None
-    if HAS_MODEL_REGISTRY:
-        registry = ModelRegistry()
-        model_version = registry.save_production_model(final_model, final_scaler, config, metrics)
-        logger.info(f"Production model saved with version: {model_version}")
-    else:
-        joblib.dump(final_model, os.path.join(model_store_path, 'model.pkl'))
-        joblib.dump(final_scaler, os.path.join(model_store_path, 'scaler.pkl'))
-        with open(os.path.join(model_store_path, 'training_config.json'), 'w') as f:
-            json.dump(convert_numpy(config), f, indent=2)
-        logger.info(f"Production model saved under {model_store_path} (legacy mode)")
-
-    report = {
-        'timestamp': datetime.now().isoformat(),
-        'dataset_size': len(df),
-        'num_symbols': len(df['symbol'].unique()),
-        'walk_forward_metrics': convert_numpy(metrics),
-        'fold_details': convert_numpy(fold_reports),
-        'production_model_saved': True,
-        'model_version': model_version,
-        'config': convert_numpy(config)
-    }
-
-    report_path = os.path.join(model_store_path, 'training_report.joblib')
-    joblib.dump(report, report_path)
-    logger.info(f"Training report saved to {report_path}")
-
-    # Log training run to DB if session provided
-    if HAS_DB and db_session is not None:
-        save_training_run_to_db(
-            db_session,
-            config,
-            metrics,
-            fold_reports,
-            model_version,
-            len(df),
-            len(df['symbol'].unique())
-        )
-
-    return report
+    except KeyboardInterrupt as e:
+        logger.warning(f"Training interrupted: {e}")
+        # Write progress with current fold to indicate interruption
+        write_progress(-1, total_folds)  # -1 means aborted
+        raise  # re-raise to be caught by outer handler
+    except Exception as e:
+        logger.error(f"Training pipeline error: {e}")
+        raise
+    finally:
+        # Stop the checker thread
+        global _abort_flag
+        _abort_flag = True
+        # Clean up progress file
+        try:
+            if os.path.exists(PROGRESS_FILE):
+                os.remove(PROGRESS_FILE)
+        except:
+            pass
 
 # ============================================================
 # Entry point for FastAPI background task
@@ -444,6 +528,9 @@ def train_model(db_session, model_store_path: str):
             logger.info(f"Model version: {report.get('model_version', 'unknown')}")
         else:
             logger.error("Training pipeline returned no report")
+    except KeyboardInterrupt:
+        logger.warning("Training aborted by user (KeyboardInterrupt).")
+        # No need to raise; the lock will be released by the outer try-finally in app.py
     except Exception as e:
         logger.error(f"Training failed: {e}")
         # Rollback session on error if provided

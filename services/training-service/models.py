@@ -8,6 +8,7 @@ Tables:
 - TrainingRun: tracks each training pipeline run (for auditing and metrics).
 """
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from sqlalchemy import (
     Column, String, Float, Integer, Boolean, DateTime, JSON, Text, LargeBinary,
     create_engine, inspect, text, desc
@@ -15,6 +16,13 @@ from sqlalchemy import (
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import numpy as np
+
+# ---------- IST timezone helper ----------
+IST = ZoneInfo("Asia/Kolkata")
+
+def ist_now() -> datetime:
+    """Return current time as a naive datetime in IST (UTC+5:30)."""
+    return datetime.now(IST).replace(tzinfo=None)
 
 # ---------- Base ----------
 Base = declarative_base()
@@ -91,7 +99,7 @@ class PredictionSnapshot(Base):
 
     # Metadata
     model_version = Column(String(50), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=ist_now)
 
     # Outcome flags (updated after evaluation)
     t1_success = Column(Integer, default=0)   # 0 = pending, 1 = success, 2 = failed
@@ -124,7 +132,7 @@ class PredictionOutcome(Base):
     success = Column(Integer, default=0)
 
     notes = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=ist_now)
 
 
 class TrainingRun(Base):
@@ -139,7 +147,7 @@ class TrainingRun(Base):
     model_version = Column(String(50), nullable=True)
     walk_forward_metrics = Column(JSON, nullable=True)
     fold_details = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=ist_now)
 
 
 class ModelArtifact(Base):
@@ -170,7 +178,7 @@ class ModelArtifact(Base):
     feature_columns = Column(JSON, nullable=True)
     config = Column(JSON, nullable=True)
     metrics = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=ist_now, index=True)
     promoted_at = Column(DateTime, nullable=True)
 
 
@@ -256,8 +264,8 @@ class ModelRegistry:
                 feature_columns=feature_columns,
                 config=config_sanitized,
                 metrics=metrics_sanitized,
-                created_at=datetime.utcnow(),
-                promoted_at=datetime.utcnow() if status == "production" else None,
+                created_at=ist_now(),
+                promoted_at=ist_now() if status == "production" else None,
             )
             if status == "production":
                 # Exactly one production row at a time — archive the rest.
@@ -283,7 +291,7 @@ class ModelRegistry:
                 ModelArtifact.status == "production"
             ).update({"status": "archived"})
             target.status = "production"
-            target.promoted_at = datetime.utcnow()
+            target.promoted_at = ist_now()
             session.commit()
             return True
         finally:

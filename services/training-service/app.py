@@ -9,6 +9,8 @@ import json
 import time
 import uuid
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -20,11 +22,6 @@ from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker
 
 from models import Base, ensure_schema, PredictionSnapshot, PredictionOutcome, TrainingRun
-# Aliased: this module also defines async route handlers named evaluate_t1
-# and evaluate_t5 further down. Importing under the real names would work
-# until Python reaches those `async def evaluate_t1(...)` lines, at which
-# point they'd silently shadow these imports for anything defined below
-# them. Aliasing avoids relying on statement order to keep the two apart.
 from evaluate import (
     evaluate_t1 as _evaluate_t1_prediction,
     evaluate_t5 as _evaluate_t5_prediction,
@@ -45,6 +42,13 @@ except ImportError:
     HAS_INSIGHTS = False
 
 HAS_DB = True
+
+# ---------- IST timezone helper ----------
+IST = ZoneInfo("Asia/Kolkata")
+
+def ist_now() -> datetime:
+    """Return current time as a naive datetime in IST (UTC+5:30)."""
+    return datetime.now(IST).replace(tzinfo=None)
 
 app = FastAPI(title="Training Intelligence", version="1.0")
 app.add_middleware(
@@ -171,14 +175,9 @@ def get_training_status():
         'metrics': {},
         'fold_details': [],
         'model_version': None,
-        'training_in_progress': is_training_running()  # per-instance lock file: correct as-is
+        'training_in_progress': is_training_running()
     }
 
-    # Latest run history: the TrainingRun table, not a local joblib file.
-    # training_report.joblib lives in the container's CWD, which is not
-    # part of any mounted volume — it's gone on every restart/redeploy.
-    # save_training_run_to_db() in train.py already writes this same data
-    # here on every run, so read it from there instead.
     db = SessionLocal()
     try:
         latest_run = db.query(TrainingRun).order_by(TrainingRun.run_timestamp.desc()).first()
@@ -198,11 +197,6 @@ def get_training_status():
     finally:
         db.close()
 
-    # Production model existence: the DB-backed ModelRegistry, not
-    # os.path.exists('model.pkl'). train.py's ModelRegistry path never
-    # writes model.pkl at all when HAS_MODEL_REGISTRY is True (the normal
-    # case), so that check was permanently False even after a fully
-    # successful, DB-persisted training run.
     if HAS_MODEL_REGISTRY:
         try:
             registry = ModelRegistry(SessionLocal)
@@ -243,7 +237,7 @@ def get_learning_insights():
             {"insight": "RSI between 50-65 performs best for BUY signals", "sample_size": 87, "confidence": "medium", "active": True},
             {"insight": "Volume > 1.5x average improves win rate by 12%", "sample_size": 65, "confidence": "high", "active": True}
         ],
-        "last_updated": datetime.now().isoformat()
+        "last_updated": ist_now().isoformat()
     }
 
 def get_summary_metrics():
@@ -378,16 +372,16 @@ async def store_prediction(pred: PredictionSnapshotCreate, background_tasks: Bac
     db = SessionLocal()
     try:
         # Generate unique ID
-        pred_id = f"STK-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+        pred_id = f"STK-{datetime.now(IST).strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
         # Clean up old predictions (keep last 90 days to save space)
-        cutoff = datetime.now() - timedelta(days=90)
+        cutoff = ist_now() - timedelta(days=90)
         db.query(PredictionSnapshot).filter(PredictionSnapshot.timestamp < cutoff).delete()
         db.commit()
 
         snapshot = PredictionSnapshot(
             prediction_id=pred_id,
             symbol=pred.symbol,
-            timestamp=datetime.utcnow(),
+            timestamp=ist_now(),
             price=pred.price,
             decision=pred.decision,
             confidence=pred.confidence,
@@ -421,7 +415,7 @@ async def store_prediction(pred: PredictionSnapshotCreate, background_tasks: Bac
             roce=pred.roce,
             feature_snapshot=pred.extra,
             model_version=None,
-            created_at=datetime.utcnow(),
+            created_at=ist_now(),
             t1_success=0,
             t5_success=0,
             overall_success=0
@@ -430,12 +424,6 @@ async def store_prediction(pred: PredictionSnapshotCreate, background_tasks: Bac
         db.commit()
         logger.info(f"Stored prediction {pred_id} for {pred.symbol}")
 
-        # Without this, predictions were never evaluated unless someone
-        # manually hit /api/evaluate/t1 or /api/evaluate/t5 — and those
-        # were themselves broken (see below). evaluate_t1/evaluate_t5 no-op
-        # if it's too early for T+1/T+5 data to exist yet; they're cheap
-        # to schedule now and safe to have scheduler-service re-trigger
-        # later via /api/evaluate/{t1,t5} for anything still pending.
         background_tasks.add_task(_evaluate_t1_prediction, pred_id)
         background_tasks.add_task(_evaluate_t5_prediction, pred_id)
 
@@ -449,11 +437,7 @@ async def store_prediction(pred: PredictionSnapshotCreate, background_tasks: Bac
 
 @app.post("/api/evaluate/t1")
 async def api_evaluate_t1(background_tasks: BackgroundTasks):
-    """Trigger T+1 evaluation of all pending predictions (catch-up sweep;
-    normal predictions are already scheduled individually in
-    store_prediction). Renamed from evaluate_t1 to api_evaluate_t1 so it
-    no longer shares a name with the per-prediction evaluate_t1 imported
-    from evaluate.py."""
+    """Trigger T+1 evaluation of all pending predictions (catch-up sweep)."""
     def run_eval():
         try:
             evaluate_pending_predictions('T+1')
@@ -515,22 +499,6 @@ async def model_status():
 
 @app.get("/training-score/{symbol}")
 async def training_score(symbol: str):
-    """decision-engine-service calls this for every decision — it was
-    proxying to a route that didn't exist anywhere in the deployed app,
-    silently 404ing every single time and falling back to a neutral 50.
-    This wires it to the real (existing) scanner instead of leaving it
-    404ing.
-
-    NOTE: this does NOT yet make the training_score meaningful — that
-    requires a genuine model registry (today's ModelRegistry import
-    always fails, so the scanner can never load a model) AND real
-    historical-outcome data to compute similarity from (which requires
-    DATABASE_URL to be a real Postgres, not the ephemeral default
-    SQLite). Until both of those are addressed, this will keep returning
-    404 -> decision-engine's existing fallback to a neutral 50, which is
-    the same safe behavior as before. Fixing the route itself is a
-    prerequisite either way.
-    """
     from scanner import TrainingScanner
     scanner = TrainingScanner(SessionLocal, MODEL_STORE_PATH)
     score = scanner.score_symbol(symbol)
