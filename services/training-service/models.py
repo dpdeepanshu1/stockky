@@ -364,10 +364,16 @@ def ensure_schema(engine):
     table_name = "training_runs"
     if inspector.has_table(table_name):
         existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
-        # Ensure run_timestamp exists (this was the missing column causing the error)
+        # All columns defined in TrainingRun model
         required_columns = {
             'run_timestamp': 'TIMESTAMP',
-            # Add any other columns that might be missing in future versions
+            'config': 'JSON',
+            'dataset_size': 'INTEGER',
+            'num_symbols': 'INTEGER',
+            'model_version': 'VARCHAR(50)',
+            'walk_forward_metrics': 'JSON',
+            'fold_details': 'JSON',
+            'created_at': 'TIMESTAMP',
         }
         with engine.connect() as conn:
             for col_name, col_type in required_columns.items():
