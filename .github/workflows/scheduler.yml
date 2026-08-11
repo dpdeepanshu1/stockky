@@ -3,11 +3,8 @@ name: Stockky Scheduler
 on:
   schedule:
     # Every hour from 02:00 to 11:59 UTC = 07:30 to 17:00 IST, Mon-Fri.
-    # run_once.py itself only acts within 08:15-16:30 IST, so the extra
-    # ticks near the edges of this window are harmless no-ops — this is
-    # just here to comfortably cover the whole trading day.
     - cron: "0 2-11 * * 1-5"
-  workflow_dispatch: {} # lets you trigger a run manually from the Actions tab
+  workflow_dispatch: {}
 
 jobs:
   tick:
@@ -22,13 +19,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r services/scheduler-service/requirements.txt
 
-      # Wake up all microservices before running the scheduler. Also pings
-      # SCHEDULER_URL (scheduler-service's own public URL) — that service
-      # runs its own internal keep-alive loop for everything else, but
-      # nothing was keeping IT awake: as a free-tier Render web service it
-      # sleeps after 15 min of no external traffic just like any other,
-      # which would silently stop its internal scan/keep-alive jobs from
-      # running at all until something hit it again. This closes that gap.
       - name: Wake up services
         env:
           API_GATEWAY_URL: ${{ secrets.API_GATEWAY_URL }}
@@ -45,7 +35,6 @@ jobs:
           SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
         run: |
           echo "Pinging all services to wake them up (preventing cold starts)..."
-          # Individual pings to ensure each service is woken
           curl -I $API_GATEWAY_URL/health || true
           curl -I $MARKET_DATA_URL/health || true
           curl -I $TECHNICAL_URL/health || true
@@ -58,10 +47,7 @@ jobs:
           curl -I $MARKET_SENTIMENT_URL/health || true
           curl -I $TRAINING_URL/health || true
           curl -I $SCHEDULER_URL/health || true
-
-          # Also call the API Gateway's /wake/all endpoint (new) to wake all via one call
           curl -X POST $API_GATEWAY_URL/wake/all || true
-
           echo "Waiting 60 seconds for services to fully spin up..."
           sleep 60
 
