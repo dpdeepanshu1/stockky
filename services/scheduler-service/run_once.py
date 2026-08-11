@@ -97,7 +97,7 @@ def _wake_up_services():
             logger.warning(f"Wake-up ping to {url} failed: {e}")
 
 
-def _wait_for_gateway_health(max_attempts: int = 5, delay: int = 10) -> bool:
+def _wait_for_gateway_health(max_attempts: int = 3, delay: int = 15) -> bool:
     """Check if the API Gateway is healthy; wait if not."""
     for attempt in range(max_attempts):
         try:
@@ -355,6 +355,9 @@ def main():
     now = datetime.now(IST)
     today_str = now.strftime("%Y-%m-%d")
     time_now = now.time()
+
+    logger.info("Current IST time: %s", now.strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("Scan window: %s – %s", SCAN_START.strftime("%H:%M"), SCAN_END.strftime("%H:%M"))
 
     if is_holiday(now):
         logger.info("Market holiday – skipping all activity.")
