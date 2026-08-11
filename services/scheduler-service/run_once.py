@@ -82,13 +82,42 @@ def is_holiday(today: datetime) -> bool:
     return date_str in HOLIDAYS_2026
 
 
-def _notify(title: str, message: str, channel: str = "telegram"):
-    try:
-        payload = {"title": title, "message": message, "channel": channel}
-        httpx.post(f"{NOTIFICATION_URL}/notify", json=payload, timeout=10)
-        logger.info("Notification sent: %s", title)
-    except httpx.HTTPError as e:
-        logger.warning("Notification dispatch failed (non-fatal): %s", e)
+def _wake_up_services():
+    """Ping all critical services to ensure they are awake before sending notifications."""
+    services = [
+        API_GATEWAY_URL,
+        NOTIFICATION_URL,
+        EVENT_TRACKER_URL,
+        # Add other URLs if needed
+    ]
+    for url in services:
+        try:
+            httpx.get(f"{url}/health", timeout=5)
+            logger.debug(f"Wake-up ping to {url} succeeded")
+        except Exception as e:
+            logger.warning(f"Wake-up ping to {url} failed: {e}")
+
+
+def _notify(title: str, message: str, channel: str = "telegram", retries: int = 2):
+    """Send notification with retries and a longer timeout."""
+    payload = {"title": title, "message": message, "channel": channel}
+    for attempt in range(retries + 1):
+        try:
+            resp = httpx.post(
+                f"{NOTIFICATION_URL}/notify",
+                json=payload,
+                timeout=30  # longer timeout
+            )
+            if resp.status_code == 200:
+                logger.info("Notification sent: %s", title)
+                return
+            else:
+                logger.warning(f"Notification attempt {attempt+1} returned {resp.status_code}")
+        except httpx.HTTPError as e:
+            logger.warning(f"Notification attempt {attempt+1} failed: {e}")
+        if attempt < retries:
+            time.sleep(5)  # wait 5s before retry
+    logger.error("Notification failed after all retries: %s", title)
 
 
 def _load_last_decisions() -> dict:
@@ -286,7 +315,7 @@ def should_skip_scan() -> bool:
     try:
         last_scan_str = _redis.get(LAST_SCAN_KEY)
         if not last_scan_str:
-            logger.info("No last scan timestamp found in Redis – will run scan.")
+            logger.info("No last scan timestamp found in Redis – will run scan (fallback).")
             return False
 
         last_scan_time = datetime.fromisoformat(last_scan_str)
@@ -313,26 +342,31 @@ def main():
         logger.info("Market holiday – skipping all activity.")
         return
 
+    # Always sync subscriptions (lightweight)
     sync_event_subscriptions()
 
     # Timed notifications (each once per day, de‑duplicated by Redis)
     if time_now == OPEN_ANNOUNCE_TIME:
         if not _redis.get(OPEN_MSG_KEY + today_str):
+            _wake_up_services()  # ensure services are up before notification
             send_market_open_announcement()
             _redis.set(OPEN_MSG_KEY + today_str, "1", ex=86400)
 
     if time_now == MARKET_OPEN:
         if not _redis.get(OPEN_NOW_KEY + today_str):
+            _wake_up_services()
             send_market_open_now()
             _redis.set(OPEN_NOW_KEY + today_str, "1", ex=86400)
 
     if time_now == CLOSE_SUMMARY_TIME:
         if not _redis.get(CLOSE_MSG_KEY + today_str):
+            _wake_up_services()
             send_close_summary(today_str)
             _redis.set(CLOSE_MSG_KEY + today_str, "1", ex=86400)
 
     if time_now == SLEEP_TIME:
         if not _redis.get(SLEEP_MSG_KEY + today_str):
+            _wake_up_services()
             send_sleep_message()
             _redis.set(SLEEP_MSG_KEY + today_str, "1", ex=86400)
 
@@ -346,6 +380,8 @@ def main():
             scan_result = run_scan_and_diff()
 
             if scan_result:
+                # Wake up services before sending notifications (cold start prevention)
+                _wake_up_services()
                 picks = scan_result.get("recommendations", [])
                 if picks:
                     store_daily_picks(today_str, picks)
@@ -356,6 +392,7 @@ def main():
                 run_event_check()
             else:
                 logger.error("Scan failed after all retries – no results available.")
+                _wake_up_services()
                 _notify(
                     "⚠️ Scan Failed",
                     f"The market scan at {time_now.strftime('%H:%M')} IST could not complete. Please check the API Gateway logs."
