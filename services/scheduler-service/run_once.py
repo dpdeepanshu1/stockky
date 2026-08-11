@@ -16,7 +16,7 @@ Coordination with Render scheduler service:
   - Otherwise, we run the scan (fallback) and send top picks / decision changes.
 
 Timeout for the full scan is set to 7200 seconds (2 hours) to accommodate the
-entire pipeline and cold starts, with one retry attempt if the first request times out.
+entire pipeline and cold starts, with up to 3 retry attempts on connection failures.
 """
 import os
 import json
@@ -97,10 +97,25 @@ def _wake_up_services():
             logger.warning(f"Wake-up ping to {url} failed: {e}")
 
 
+def _wait_for_gateway_health(max_attempts: int = 5, delay: int = 10) -> bool:
+    """Check if the API Gateway is healthy; wait if not."""
+    for attempt in range(max_attempts):
+        try:
+            resp = httpx.get(f"{API_GATEWAY_URL}/health", timeout=10)
+            if resp.status_code == 200:
+                logger.info("API Gateway is healthy.")
+                return True
+        except Exception:
+            pass
+        logger.warning(f"API Gateway not ready, attempt {attempt+1}/{max_attempts} – waiting {delay}s...")
+        time.sleep(delay)
+    return False
+
+
 def _notify(title: str, message: str, channel: str = "telegram", retries: int = 3):
     """Send notification with retries, longer timeout, and wake‑up first."""
     _wake_up_services()
-    time.sleep(5)  # give services a moment to fully initialise
+    time.sleep(5)
 
     payload = {"title": title, "message": message, "channel": channel}
     for attempt in range(retries + 1):
@@ -180,28 +195,34 @@ def run_event_check():
         logger.warning("Event check failed (non-fatal): %s", e)
 
 
-def run_scan_and_diff(timeout: int = SCAN_TIMEOUT_SECONDS, retries: int = 1) -> Dict[str, Any]:
+def run_scan_and_diff(timeout: int = SCAN_TIMEOUT_SECONDS, max_retries: int = 3) -> Dict[str, Any]:
+    """
+    Fetch scan results with a long timeout and multiple retries on connection failures.
+    Uses exponential backoff: 30s, 60s, 120s.
+    """
     attempt = 0
-    while attempt <= retries:
+    backoff = 30
+    while attempt <= max_retries:
         try:
-            logger.info(f"Calling /scan (attempt {attempt+1}/{retries+1}) with timeout {timeout}s")
+            logger.info(f"Calling /scan (attempt {attempt+1}/{max_retries+1}) with timeout {timeout}s")
             resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=timeout)
             resp.raise_for_status()
             result = resp.json()
             logger.info("Scan complete: %s", result.get("verdict"))
             check_decision_changes(result.get("all_results", []))
             return result
-        except httpx.TimeoutException as e:
-            logger.error(f"Scan timed out after {timeout}s (attempt {attempt+1}): {e}")
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.StreamError) as e:
+            logger.error(f"Connection/stream error (attempt {attempt+1}): {e}")
         except httpx.HTTPStatusError as e:
             logger.error(f"Scan returned HTTP error {e.response.status_code}: {e.response.text[:200]}")
         except Exception as e:
             logger.error(f"Scan failed with unexpected error: {e}")
         attempt += 1
-        if attempt <= retries:
-            wait = 60
+        if attempt <= max_retries:
+            wait = min(backoff, 300)  # cap at 5 minutes
             logger.info(f"Retrying in {wait}s...")
             time.sleep(wait)
+            backoff *= 2  # exponential backoff
     return {}
 
 
@@ -341,7 +362,7 @@ def main():
 
     sync_event_subscriptions()
 
-    # Timed notifications (each once per day, de‑duplicated by Redis)
+    # Timed notifications
     if time_now == OPEN_ANNOUNCE_TIME:
         if not _redis.get(OPEN_MSG_KEY + today_str):
             send_market_open_announcement()
@@ -368,6 +389,15 @@ def main():
         if should_skip_scan():
             logger.info("Skipping GitHub scan because scheduler service handled it.")
         else:
+            # First, make sure the API Gateway is healthy
+            if not _wait_for_gateway_health(max_attempts=3, delay=15):
+                logger.error("API Gateway not healthy after multiple attempts – aborting scan.")
+                _notify(
+                    "⚠️ Scan Aborted",
+                    f"API Gateway is not healthy at {time_now.strftime('%H:%M')} IST. Please check the service."
+                )
+                return
+
             logger.info("Running scan (fallback) at %s", time_now.strftime("%H:%M"))
             scan_result = run_scan_and_diff()
 
