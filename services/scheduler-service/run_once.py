@@ -4,7 +4,7 @@ Scheduler — single-shot mode, driven by GitHub Actions cron.
 Enhanced with timed notifications:
   - 08:15 IST: "Market opens in 1 hour" + top picks from previous day.
   - 09:15 IST: "Market is open now"
-  - Hourly scans (08:30..15:30) with top picks
+  - Hourly scans (08:30..15:30) with top picks, but only on the hour (minute == 0)
   - 15:30 IST: Market close summary
   - 16:30 IST: "Going to sleep" + preview for tomorrow
 Uses Redis to track sent messages (so each event fires only once per day).
@@ -15,12 +15,13 @@ Coordination with Render scheduler service:
     the scan and its notifications to avoid duplication.
   - Otherwise, we run the scan (fallback) and send top picks / decision changes.
 
-Timeout for the full scan is set to 1800 seconds (30 minutes) to accommodate
-the entire pipeline (market data, technicals, fundamentals, decision engine).
+Timeout for the full scan is set to 3600 seconds (1 hour) to accommodate the
+entire pipeline, with one retry attempt if the first request times out.
 """
 import os
 import json
 import logging
+import time
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any
@@ -70,8 +71,8 @@ BUY_FAMILY = {"BUY NOW", "PREPARE TO BUY", "HOLD"}
 
 # Now scans run every hour (60 minutes)
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
-# Timeout for the full scan – 30 minutes (1800 seconds)
-SCAN_TIMEOUT_SECONDS = int(os.getenv("SCAN_TIMEOUT_SECONDS", "1800"))
+# Timeout for the full scan – 1 hour (3600 seconds)
+SCAN_TIMEOUT_SECONDS = int(os.getenv("SCAN_TIMEOUT_SECONDS", "3600"))
 
 
 def is_holiday(today: datetime) -> bool:
@@ -148,17 +149,33 @@ def run_event_check():
         logger.warning("Event check failed (non-fatal): %s", e)
 
 
-def run_scan_and_diff(timeout: int = SCAN_TIMEOUT_SECONDS) -> Dict[str, Any]:
-    try:
-        resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=timeout)
-        resp.raise_for_status()
-        result = resp.json()
-        logger.info("Scan complete: %s", result.get("verdict"))
-        check_decision_changes(result.get("all_results", []))
-        return result
-    except httpx.HTTPError as e:
-        logger.error("Scan failed: %s", e)
-        return {}
+def run_scan_and_diff(timeout: int = SCAN_TIMEOUT_SECONDS, retries: int = 1) -> Dict[str, Any]:
+    """
+    Fetch scan results with timeout and one retry on failure.
+    Returns the scan result dict, or empty dict if all attempts fail.
+    """
+    attempt = 0
+    while attempt <= retries:
+        try:
+            logger.info(f"Calling /scan (attempt {attempt+1}/{retries+1}) with timeout {timeout}s")
+            resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=timeout)
+            resp.raise_for_status()
+            result = resp.json()
+            logger.info("Scan complete: %s", result.get("verdict"))
+            check_decision_changes(result.get("all_results", []))
+            return result
+        except httpx.TimeoutException as e:
+            logger.error(f"Scan timed out after {timeout}s (attempt {attempt+1}): {e}")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Scan returned HTTP error {e.response.status_code}: {e.response.text[:200]}")
+        except Exception as e:
+            logger.error(f"Scan failed with unexpected error: {e}")
+        attempt += 1
+        if attempt <= retries:
+            wait = 30  # wait 30 seconds before retry
+            logger.info(f"Retrying in {wait}s...")
+            time.sleep(wait)
+    return {}
 
 
 def format_stock_picks(picks: List[Dict]) -> str:
@@ -212,7 +229,6 @@ def get_daily_picks(date_str: str) -> List[Dict]:
 
 def send_market_open_announcement():
     """Send 'Market opens in 1 hour' along with the top picks from the previous day."""
-    # Get previous day's picks
     yesterday = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
     picks = get_daily_picks(yesterday)
 
@@ -300,33 +316,29 @@ def main():
     sync_event_subscriptions()
 
     # Timed notifications (each once per day, de‑duplicated by Redis)
-    # 08:15 – Market opens in 1 hour + previous day's picks
     if time_now == OPEN_ANNOUNCE_TIME:
         if not _redis.get(OPEN_MSG_KEY + today_str):
             send_market_open_announcement()
             _redis.set(OPEN_MSG_KEY + today_str, "1", ex=86400)
 
-    # 09:15 – Market open
     if time_now == MARKET_OPEN:
         if not _redis.get(OPEN_NOW_KEY + today_str):
             send_market_open_now()
             _redis.set(OPEN_NOW_KEY + today_str, "1", ex=86400)
 
-    # 15:30 – Close summary
     if time_now == CLOSE_SUMMARY_TIME:
         if not _redis.get(CLOSE_MSG_KEY + today_str):
             send_close_summary(today_str)
             _redis.set(CLOSE_MSG_KEY + today_str, "1", ex=86400)
 
-    # 16:30 – Sleep
     if time_now == SLEEP_TIME:
         if not _redis.get(SLEEP_MSG_KEY + today_str):
             send_sleep_message()
             _redis.set(SLEEP_MSG_KEY + today_str, "1", ex=86400)
 
-    # Regular scan – runs at ANY minute within the scan window,
-    # but only if the scheduler hasn't scanned recently (within 60 min).
-    if SCAN_START <= time_now <= SCAN_END:
+    # Regular scan – runs ONLY on the hour (minute == 0) within the scan window,
+    # and only if the scheduler hasn't scanned recently (within 60 min).
+    if SCAN_START <= time_now <= SCAN_END and time_now.minute == 0:
         if should_skip_scan():
             logger.info("Skipping GitHub scan because scheduler service handled it.")
         else:
@@ -343,11 +355,13 @@ def main():
 
                 run_event_check()
             else:
-                logger.error("Scan failed – no results available.")
+                logger.error("Scan failed after all retries – no results available.")
                 _notify(
                     "⚠️ Scan Failed",
-                    f"The market scan at {time_now.strftime('%H:%M')} IST timed out or failed. Please check the system."
+                    f"The market scan at {time_now.strftime('%H:%M')} IST could not complete. Please check the API Gateway logs."
                 )
+    else:
+        logger.info("Not a scheduled scan hour or outside window – skipping scan.")
 
     logger.info("Scheduler tick completed.")
 
