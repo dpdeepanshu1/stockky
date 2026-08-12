@@ -3,10 +3,9 @@ name: Stockky Scheduler
 on:
   schedule:
     # Run at minute 50 past every hour from 02:50 to 09:50 UTC
-    # This translates to 08:20, 09:20, ... 15:20 IST (10 min before each hour)
+    # 08:20, 09:20, ... 15:20 IST
     - cron: "50 2-9 * * 1-5"
 
-  # Manual trigger with a checkbox to force scan outside market hours
   workflow_dispatch:
     inputs:
       force_scan:
@@ -43,7 +42,7 @@ jobs:
           TRAINING_URL: ${{ secrets.TRAINING_URL }}
           SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
         run: |
-          echo "Pinging all services to wake them up (preventing cold starts)..."
+          echo "Pinging all services to wake them up..."
           curl -I $API_GATEWAY_URL/health || true
           curl -I $MARKET_DATA_URL/health || true
           curl -I $TECHNICAL_URL/health || true
@@ -57,7 +56,7 @@ jobs:
           curl -I $TRAINING_URL/health || true
           curl -I $SCHEDULER_URL/health || true
           curl -X POST $API_GATEWAY_URL/wake/all || true
-          echo "Waiting 60 seconds for services to fully spin up..."
+          echo "Waiting 60 seconds for services to spin up..."
           sleep 60
 
       - name: Run scheduler tick
@@ -67,6 +66,6 @@ jobs:
           NOTIFICATION_URL: ${{ secrets.NOTIFICATION_URL }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          # Set FORCE_SCAN only if this is a manual run and the checkbox is ticked
+          # FORCE_SCAN is set only when running manually with the checkbox ticked
           FORCE_SCAN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_scan == true && 'true' || 'false' }}
         run: python services/scheduler-service/run_once.py
