@@ -19,6 +19,11 @@ Manual override:
   - If FORCE_SCAN=true, the window check is bypassed (for manual testing).
   - A start notification is sent every run within the window or forced.
   - Overall scan timeout is 1 hour; the /scan endpoint is called with that timeout.
+
+Retry strategy:
+  - Up to 3 attempts with exponential backoff (10s, 20s, 40s).
+  - If the gateway disconnects, we retry from scratch (the gateway doesn't support resuming).
+  - A final notification is sent if all attempts fail.
 """
 import os
 import json
@@ -76,6 +81,8 @@ BUY_FAMILY = {"BUY NOW", "PREPARE TO BUY", "HOLD"}
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
 # Overall scan timeout – 1 hour (3600 seconds)
 SCAN_TIMEOUT_TOTAL = int(os.getenv("SCAN_TIMEOUT_TOTAL", "3600"))
+# Max retries
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 # Force scan (bypass window check)
 FORCE_SCAN = os.getenv("FORCE_SCAN", "false").lower() == "true"
 
@@ -187,27 +194,46 @@ def run_event_check():
 
 def run_scan() -> Dict[str, Any]:
     """
-    Trigger a full market scan via the /scan endpoint with the overall timeout.
-    Returns the scan result dict, or an empty dict on failure.
+    Trigger a full market scan via the /scan endpoint with retries.
+    Uses exponential backoff between attempts.
     """
-    try:
-        logger.info(f"Calling /scan with timeout {SCAN_TIMEOUT_TOTAL}s")
-        resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=SCAN_TIMEOUT_TOTAL)
-        resp.raise_for_status()
-        result = resp.json()
-        logger.info("Scan complete: %s", result.get("verdict"))
-        # Detect decision changes from the scan results
-        check_decision_changes(result.get("all_results", []))
-        return result
-    except httpx.TimeoutException:
-        logger.error(f"Scan timed out after {SCAN_TIMEOUT_TOTAL}s")
-        # Send a "timed out" notification
-        _notify(
-            "⏱️ Scan Timed Out",
-            f"The market scan timed out after {SCAN_TIMEOUT_TOTAL}s. No results available."
-        )
-    except Exception as e:
-        logger.error(f"Scan failed: {e}")
+    attempt = 0
+    backoff = 10  # seconds
+    last_error = None
+    while attempt <= MAX_RETRIES:
+        try:
+            logger.info(f"Calling /scan (attempt {attempt+1}/{MAX_RETRIES+1}) with timeout {SCAN_TIMEOUT_TOTAL}s")
+            # Use a longer timeout and keep-alive
+            with httpx.Client(timeout=SCAN_TIMEOUT_TOTAL) as client:
+                resp = client.get(f"{API_GATEWAY_URL}/scan", headers={"Connection": "keep-alive"})
+            resp.raise_for_status()
+            result = resp.json()
+            logger.info("Scan complete: %s", result.get("verdict"))
+            # Detect decision changes from the scan results
+            check_decision_changes(result.get("all_results", []))
+            return result
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.StreamError) as e:
+            last_error = e
+            logger.error(f"Scan attempt {attempt+1} failed with connection/stream error: {e}")
+            if "Server disconnected" in str(e):
+                logger.error("The gateway likely crashed mid-scan. This often indicates memory exhaustion.")
+                # If gateway is crashed, wait longer before retrying
+                backoff = 30
+        except Exception as e:
+            last_error = e
+            logger.error(f"Scan attempt {attempt+1} failed with unexpected error: {e}")
+        attempt += 1
+        if attempt <= MAX_RETRIES:
+            logger.info(f"Retrying in {backoff}s...")
+            time.sleep(backoff)
+            backoff *= 2  # exponential backoff
+    # All attempts failed
+    error_msg = f"Scan failed after {MAX_RETRIES+1} attempts. Last error: {last_error}"
+    logger.error(error_msg)
+    _notify(
+        "⏱️ Scan Failed After Retries",
+        f"The market scan could not complete after {MAX_RETRIES+1} attempts. The last error was: {last_error}\n\nPlease check:\n- API Gateway memory (needs >512MB for large watchlists)\n- Gateway logs for 'Killed' or 'MemoryError'"
+    )
     return {}
 
 
@@ -427,12 +453,8 @@ def main():
 
                 run_event_check()
             else:
-                # run_scan already sent a timeout notification if it timed out
-                # If it failed for other reasons, send a generic failure
-                _notify(
-                    "⚠️ Scan Failed",
-                    f"The market scan at {time_now.strftime('%H:%M')} IST could not complete. Please check the API Gateway logs."
-                )
+                # run_scan already sent a notification if all retries failed
+                logger.error("Scan failed – no results available.")
     else:
         logger.info("Skipping scan due to window/force settings.")
 
