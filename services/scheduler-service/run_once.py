@@ -13,17 +13,12 @@ Coordination with Render scheduler service:
   - Before performing a scan, we check Redis key "stockky:scheduler:last_scan_timestamp"
   - If the timestamp is within the last SCAN_INTERVAL_MINUTES (60 min), we skip
     the scan and its notifications to avoid duplication.
-  - Otherwise, we run the scan (fallback) by analyzing each symbol individually
-    in parallel (more reliable than the monolithic /scan endpoint).
-
-Rate‑limiting considerations:
-  - Default concurrency is 5 symbols at a time (MAX_WORKERS).
-  - A 1‑second delay between batches (BATCH_DELAY) prevents overwhelming free‑tier APIs.
+  - Otherwise, we run the scan (fallback) via the monolithic /scan endpoint.
 
 Manual override:
   - If FORCE_SCAN=true, the window check is bypassed (for manual testing).
-  - A start notification is sent once per day at the first run.
-  - Overall scan timeout is 1 hour; partial results are sent if the scan is cut short.
+  - A start notification is sent every run within the window or forced.
+  - Overall scan timeout is 1 hour; the /scan endpoint is called with that timeout.
 """
 import os
 import json
@@ -32,7 +27,6 @@ import time
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from upstash_redis import Redis
@@ -80,12 +74,6 @@ BUY_FAMILY = {"BUY NOW", "PREPARE TO BUY", "HOLD"}
 
 # Scan interval (60 minutes)
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
-# Per-symbol timeout (seconds)
-SYMBOL_TIMEOUT = int(os.getenv("SYMBOL_TIMEOUT", "120"))
-# Max parallel symbols (reduced to avoid rate limits)
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
-# Delay between batches (seconds)
-BATCH_DELAY = float(os.getenv("BATCH_DELAY", "1.0"))
 # Overall scan timeout – 1 hour (3600 seconds)
 SCAN_TIMEOUT_TOTAL = int(os.getenv("SCAN_TIMEOUT_TOTAL", "3600"))
 # Force scan (bypass window check)
@@ -197,97 +185,30 @@ def run_event_check():
         logger.warning("Event check failed (non-fatal): %s", e)
 
 
-def analyze_one(symbol: str, timeout: int = SYMBOL_TIMEOUT) -> Dict[str, Any]:
-    """Fetch analysis for a single symbol from the gateway."""
+def run_scan() -> Dict[str, Any]:
+    """
+    Trigger a full market scan via the /scan endpoint with the overall timeout.
+    Returns the scan result dict, or an empty dict on failure.
+    """
     try:
-        resp = httpx.get(f"{API_GATEWAY_URL}/analyze/{symbol}", timeout=timeout)
+        logger.info(f"Calling /scan with timeout {SCAN_TIMEOUT_TOTAL}s")
+        resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=SCAN_TIMEOUT_TOTAL)
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+        logger.info("Scan complete: %s", result.get("verdict"))
+        # Detect decision changes from the scan results
+        check_decision_changes(result.get("all_results", []))
+        return result
+    except httpx.TimeoutException:
+        logger.error(f"Scan timed out after {SCAN_TIMEOUT_TOTAL}s")
+        # Send a "timed out" notification
+        _notify(
+            "⏱️ Scan Timed Out",
+            f"The market scan timed out after {SCAN_TIMEOUT_TOTAL}s. No results available."
+        )
     except Exception as e:
-        logger.error(f"Error analyzing {symbol}: {e}")
-        return {"symbol": symbol, "decision": "ERROR", "error": str(e)}
-
-
-def run_scan_individual() -> Dict[str, Any]:
-    """
-    Scan all symbols in parallel using individual /analyze calls.
-    Uses a small concurrency and batch delay to avoid rate limits.
-    Stops after SCAN_TIMEOUT_TOTAL seconds and returns partial results.
-    """
-    # Get watchlist
-    try:
-        wl_resp = httpx.get(f"{API_GATEWAY_URL}/watchlist", timeout=15)
-        wl_resp.raise_for_status()
-        symbols = wl_resp.json().get("symbols", [])
-    except Exception as e:
-        logger.error(f"Failed to fetch watchlist: {e}")
-        return {}
-
-    if not symbols:
-        logger.warning("No symbols in watchlist")
-        return {}
-
-    logger.info(f"Scanning {len(symbols)} symbols individually (parallel, max {MAX_WORKERS})")
-    start = datetime.now()
-    results = []
-    timed_out = False
-
-    # Process in batches
-    for i in range(0, len(symbols), MAX_WORKERS):
-        # Check overall timeout
-        elapsed = (datetime.now() - start).total_seconds()
-        if elapsed > SCAN_TIMEOUT_TOTAL:
-            logger.warning(f"Overall scan timeout of {SCAN_TIMEOUT_TOTAL}s reached. Partial results will be returned.")
-            timed_out = True
-            break
-
-        batch = symbols[i:i + MAX_WORKERS]
-        logger.debug(f"Processing batch {i//MAX_WORKERS + 1}: {batch}")
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_symbol = {executor.submit(analyze_one, sym): sym for sym in batch}
-            for future in as_completed(future_to_symbol):
-                # Check timeout for each future individually
-                remaining = SCAN_TIMEOUT_TOTAL - (datetime.now() - start).total_seconds()
-                if remaining <= 0:
-                    timed_out = True
-                    break
-                sym = future_to_symbol[future]
-                try:
-                    data = future.result(timeout=min(SYMBOL_TIMEOUT, remaining + 10))
-                    results.append(data)
-                except Exception as e:
-                    logger.error(f"Future error for {sym}: {e}")
-                    results.append({"symbol": sym, "decision": "ERROR", "error": str(e)})
-        if timed_out:
-            break
-
-        # Delay between batches to avoid rate limits
-        if i + MAX_WORKERS < len(symbols):
-            time.sleep(BATCH_DELAY)
-
-    elapsed = (datetime.now() - start).total_seconds()
-    logger.info(f"Individual scan completed in {elapsed:.2f}s for {len(results)} symbols (timed_out={timed_out})")
-
-    # Filter out errors for decision change detection
-    valid_results = [r for r in results if r.get("decision") not in ("ERROR", None)]
-    if valid_results:
-        check_decision_changes(valid_results)
-
-    # Build a summary
-    scan_result = {
-        "verdict": "Partial scan" if timed_out else "Individual scan completed",
-        "all_results": results,
-        "recommendations": [
-            r for r in valid_results
-            if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")
-        ][:5],
-        "scanned": len(symbols),
-        "successful": len(valid_results),
-        "elapsed": elapsed,
-        "timed_out": timed_out,
-    }
-    return scan_result
+        logger.error(f"Scan failed: {e}")
+    return {}
 
 
 def format_stock_picks(picks: List[Dict]) -> str:
@@ -343,7 +264,6 @@ def send_start_message():
     """Send a scheduler tick start notification (every run, not de‑duplicated)."""
     title = "🟢 Scheduler Tick Started"
     msg = f"Stockky scheduler tick at {datetime.now(IST).strftime('%H:%M')} IST"
-    # Include yesterday's top picks if available
     yesterday = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
     picks = get_daily_picks(yesterday)
     if picks:
@@ -352,7 +272,6 @@ def send_start_message():
 
 
 def send_market_open_announcement():
-    """Send 'Market opens in 1 hour' along with the top picks from the previous day."""
     yesterday = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
     picks = get_daily_picks(yesterday)
 
@@ -369,24 +288,16 @@ def send_market_open_now():
     _notify("\U0001F7E2 Market is now open", "Trading has started. Let's find opportunities!")
 
 
-def send_scan_picks(picks: List[Dict], timed_out: bool = False):
+def send_scan_picks(picks: List[Dict]):
     timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
-    if timed_out:
-        title = "⏱️ Scan Timed Out (Partial Results)"
-        if not picks:
-            msg = f"Scan timed out after 1 hour – no actionable stocks found yet.\nTime: {timestamp}"
-        else:
-            msg = f"Scan timed out after 1 hour – partial picks:\n\n{format_stock_picks(picks)}\n\n⏱️ {timestamp}"
-        _notify(title, msg)
+    if not picks:
+        _notify(
+            "\U0001F6AB No buy signals",
+            f"No actionable BUY NOW / PREPARE TO BUY stocks at this hour.\nTime: {timestamp}"
+        )
     else:
-        if not picks:
-            _notify(
-                "\U0001F6AB No buy signals",
-                f"No actionable BUY NOW / PREPARE TO BUY stocks at this hour.\nTime: {timestamp}"
-            )
-        else:
-            msg = format_stock_picks(picks) + f"\n\n⏱️ {timestamp}"
-            _notify("\U0001F4C8 Market Scan Update", msg)
+        msg = format_stock_picks(picks) + f"\n\n⏱️ {timestamp}"
+        _notify("\U0001F4C8 Market Scan Update", msg)
 
 
 def send_close_summary(date_str: str):
@@ -503,22 +414,21 @@ def main():
                 _notify("⚠️ Scan Aborted", f"API Gateway unreachable at {time_now.strftime('%H:%M')} IST.")
                 return
 
-            logger.info("Running individual symbol scan (fallback) at %s", time_now.strftime("%H:%M"))
-            scan_result = run_scan_individual()
+            logger.info("Running scan (fallback) at %s", time_now.strftime("%H:%M"))
+            scan_result = run_scan()
 
             if scan_result:
                 picks = scan_result.get("recommendations", [])
-                timed_out = scan_result.get("timed_out", False)
-                if picks or timed_out:
-                    send_scan_picks(picks, timed_out=timed_out)
-                    if picks:
-                        store_daily_picks(today_str, picks)
+                if picks:
+                    store_daily_picks(today_str, picks)
+                    send_scan_picks(picks)
                 else:
                     send_scan_picks([])
 
                 run_event_check()
             else:
-                logger.error("Scan failed – no results available.")
+                # run_scan already sent a timeout notification if it timed out
+                # If it failed for other reasons, send a generic failure
                 _notify(
                     "⚠️ Scan Failed",
                     f"The market scan at {time_now.strftime('%H:%M')} IST could not complete. Please check the API Gateway logs."
