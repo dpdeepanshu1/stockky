@@ -4,7 +4,7 @@ Scheduler — single-shot mode, driven by GitHub Actions cron.
 Enhanced with timed notifications:
   - 08:15 IST: "Market opens in 1 hour" + top picks from previous day.
   - 09:15 IST: "Market is open now"
-  - Hourly scans (08:30..15:30) with top picks
+  - Hourly scans (08:20..15:20) with top picks
   - 15:30 IST: Market close summary
   - 16:30 IST: "Going to sleep" + preview for tomorrow
 Uses Redis to track sent messages (so each event fires only once per day).
@@ -13,10 +13,17 @@ Coordination with Render scheduler service:
   - Before performing a scan, we check Redis key "stockky:scheduler:last_scan_timestamp"
   - If the timestamp is within the last SCAN_INTERVAL_MINUTES (60 min), we skip
     the scan and its notifications to avoid duplication.
-  - Otherwise, we run the scan (fallback) and send top picks / decision changes.
+  - Otherwise, we run the scan (fallback) by analyzing each symbol individually
+    in parallel (more reliable than the monolithic /scan endpoint).
 
-Timeout for the full scan is set to 7200 seconds (2 hours) to accommodate the
-entire pipeline and cold starts, with up to 3 retry attempts on connection failures.
+Rate‑limiting considerations:
+  - Default concurrency is 5 symbols at a time (MAX_WORKERS).
+  - A 1‑second delay between batches (BATCH_DELAY) prevents overwhelming free‑tier APIs.
+
+Manual override:
+  - If FORCE_SCAN=true, the window check is bypassed (for manual testing).
+  - A start notification is sent once per day at the first run.
+  - Overall scan timeout is 1 hour; partial results are sent if the scan is cut short.
 """
 import os
 import json
@@ -25,6 +32,7 @@ import time
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from upstash_redis import Redis
@@ -40,7 +48,7 @@ IST = ZoneInfo("Asia/Kolkata")
 # Market hours (IST)
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
-SCAN_START = dtime(8, 30)   # first scan
+SCAN_START = dtime(8, 15)   # widened to allow early start (08:20)
 SCAN_END = dtime(15, 30)    # last scan (at close)
 OPEN_ANNOUNCE_TIME = dtime(8, 15)   # 1 hour before open
 CLOSE_SUMMARY_TIME = dtime(15, 30)
@@ -54,8 +62,9 @@ CLOSE_MSG_KEY = "stockky:scheduler:close_msg:"   # + date (sent close summary)
 SLEEP_MSG_KEY = "stockky:scheduler:sleep_msg:"   # + date (sent sleep)
 DAILY_PICKS_KEY = "stockky:scheduler:picks:"     # + date (store top picks of the day)
 LAST_SCAN_KEY = "stockky:scheduler:last_scan_timestamp"   # written by scheduler service
+START_MSG_KEY = "stockky:scheduler:start_msg:"   # + date (sent start message)
 
-# NSE holidays 2026 (static; can be extended or fetched from API)
+# NSE holidays 2026
 HOLIDAYS_2026 = [
     "2026-01-26", "2026-03-02", "2026-03-31", "2026-04-02",
     "2026-04-10", "2026-04-14", "2026-05-01", "2026-08-15",
@@ -69,10 +78,18 @@ _redis = Redis(
 
 BUY_FAMILY = {"BUY NOW", "PREPARE TO BUY", "HOLD"}
 
-# Now scans run every hour (60 minutes)
+# Scan interval (60 minutes)
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
-# Timeout for the full scan – 2 hours (7200 seconds)
-SCAN_TIMEOUT_SECONDS = int(os.getenv("SCAN_TIMEOUT_SECONDS", "7200"))
+# Per-symbol timeout (seconds)
+SYMBOL_TIMEOUT = int(os.getenv("SYMBOL_TIMEOUT", "120"))
+# Max parallel symbols (reduced to avoid rate limits)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
+# Delay between batches (seconds)
+BATCH_DELAY = float(os.getenv("BATCH_DELAY", "1.0"))
+# Overall scan timeout – 1 hour (3600 seconds)
+SCAN_TIMEOUT_TOTAL = int(os.getenv("SCAN_TIMEOUT_TOTAL", "3600"))
+# Force scan (bypass window check)
+FORCE_SCAN = os.getenv("FORCE_SCAN", "false").lower() == "true"
 
 
 def is_holiday(today: datetime) -> bool:
@@ -95,21 +112,6 @@ def _wake_up_services():
             logger.debug(f"Wake-up ping to {url} succeeded")
         except Exception as e:
             logger.warning(f"Wake-up ping to {url} failed: {e}")
-
-
-def _wait_for_gateway_health(max_attempts: int = 3, delay: int = 15) -> bool:
-    """Check if the API Gateway is healthy; wait if not."""
-    for attempt in range(max_attempts):
-        try:
-            resp = httpx.get(f"{API_GATEWAY_URL}/health", timeout=10)
-            if resp.status_code == 200:
-                logger.info("API Gateway is healthy.")
-                return True
-        except Exception:
-            pass
-        logger.warning(f"API Gateway not ready, attempt {attempt+1}/{max_attempts} – waiting {delay}s...")
-        time.sleep(delay)
-    return False
 
 
 def _notify(title: str, message: str, channel: str = "telegram", retries: int = 3):
@@ -195,35 +197,97 @@ def run_event_check():
         logger.warning("Event check failed (non-fatal): %s", e)
 
 
-def run_scan_and_diff(timeout: int = SCAN_TIMEOUT_SECONDS, max_retries: int = 3) -> Dict[str, Any]:
+def analyze_one(symbol: str, timeout: int = SYMBOL_TIMEOUT) -> Dict[str, Any]:
+    """Fetch analysis for a single symbol from the gateway."""
+    try:
+        resp = httpx.get(f"{API_GATEWAY_URL}/analyze/{symbol}", timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"Error analyzing {symbol}: {e}")
+        return {"symbol": symbol, "decision": "ERROR", "error": str(e)}
+
+
+def run_scan_individual() -> Dict[str, Any]:
     """
-    Fetch scan results with a long timeout and multiple retries on connection failures.
-    Uses exponential backoff: 30s, 60s, 120s.
+    Scan all symbols in parallel using individual /analyze calls.
+    Uses a small concurrency and batch delay to avoid rate limits.
+    Stops after SCAN_TIMEOUT_TOTAL seconds and returns partial results.
     """
-    attempt = 0
-    backoff = 30
-    while attempt <= max_retries:
-        try:
-            logger.info(f"Calling /scan (attempt {attempt+1}/{max_retries+1}) with timeout {timeout}s")
-            resp = httpx.get(f"{API_GATEWAY_URL}/scan", timeout=timeout)
-            resp.raise_for_status()
-            result = resp.json()
-            logger.info("Scan complete: %s", result.get("verdict"))
-            check_decision_changes(result.get("all_results", []))
-            return result
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.StreamError) as e:
-            logger.error(f"Connection/stream error (attempt {attempt+1}): {e}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Scan returned HTTP error {e.response.status_code}: {e.response.text[:200]}")
-        except Exception as e:
-            logger.error(f"Scan failed with unexpected error: {e}")
-        attempt += 1
-        if attempt <= max_retries:
-            wait = min(backoff, 300)  # cap at 5 minutes
-            logger.info(f"Retrying in {wait}s...")
-            time.sleep(wait)
-            backoff *= 2  # exponential backoff
-    return {}
+    # Get watchlist
+    try:
+        wl_resp = httpx.get(f"{API_GATEWAY_URL}/watchlist", timeout=15)
+        wl_resp.raise_for_status()
+        symbols = wl_resp.json().get("symbols", [])
+    except Exception as e:
+        logger.error(f"Failed to fetch watchlist: {e}")
+        return {}
+
+    if not symbols:
+        logger.warning("No symbols in watchlist")
+        return {}
+
+    logger.info(f"Scanning {len(symbols)} symbols individually (parallel, max {MAX_WORKERS})")
+    start = datetime.now()
+    results = []
+    timed_out = False
+
+    # Process in batches
+    for i in range(0, len(symbols), MAX_WORKERS):
+        # Check overall timeout
+        elapsed = (datetime.now() - start).total_seconds()
+        if elapsed > SCAN_TIMEOUT_TOTAL:
+            logger.warning(f"Overall scan timeout of {SCAN_TIMEOUT_TOTAL}s reached. Partial results will be returned.")
+            timed_out = True
+            break
+
+        batch = symbols[i:i + MAX_WORKERS]
+        logger.debug(f"Processing batch {i//MAX_WORKERS + 1}: {batch}")
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_symbol = {executor.submit(analyze_one, sym): sym for sym in batch}
+            for future in as_completed(future_to_symbol):
+                # Check timeout for each future individually
+                remaining = SCAN_TIMEOUT_TOTAL - (datetime.now() - start).total_seconds()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                sym = future_to_symbol[future]
+                try:
+                    data = future.result(timeout=min(SYMBOL_TIMEOUT, remaining + 10))
+                    results.append(data)
+                except Exception as e:
+                    logger.error(f"Future error for {sym}: {e}")
+                    results.append({"symbol": sym, "decision": "ERROR", "error": str(e)})
+        if timed_out:
+            break
+
+        # Delay between batches to avoid rate limits
+        if i + MAX_WORKERS < len(symbols):
+            time.sleep(BATCH_DELAY)
+
+    elapsed = (datetime.now() - start).total_seconds()
+    logger.info(f"Individual scan completed in {elapsed:.2f}s for {len(results)} symbols (timed_out={timed_out})")
+
+    # Filter out errors for decision change detection
+    valid_results = [r for r in results if r.get("decision") not in ("ERROR", None)]
+    if valid_results:
+        check_decision_changes(valid_results)
+
+    # Build a summary
+    scan_result = {
+        "verdict": "Partial scan" if timed_out else "Individual scan completed",
+        "all_results": results,
+        "recommendations": [
+            r for r in valid_results
+            if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")
+        ][:5],
+        "scanned": len(symbols),
+        "successful": len(valid_results),
+        "elapsed": elapsed,
+        "timed_out": timed_out,
+    }
+    return scan_result
 
 
 def format_stock_picks(picks: List[Dict]) -> str:
@@ -275,7 +339,20 @@ def get_daily_picks(date_str: str) -> List[Dict]:
     return []
 
 
+def send_start_message():
+    """Send a scheduler tick start notification (every run, not de‑duplicated)."""
+    title = "🟢 Scheduler Tick Started"
+    msg = f"Stockky scheduler tick at {datetime.now(IST).strftime('%H:%M')} IST"
+    # Include yesterday's top picks if available
+    yesterday = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
+    picks = get_daily_picks(yesterday)
+    if picks:
+        msg += "\n\n" + format_stock_picks(picks)
+    _notify(title, msg)
+
+
 def send_market_open_announcement():
+    """Send 'Market opens in 1 hour' along with the top picks from the previous day."""
     yesterday = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
     picks = get_daily_picks(yesterday)
 
@@ -292,16 +369,24 @@ def send_market_open_now():
     _notify("\U0001F7E2 Market is now open", "Trading has started. Let's find opportunities!")
 
 
-def send_scan_picks(picks: List[Dict]):
+def send_scan_picks(picks: List[Dict], timed_out: bool = False):
     timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
-    if not picks:
-        _notify(
-            "\U0001F6AB No buy signals",
-            f"No actionable BUY NOW / PREPARE TO BUY stocks at this hour.\nTime: {timestamp}"
-        )
+    if timed_out:
+        title = "⏱️ Scan Timed Out (Partial Results)"
+        if not picks:
+            msg = f"Scan timed out after 1 hour – no actionable stocks found yet.\nTime: {timestamp}"
+        else:
+            msg = f"Scan timed out after 1 hour – partial picks:\n\n{format_stock_picks(picks)}\n\n⏱️ {timestamp}"
+        _notify(title, msg)
     else:
-        msg = format_stock_picks(picks) + f"\n\n⏱️ {timestamp}"
-        _notify("\U0001F4C8 Market Scan Update", msg)
+        if not picks:
+            _notify(
+                "\U0001F6AB No buy signals",
+                f"No actionable BUY NOW / PREPARE TO BUY stocks at this hour.\nTime: {timestamp}"
+            )
+        else:
+            msg = format_stock_picks(picks) + f"\n\n⏱️ {timestamp}"
+            _notify("\U0001F4C8 Market Scan Update", msg)
 
 
 def send_close_summary(date_str: str):
@@ -358,6 +443,8 @@ def main():
 
     logger.info("Current IST time: %s", now.strftime("%Y-%m-%d %H:%M:%S"))
     logger.info("Scan window: %s – %s", SCAN_START.strftime("%H:%M"), SCAN_END.strftime("%H:%M"))
+    if FORCE_SCAN:
+        logger.info("FORCE_SCAN is enabled – window check will be bypassed.")
 
     if is_holiday(now):
         logger.info("Market holiday – skipping all activity.")
@@ -365,7 +452,11 @@ def main():
 
     sync_event_subscriptions()
 
-    # Timed notifications
+    # Send start message every time the runner runs (within window or forced)
+    if FORCE_SCAN or (SCAN_START <= time_now <= SCAN_END):
+        send_start_message()
+
+    # Timed notifications (each once per day)
     if time_now == OPEN_ANNOUNCE_TIME:
         if not _redis.get(OPEN_MSG_KEY + today_str):
             send_market_open_announcement()
@@ -386,41 +477,54 @@ def main():
             send_sleep_message()
             _redis.set(SLEEP_MSG_KEY + today_str, "1", ex=86400)
 
-    # Regular scan – runs at ANY minute within the scan window,
-    # but only if the scheduler hasn't scanned recently (within 60 min).
-    if SCAN_START <= time_now <= SCAN_END:
+    # Determine if we should run a scan
+    should_run = False
+    if FORCE_SCAN:
+        should_run = True
+        logger.info("FORCE_SCAN: running scan regardless of window.")
+    elif SCAN_START <= time_now <= SCAN_END:
+        should_run = True
+    else:
+        logger.info("Outside scan window and FORCE_SCAN not set – skipping scan.")
+
+    if should_run:
         if should_skip_scan():
             logger.info("Skipping GitHub scan because scheduler service handled it.")
         else:
-            # First, make sure the API Gateway is healthy
-            if not _wait_for_gateway_health(max_attempts=3, delay=15):
-                logger.error("API Gateway not healthy after multiple attempts – aborting scan.")
-                _notify(
-                    "⚠️ Scan Aborted",
-                    f"API Gateway is not healthy at {time_now.strftime('%H:%M')} IST. Please check the service."
-                )
+            # Quick health check
+            try:
+                health = httpx.get(f"{API_GATEWAY_URL}/health", timeout=5)
+                if health.status_code != 200:
+                    logger.error("API Gateway not healthy, aborting scan.")
+                    _notify("⚠️ Scan Aborted", f"API Gateway is not healthy at {time_now.strftime('%H:%M')} IST.")
+                    return
+            except Exception:
+                logger.error("API Gateway unreachable, aborting scan.")
+                _notify("⚠️ Scan Aborted", f"API Gateway unreachable at {time_now.strftime('%H:%M')} IST.")
                 return
 
-            logger.info("Running scan (fallback) at %s", time_now.strftime("%H:%M"))
-            scan_result = run_scan_and_diff()
+            logger.info("Running individual symbol scan (fallback) at %s", time_now.strftime("%H:%M"))
+            scan_result = run_scan_individual()
 
             if scan_result:
                 picks = scan_result.get("recommendations", [])
-                if picks:
-                    store_daily_picks(today_str, picks)
-                    send_scan_picks(picks)
+                timed_out = scan_result.get("timed_out", False)
+                if picks or timed_out:
+                    send_scan_picks(picks, timed_out=timed_out)
+                    if picks:
+                        store_daily_picks(today_str, picks)
                 else:
                     send_scan_picks([])
 
                 run_event_check()
             else:
-                logger.error("Scan failed after all retries – no results available.")
+                logger.error("Scan failed – no results available.")
                 _notify(
                     "⚠️ Scan Failed",
                     f"The market scan at {time_now.strftime('%H:%M')} IST could not complete. Please check the API Gateway logs."
                 )
     else:
-        logger.info("Outside scan window – skipping scan.")
+        logger.info("Skipping scan due to window/force settings.")
 
     logger.info("Scheduler tick completed.")
 
