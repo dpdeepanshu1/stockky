@@ -1285,6 +1285,34 @@ def run_scan(force_refresh: bool = False):
     _send_scan_notification(result.get("recommendations", []), result["verdict"], result["scanned"], result["universe_size"])
     return result
 
+# ============================================================================
+# NEW: Batch scan endpoint – used by GitHub Actions runner
+# ============================================================================
+
+@app.post("/scan/batch")
+async def scan_batch(request: Request):
+    """
+    Analyse a batch of symbols (max 15) and return results quickly.
+    Uses the same parallel logic as the full scan but limited to the batch.
+    """
+    data = await request.json()
+    symbols = data.get("symbols", [])
+    if len(symbols) > 15:
+        raise HTTPException(status_code=400, detail="Maximum 15 symbols per batch")
+
+    # Use a semaphore to limit concurrent downstream calls inside this batch
+    sem = asyncio.Semaphore(10)
+    async with httpx.AsyncClient(timeout=240) as client:
+        tasks = [_analyze_one_symbol_ultra(sym, client, sem) for sym in symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        final_results = []
+        for sym, result in zip(symbols, results):
+            if isinstance(result, Exception):
+                final_results.append({"symbol": sym, "decision": "ERROR", "error": str(result)})
+            else:
+                final_results.append(result)
+        return {"results": final_results}
+
 # ── Async scan endpoints ──────────────────────────────────────────────────
 @app.post("/scan/start")
 def start_scan(force_refresh: bool = False, background_tasks: BackgroundTasks = None):

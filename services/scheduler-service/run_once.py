@@ -1,29 +1,7 @@
 """
 Scheduler — single-shot mode, driven by GitHub Actions cron.
 
-Enhanced with timed notifications:
-  - 08:15 IST: "Market opens in 1 hour" + top picks from previous day.
-  - 09:15 IST: "Market is open now"
-  - Hourly scans (08:20..15:20) with top picks
-  - 15:30 IST: Market close summary
-  - 16:30 IST: "Going to sleep" + preview for tomorrow
-Uses Redis to track sent messages (so each event fires only once per day).
-
-Coordination with Render scheduler service:
-  - Before performing a scan, we check Redis key "stockky:scheduler:last_scan_timestamp"
-  - If the timestamp is within the last SCAN_INTERVAL_MINUTES (60 min), we skip
-    the scan and its notifications to avoid duplication.
-  - Otherwise, we run the scan (fallback) via the monolithic /scan endpoint.
-
-Manual override:
-  - If FORCE_SCAN=true, the window check is bypassed (for manual testing).
-  - A start notification is sent every run within the window or forced.
-  - Overall scan timeout is 1 hour; the /scan endpoint is called with that timeout.
-
-Retry strategy:
-  - Up to 3 attempts with exponential backoff (10s, 20s, 40s).
-  - If the gateway disconnects, we retry from scratch (the gateway doesn't support resuming).
-  - A final notification is sent if all attempts fail.
+Now uses batch scanning via /scan/batch to avoid monolithic timeouts.
 """
 import os
 import json
@@ -32,6 +10,7 @@ import time
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from upstash_redis import Redis
@@ -47,23 +26,22 @@ IST = ZoneInfo("Asia/Kolkata")
 # Market hours (IST)
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
-SCAN_START = dtime(8, 15)   # widened to allow early start (08:20)
-SCAN_END = dtime(15, 30)    # last scan (at close)
-OPEN_ANNOUNCE_TIME = dtime(8, 15)   # 1 hour before open
+SCAN_START = dtime(8, 15)
+SCAN_END = dtime(15, 30)
+OPEN_ANNOUNCE_TIME = dtime(8, 15)
 CLOSE_SUMMARY_TIME = dtime(15, 30)
 SLEEP_TIME = dtime(16, 30)
 
 # Redis keys
 STATE_KEY = "stockky:scheduler:last_decisions"
-OPEN_MSG_KEY = "stockky:scheduler:open_msg:"     # + date (sent open-in-1h)
-OPEN_NOW_KEY = "stockky:scheduler:open_now:"     # + date (sent market-open)
-CLOSE_MSG_KEY = "stockky:scheduler:close_msg:"   # + date (sent close summary)
-SLEEP_MSG_KEY = "stockky:scheduler:sleep_msg:"   # + date (sent sleep)
-DAILY_PICKS_KEY = "stockky:scheduler:picks:"     # + date (store top picks of the day)
-LAST_SCAN_KEY = "stockky:scheduler:last_scan_timestamp"   # written by scheduler service
-START_MSG_KEY = "stockky:scheduler:start_msg:"   # + date (sent start message)
+OPEN_MSG_KEY = "stockky:scheduler:open_msg:"
+OPEN_NOW_KEY = "stockky:scheduler:open_now:"
+CLOSE_MSG_KEY = "stockky:scheduler:close_msg:"
+SLEEP_MSG_KEY = "stockky:scheduler:sleep_msg:"
+DAILY_PICKS_KEY = "stockky:scheduler:picks:"
+LAST_SCAN_KEY = "stockky:scheduler:last_scan_timestamp"
+START_MSG_KEY = "stockky:scheduler:start_msg:"
 
-# NSE holidays 2026
 HOLIDAYS_2026 = [
     "2026-01-26", "2026-03-02", "2026-03-31", "2026-04-02",
     "2026-04-10", "2026-04-14", "2026-05-01", "2026-08-15",
@@ -77,13 +55,11 @@ _redis = Redis(
 
 BUY_FAMILY = {"BUY NOW", "PREPARE TO BUY", "HOLD"}
 
-# Scan interval (60 minutes)
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
-# Overall scan timeout – 1 hour (3600 seconds)
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "15"))          # max symbols per batch
+MAX_CONCURRENT_BATCHES = int(os.getenv("MAX_CONCURRENT_BATCHES", "3"))
+BATCH_TIMEOUT = int(os.getenv("BATCH_TIMEOUT", "120"))   # seconds per batch
 SCAN_TIMEOUT_TOTAL = int(os.getenv("SCAN_TIMEOUT_TOTAL", "3600"))
-# Max retries
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-# Force scan (bypass window check)
 FORCE_SCAN = os.getenv("FORCE_SCAN", "false").lower() == "true"
 
 
@@ -95,40 +71,26 @@ def is_holiday(today: datetime) -> bool:
 
 
 def _wake_up_services():
-    """Ping all critical services to ensure they are awake."""
-    services = [
-        API_GATEWAY_URL,
-        NOTIFICATION_URL,
-        EVENT_TRACKER_URL,
-    ]
+    services = [API_GATEWAY_URL, NOTIFICATION_URL, EVENT_TRACKER_URL]
     for url in services:
         try:
             httpx.get(f"{url}/health", timeout=10)
-            logger.debug(f"Wake-up ping to {url} succeeded")
-        except Exception as e:
-            logger.warning(f"Wake-up ping to {url} failed: {e}")
+        except Exception:
+            pass
 
 
 def _notify(title: str, message: str, channel: str = "telegram", retries: int = 3):
-    """Send notification with retries, longer timeout, and wake‑up first."""
     _wake_up_services()
     time.sleep(5)
-
     payload = {"title": title, "message": message, "channel": channel}
     for attempt in range(retries + 1):
         try:
-            resp = httpx.post(
-                f"{NOTIFICATION_URL}/notify",
-                json=payload,
-                timeout=60
-            )
+            resp = httpx.post(f"{NOTIFICATION_URL}/notify", json=payload, timeout=60)
             if resp.status_code == 200:
                 logger.info("Notification sent: %s", title)
                 return
-            else:
-                logger.warning(f"Notification attempt {attempt+1} returned {resp.status_code}")
-        except httpx.HTTPError as e:
-            logger.warning(f"Notification attempt {attempt+1} failed: {e}")
+        except Exception as e:
+            logger.warning(f"Notify attempt {attempt+1} failed: {e}")
         if attempt < retries:
             time.sleep(10)
     logger.error("Notification failed after all retries: %s", title)
@@ -138,35 +100,28 @@ def _load_last_decisions() -> dict:
     try:
         val = _redis.get(STATE_KEY)
         return json.loads(val) if val else {}
-    except Exception as e:
-        logger.warning("Could not load previous decisions from Redis: %s", e)
+    except Exception:
         return {}
 
 
 def _save_last_decisions(decisions: dict):
     try:
         _redis.set(STATE_KEY, json.dumps(decisions))
-    except Exception as e:
-        logger.warning("Could not persist decisions to Redis: %s", e)
+    except Exception:
+        pass
 
 
 def check_decision_changes(all_results: list):
     previous = _load_last_decisions()
     current = {r["symbol"]: r["decision"] for r in all_results}
-
     for symbol, decision in current.items():
-        prev_decision = previous.get(symbol)
-        if decision == "BUY NOW" and prev_decision != "BUY NOW":
-            _notify(
-                f"\U0001F7E2 New BUY NOW: {symbol}",
-                f"{symbol} just became a BUY NOW opportunity. Check Stockky for entry/target/stop-loss.",
-            )
-        elif decision == "SELL" and prev_decision in BUY_FAMILY:
-            _notify(
-                f"\U0001F534 {symbol} flipped to SELL",
-                f"{symbol} moved from {prev_decision} to SELL. Review your position.",
-            )
-
+        prev = previous.get(symbol)
+        if decision == "BUY NOW" and prev != "BUY NOW":
+            _notify(f"🟢 New BUY NOW: {symbol}",
+                    f"{symbol} just became a BUY NOW opportunity.")
+        elif decision == "SELL" and prev in BUY_FAMILY:
+            _notify(f"🔴 {symbol} flipped to SELL",
+                    f"{symbol} moved from {prev} to SELL.")
     _save_last_decisions(current)
 
 
@@ -174,9 +129,9 @@ def sync_event_subscriptions():
     try:
         wl = httpx.get(f"{API_GATEWAY_URL}/watchlist", timeout=15).json()
         httpx.post(f"{EVENT_TRACKER_URL}/subscribe", json={"symbols": wl["symbols"]}, timeout=15)
-        logger.info("Event Tracker subscriptions synced: %s", wl["symbols"])
-    except httpx.HTTPError as e:
-        logger.warning("Could not sync event subscriptions (non-fatal): %s", e)
+        logger.info("Event Tracker subscriptions synced")
+    except Exception as e:
+        logger.warning(f"Event sync failed: {e}")
 
 
 def run_event_check():
@@ -185,62 +140,97 @@ def run_event_check():
         resp.raise_for_status()
         result = resp.json()
         for change in result.get("changes", []):
-            _notify(f"\U0001F4C5 Event update: {change['symbol']}", "\n".join(change["changes"]))
-        if result.get("changes"):
-            logger.info("Event changes detected: %d", len(result["changes"]))
-    except httpx.HTTPError as e:
-        logger.warning("Event check failed (non-fatal): %s", e)
+            _notify(f"📅 Event update: {change['symbol']}", "\n".join(change["changes"]))
+    except Exception as e:
+        logger.warning(f"Event check failed: {e}")
+
+
+def scan_batch(symbols: List[str], timeout: int = BATCH_TIMEOUT) -> List[Dict]:
+    """Call /scan/batch for a list of symbols."""
+    try:
+        resp = httpx.post(
+            f"{API_GATEWAY_URL}/scan/batch",
+            json={"symbols": symbols},
+            timeout=timeout
+        )
+        resp.raise_for_status()
+        return resp.json().get("results", [])
+    except Exception as e:
+        logger.error(f"Batch scan failed for {symbols}: {e}")
+        # Return error entries for each symbol
+        return [{"symbol": sym, "decision": "ERROR", "error": str(e)} for sym in symbols]
 
 
 def run_scan() -> Dict[str, Any]:
-    """
-    Trigger a full market scan via the /scan endpoint with retries.
-    Uses exponential backoff between attempts.
-    """
-    attempt = 0
-    backoff = 10  # seconds
-    last_error = None
-    while attempt <= MAX_RETRIES:
-        try:
-            logger.info(f"Calling /scan (attempt {attempt+1}/{MAX_RETRIES+1}) with timeout {SCAN_TIMEOUT_TOTAL}s")
-            # Use a longer timeout and keep-alive
-            with httpx.Client(timeout=SCAN_TIMEOUT_TOTAL) as client:
-                resp = client.get(f"{API_GATEWAY_URL}/scan", headers={"Connection": "keep-alive"})
-            resp.raise_for_status()
-            result = resp.json()
-            logger.info("Scan complete: %s", result.get("verdict"))
-            # Detect decision changes from the scan results
-            check_decision_changes(result.get("all_results", []))
-            return result
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.StreamError) as e:
-            last_error = e
-            logger.error(f"Scan attempt {attempt+1} failed with connection/stream error: {e}")
-            if "Server disconnected" in str(e):
-                logger.error("The gateway likely crashed mid-scan. This often indicates memory exhaustion.")
-                # If gateway is crashed, wait longer before retrying
-                backoff = 30
-        except Exception as e:
-            last_error = e
-            logger.error(f"Scan attempt {attempt+1} failed with unexpected error: {e}")
-        attempt += 1
-        if attempt <= MAX_RETRIES:
-            logger.info(f"Retrying in {backoff}s...")
-            time.sleep(backoff)
-            backoff *= 2  # exponential backoff
-    # All attempts failed
-    error_msg = f"Scan failed after {MAX_RETRIES+1} attempts. Last error: {last_error}"
-    logger.error(error_msg)
-    _notify(
-        "⏱️ Scan Failed After Retries",
-        f"The market scan could not complete after {MAX_RETRIES+1} attempts. The last error was: {last_error}\n\nPlease check:\n- API Gateway memory (needs >512MB for large watchlists)\n- Gateway logs for 'Killed' or 'MemoryError'"
-    )
-    return {}
+    """Run batch scans in parallel, collect results, return summary."""
+    # Get watchlist
+    try:
+        wl_resp = httpx.get(f"{API_GATEWAY_URL}/watchlist", timeout=15)
+        wl_resp.raise_for_status()
+        symbols = wl_resp.json().get("symbols", [])
+    except Exception as e:
+        logger.error(f"Failed to fetch watchlist: {e}")
+        return {}
+
+    if not symbols:
+        logger.warning("No symbols in watchlist")
+        return {}
+
+    logger.info(f"Scanning {len(symbols)} symbols in batches of {BATCH_SIZE}")
+
+    # Split into batches
+    batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
+    all_results = []
+    start_time = datetime.now()
+    timed_out = False
+
+    # Use ThreadPoolExecutor to run batches in parallel
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_BATCHES) as executor:
+        future_to_batch = {executor.submit(scan_batch, batch): batch for batch in batches}
+        for future in as_completed(future_to_batch):
+            # Check overall timeout
+            elapsed = (datetime.now() - start_time).total_seconds()
+            if elapsed > SCAN_TIMEOUT_TOTAL:
+                logger.warning(f"Overall timeout ({SCAN_TIMEOUT_TOTAL}s) reached, stopping.")
+                timed_out = True
+                break
+            try:
+                results = future.result(timeout=min(BATCH_TIMEOUT, SCAN_TIMEOUT_TOTAL - elapsed))
+                all_results.extend(results)
+            except Exception as e:
+                batch = future_to_batch[future]
+                logger.error(f"Batch {batch} failed: {e}")
+                # Add error entries
+                all_results.extend([{"symbol": sym, "decision": "ERROR", "error": str(e)} for sym in batch])
+
+    elapsed = (datetime.now() - start_time).total_seconds()
+    logger.info(f"Batch scan completed in {elapsed:.2f}s, got {len(all_results)} results")
+
+    # Filter errors
+    valid_results = [r for r in all_results if r.get("decision") not in ("ERROR", None)]
+    if valid_results:
+        check_decision_changes(valid_results)
+
+    # Top 5 picks
+    picks = [
+        r for r in valid_results
+        if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")
+    ][:5]
+
+    return {
+        "verdict": "Batch scan completed" + (" (partial)" if timed_out else ""),
+        "all_results": all_results,
+        "recommendations": picks,
+        "scanned": len(symbols),
+        "successful": len(valid_results),
+        "elapsed": elapsed,
+        "timed_out": timed_out,
+    }
 
 
 def format_stock_picks(picks: List[Dict]) -> str:
     if not picks:
         return "No actionable BUY NOW / PREPARE TO BUY stocks at the moment."
-
     lines = ["🏆 *Top Picks:*"]
     for i, p in enumerate(picks[:5], 1):
         decision = p.get("decision", "UNKNOWN")
@@ -264,7 +254,6 @@ def store_daily_picks(date_str: str, picks: List[Dict]):
             existing_picks = []
     else:
         existing_picks = []
-
     symbols = {p["symbol"]: p for p in existing_picks}
     for p in picks:
         symbols[p["symbol"]] = p
@@ -287,7 +276,6 @@ def get_daily_picks(date_str: str) -> List[Dict]:
 
 
 def send_start_message():
-    """Send a scheduler tick start notification (every run, not de‑duplicated)."""
     title = "🟢 Scheduler Tick Started"
     msg = f"Stockky scheduler tick at {datetime.now(IST).strftime('%H:%M')} IST"
     yesterday = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -300,40 +288,41 @@ def send_start_message():
 def send_market_open_announcement():
     yesterday = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
     picks = get_daily_picks(yesterday)
-
     if picks:
-        picks_msg = format_stock_picks(picks)
-        msg = f"The market will open at 09:15 IST. Get ready!\n\n{picks_msg}"
+        msg = f"The market will open at 09:15 IST. Get ready!\n\n{format_stock_picks(picks)}"
     else:
         msg = "The market will open at 09:15 IST. Get ready!"
-
-    _notify("\U0001F55B Market opens in 1 hour", msg)
+    _notify("🕐 Market opens in 1 hour", msg)
 
 
 def send_market_open_now():
-    _notify("\U0001F7E2 Market is now open", "Trading has started. Let's find opportunities!")
+    _notify("🟢 Market is now open", "Trading has started. Let's find opportunities!")
 
 
-def send_scan_picks(picks: List[Dict]):
+def send_scan_picks(picks: List[Dict], timed_out: bool = False):
     timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
-    if not picks:
-        _notify(
-            "\U0001F6AB No buy signals",
-            f"No actionable BUY NOW / PREPARE TO BUY stocks at this hour.\nTime: {timestamp}"
-        )
+    if timed_out:
+        title = "⏱️ Scan Timed Out (Partial Results)"
+        if not picks:
+            msg = f"Scan timed out – no actionable stocks found yet.\nTime: {timestamp}"
+        else:
+            msg = f"Scan timed out – partial picks:\n\n{format_stock_picks(picks)}\n\n⏱️ {timestamp}"
+        _notify(title, msg)
     else:
-        msg = format_stock_picks(picks) + f"\n\n⏱️ {timestamp}"
-        _notify("\U0001F4C8 Market Scan Update", msg)
+        if not picks:
+            _notify("🚫 No buy signals", f"No actionable stocks at this hour.\nTime: {timestamp}")
+        else:
+            msg = format_stock_picks(picks) + f"\n\n⏱️ {timestamp}"
+            _notify("📈 Market Scan Update", msg)
 
 
 def send_close_summary(date_str: str):
     picks = get_daily_picks(date_str)
     if not picks:
-        _notify("\U0001F4CA End of Day – No picks today", "No strong buy opportunities were found today.")
+        _notify("📊 End of Day – No picks today", "No strong buy opportunities were found today.")
         return
-
     best = picks[:3]
-    lines = ["📊 *End-of-Day Summary – Best picks of the day*"]
+    lines = ["📊 *End-of-Day Summary – Best picks*"]
     for i, p in enumerate(best, 1):
         sym = p.get("symbol", "?")
         decision = p.get("decision", "UNKNOWN")
@@ -343,33 +332,22 @@ def send_close_summary(date_str: str):
         stop = p.get("stop_loss", 0)
         lines.append(f"{i}. *{sym}* – {decision} (Score: {score})")
         lines.append(f"   Entry: {entry.get('low')}–{entry.get('high')} | Target: {target} | Stop: {stop}")
-    msg = "\n".join(lines)
-    _notify("\U0001F4CA End-of-Day Summary", msg)
+    _notify("📊 End-of-Day Summary", "\n".join(lines))
 
 
 def send_sleep_message():
-    _notify("\U0001F634 Going to sleep", "Good night! I'll be back tomorrow before market open. Preview for tomorrow: Keep an eye on global cues and any after-market news.")
+    _notify("🌙 Going to sleep", "Good night! I'll be back tomorrow before market open.")
 
 
 def should_skip_scan() -> bool:
     try:
         last_scan_str = _redis.get(LAST_SCAN_KEY)
         if not last_scan_str:
-            logger.info("No last scan timestamp found in Redis – will run scan (fallback).")
             return False
-
         last_scan_time = datetime.fromisoformat(last_scan_str)
         now = datetime.now(IST)
-        if (now - last_scan_time) < timedelta(minutes=SCAN_INTERVAL_MINUTES):
-            logger.info("Scheduler service already ran a scan at %s (within %d min) – skipping GitHub scan.",
-                        last_scan_time.strftime("%H:%M"), SCAN_INTERVAL_MINUTES)
-            return True
-        else:
-            logger.info("Last scan was at %s (more than %d min ago) – running GitHub scan.",
-                        last_scan_time.strftime("%H:%M"), SCAN_INTERVAL_MINUTES)
-            return False
-    except Exception as e:
-        logger.warning("Error checking last scan timestamp: %s – will run scan as fallback.", e)
+        return (now - last_scan_time) < timedelta(minutes=SCAN_INTERVAL_MINUTES)
+    except Exception:
         return False
 
 
@@ -381,82 +359,68 @@ def main():
     logger.info("Current IST time: %s", now.strftime("%Y-%m-%d %H:%M:%S"))
     logger.info("Scan window: %s – %s", SCAN_START.strftime("%H:%M"), SCAN_END.strftime("%H:%M"))
     if FORCE_SCAN:
-        logger.info("FORCE_SCAN is enabled – window check will be bypassed.")
+        logger.info("FORCE_SCAN enabled – bypassing window.")
 
     if is_holiday(now):
-        logger.info("Market holiday – skipping all activity.")
+        logger.info("Market holiday – skipping.")
         return
 
     sync_event_subscriptions()
 
-    # Send start message every time the runner runs (within window or forced)
+    # Start message
     if FORCE_SCAN or (SCAN_START <= time_now <= SCAN_END):
         send_start_message()
 
-    # Timed notifications (each once per day)
-    if time_now == OPEN_ANNOUNCE_TIME:
-        if not _redis.get(OPEN_MSG_KEY + today_str):
-            send_market_open_announcement()
-            _redis.set(OPEN_MSG_KEY + today_str, "1", ex=86400)
+    # Timed notifications (once per day)
+    if time_now == OPEN_ANNOUNCE_TIME and not _redis.get(OPEN_MSG_KEY + today_str):
+        send_market_open_announcement()
+        _redis.set(OPEN_MSG_KEY + today_str, "1", ex=86400)
 
-    if time_now == MARKET_OPEN:
-        if not _redis.get(OPEN_NOW_KEY + today_str):
-            send_market_open_now()
-            _redis.set(OPEN_NOW_KEY + today_str, "1", ex=86400)
+    if time_now == MARKET_OPEN and not _redis.get(OPEN_NOW_KEY + today_str):
+        send_market_open_now()
+        _redis.set(OPEN_NOW_KEY + today_str, "1", ex=86400)
 
-    if time_now == CLOSE_SUMMARY_TIME:
-        if not _redis.get(CLOSE_MSG_KEY + today_str):
-            send_close_summary(today_str)
-            _redis.set(CLOSE_MSG_KEY + today_str, "1", ex=86400)
+    if time_now == CLOSE_SUMMARY_TIME and not _redis.get(CLOSE_MSG_KEY + today_str):
+        send_close_summary(today_str)
+        _redis.set(CLOSE_MSG_KEY + today_str, "1", ex=86400)
 
-    if time_now == SLEEP_TIME:
-        if not _redis.get(SLEEP_MSG_KEY + today_str):
-            send_sleep_message()
-            _redis.set(SLEEP_MSG_KEY + today_str, "1", ex=86400)
+    if time_now == SLEEP_TIME and not _redis.get(SLEEP_MSG_KEY + today_str):
+        send_sleep_message()
+        _redis.set(SLEEP_MSG_KEY + today_str, "1", ex=86400)
 
-    # Determine if we should run a scan
-    should_run = False
-    if FORCE_SCAN:
-        should_run = True
-        logger.info("FORCE_SCAN: running scan regardless of window.")
-    elif SCAN_START <= time_now <= SCAN_END:
-        should_run = True
-    else:
-        logger.info("Outside scan window and FORCE_SCAN not set – skipping scan.")
-
+    # Run scan?
+    should_run = FORCE_SCAN or (SCAN_START <= time_now <= SCAN_END)
     if should_run:
         if should_skip_scan():
-            logger.info("Skipping GitHub scan because scheduler service handled it.")
+            logger.info("Skipping scan – scheduler service already scanned recently.")
         else:
-            # Quick health check
+            # Health check
             try:
                 health = httpx.get(f"{API_GATEWAY_URL}/health", timeout=5)
                 if health.status_code != 200:
-                    logger.error("API Gateway not healthy, aborting scan.")
-                    _notify("⚠️ Scan Aborted", f"API Gateway is not healthy at {time_now.strftime('%H:%M')} IST.")
+                    logger.error("Gateway not healthy.")
+                    _notify("⚠️ Scan Aborted", "API Gateway is not healthy.")
                     return
             except Exception:
-                logger.error("API Gateway unreachable, aborting scan.")
-                _notify("⚠️ Scan Aborted", f"API Gateway unreachable at {time_now.strftime('%H:%M')} IST.")
+                logger.error("Gateway unreachable.")
+                _notify("⚠️ Scan Aborted", "API Gateway unreachable.")
                 return
 
-            logger.info("Running scan (fallback) at %s", time_now.strftime("%H:%M"))
+            logger.info("Running batch scan at %s", time_now.strftime("%H:%M"))
             scan_result = run_scan()
 
             if scan_result:
                 picks = scan_result.get("recommendations", [])
+                timed_out = scan_result.get("timed_out", False)
                 if picks:
                     store_daily_picks(today_str, picks)
-                    send_scan_picks(picks)
-                else:
-                    send_scan_picks([])
-
+                send_scan_picks(picks, timed_out)
                 run_event_check()
             else:
-                # run_scan already sent a notification if all retries failed
-                logger.error("Scan failed – no results available.")
+                logger.error("Scan failed – no results.")
+                _notify("⚠️ Scan Failed", f"Scan at {time_now.strftime('%H:%M')} IST could not complete.")
     else:
-        logger.info("Skipping scan due to window/force settings.")
+        logger.info("Skipping scan – outside window.")
 
     logger.info("Scheduler tick completed.")
 
