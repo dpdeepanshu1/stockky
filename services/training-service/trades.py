@@ -17,17 +17,24 @@ closes regardless.
 Mirrors evaluate.py's structure and conventions (own Session() per call,
 yfinance for price data, explicit commit/rollback/close).
 """
+import os
 import logging
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 import models as db_models
 
 logger = logging.getLogger("training-service.trades")
+
+# ---------- Database setup ----------
+DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./training.db')
+engine = create_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(bind=engine)
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -65,7 +72,7 @@ def _log_transaction(db, account, transaction_type, amount, trade_id=None, note=
 def deposit_funds(amount: float, note: str = None):
     if amount <= 0:
         return None, "Deposit amount must be positive"
-    db = Session()
+    db = SessionLocal()   # <-- FIXED
     try:
         account = get_or_create_account(db)
         account.cash_balance += amount
@@ -84,7 +91,7 @@ def deposit_funds(amount: float, note: str = None):
 
 
 def get_portfolio_summary():
-    db = Session()
+    db = SessionLocal()   # <-- FIXED
     try:
         account = get_or_create_account(db)
         open_trades = db.query(db_models.PaperTrade).filter(db_models.PaperTrade.status == "OPEN").all()
@@ -109,7 +116,7 @@ def get_portfolio_summary():
 
 
 def open_trade(prediction_id: str, capital: float = None, max_holding_days: int = MAX_HOLDING_DAYS):
-    db = Session()
+    db = SessionLocal()   # <-- FIXED
     try:
         existing = db.query(db_models.PaperTrade).filter(
             db_models.PaperTrade.prediction_id == prediction_id
@@ -227,7 +234,7 @@ def _close_trade(db, account, trade, price: float, exit_reason: str):
 
 
 def mark_to_market(trade_id: str):
-    db = Session()
+    db = SessionLocal()   # <-- FIXED
     try:
         trade = db.query(db_models.PaperTrade).filter(
             db_models.PaperTrade.trade_id == trade_id,
@@ -278,7 +285,7 @@ def mark_to_market(trade_id: str):
 
 
 def close_trade_manually(trade_id: str):
-    db = Session()
+    db = SessionLocal()   # <-- FIXED
     try:
         trade = db.query(db_models.PaperTrade).filter(
             db_models.PaperTrade.trade_id == trade_id,
@@ -305,7 +312,7 @@ def close_trade_manually(trade_id: str):
 
 
 def mark_all_open_trades():
-    db = Session()
+    db = SessionLocal()   # <-- FIXED
     try:
         open_trade_ids = [
             t.trade_id for t in db.query(db_models.PaperTrade).filter(
@@ -331,7 +338,7 @@ def get_trade_summary():
 
 
 def _build_trade_report(period: str, lookback: int):
-    db = Session()
+    db = SessionLocal()   # <-- FIXED
     try:
         cutoff = ist_now() - (timedelta(days=lookback) if period == "daily" else timedelta(weeks=lookback))
         closes = db.query(db_models.PaperTrade).filter(
