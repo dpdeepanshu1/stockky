@@ -50,11 +50,64 @@ DEFAULT_K_NEIGHBORS = 10
 
 class TrainingScanner:
     def __init__(self, db_session_maker, model_store_path: str = None):
-        # model_store_path is kept as a constructor parameter only for
-        # compatibility with existing call sites — see the module
-        # docstring for why this no longer loads or depends on a
-        # trained model at all.
+        # model_store_path is kept as a constructor parameter for
+        # call-site compatibility but isn't used to read files — the
+        # model, if any, comes from the DB-backed ModelRegistry below.
         self.db_session_maker = db_session_maker
+        self.model, self.model_scaler, self.model_feature_columns = self._load_model()
+
+    @staticmethod
+    def _load_model():
+        """Loads the current production model, but only if it's actually
+        the pick-success classifier train.py's train_pick_success_model
+        produces — a stray older artifact (e.g. the legacy OHLCV
+        regressor, which used a completely different, incompatible
+        feature set) could otherwise still be sitting in the 'production'
+        slot and get loaded here, silently producing garbage predictions
+        instead of failing loudly."""
+        try:
+            from models import ModelRegistry
+        except ImportError:
+            return None, None, None
+        try:
+            registry = ModelRegistry()
+            prod = registry.get_production_model()
+            if not prod:
+                return None, None, None
+            model, scaler, meta = prod
+            if meta.get("config", {}).get("model_type") != "prediction_success_classifier":
+                logger.info(
+                    "Production model %s is not a prediction_success_classifier "
+                    "(model_type=%s) — not using it for scoring",
+                    meta.get("version"), meta.get("config", {}).get("model_type"),
+                )
+                return None, None, None
+            return model, scaler, meta.get("feature_columns") or []
+        except Exception as e:
+            logger.warning(f"Could not load production model: {e}")
+            return None, None, None
+
+    def _model_probability(self, row) -> Optional[float]:
+        """Success probability from the trained classifier, or None if no
+        model is loaded, or if any required feature is missing on this
+        row. No imputation here deliberately: the model was calibrated
+        against training-time median fills, which weren't persisted
+        alongside it, so silently substituting a different fallback value
+        at inference time could produce a confident-looking but
+        meaningless number."""
+        if self.model is None or not self.model_feature_columns:
+            return None
+        try:
+            values = [getattr(row, col, None) for col in self.model_feature_columns]
+            if any(v is None for v in values):
+                return None
+            vec = np.array([[float(v) for v in values]], dtype=np.float32)
+            scaled = self.model_scaler.transform(vec) if self.model_scaler is not None else vec
+            proba = self.model.predict_proba(scaled)[0, 1]
+            return round(float(proba) * 100, 1)
+        except Exception as e:
+            logger.warning(f"Model scoring failed for {row.symbol}: {e}")
+            return None
 
     @staticmethod
     def _feature_vector(row) -> np.ndarray:
@@ -99,6 +152,7 @@ class TrainingScanner:
                 return None
 
             current_vec = self._feature_vector(current)
+            model_success_probability = self._model_probability(current)
             hist_vecs = np.array([self._feature_vector(r) for r in historical])
 
             # z-score normalize using the historical population's own
@@ -107,9 +161,24 @@ class TrainingScanner:
             # because of units. Missing values are imputed with the
             # population mean for that column (contributes ~0 on that
             # axis rather than invalidating the whole comparison).
+            #
+            # If a column is missing across the ENTIRE historical
+            # population (true right now for rsi/volume_ratio — see
+            # decision-engine's known gap), nanmean/nanstd return NaN for
+            # that column, which the col_std==0 guard below does NOT
+            # catch (NaN != 0), and that NaN then propagates through
+            # every distance computed — every neighbor "distance" becomes
+            # NaN, and np.argsort on an all-NaN array returns an
+            # arbitrary, meaningless order. Not a crash, so it was never
+            # loud about it — training_score would return neighbors with
+            # no real relationship to the current setup. Guarding NaN the
+            # same way as exact-zero fixes this: that axis contributes
+            # nothing to distance (mean 0, std 1 after centering-to-mean),
+            # exactly like a genuinely constant column would.
             col_mean = np.nanmean(hist_vecs, axis=0)
             col_std = np.nanstd(hist_vecs, axis=0)
-            col_std[col_std == 0] = 1.0  # constant columns: avoid divide-by-zero
+            col_mean = np.where(np.isnan(col_mean), 0.0, col_mean)
+            col_std = np.where(np.isnan(col_std) | (col_std == 0), 1.0, col_std)
 
             def _normalize(vec):
                 filled = np.where(np.isnan(vec), col_mean, vec)
@@ -152,6 +221,7 @@ class TrainingScanner:
                 "training_score": training_score,
                 "t1_success_probability": round(t1_hits / k * 100, 1),
                 "t5_success_probability": round(t5_hits / k * 100, 1),
+                "model_success_probability": model_success_probability,
                 "based_on_n_similar_setups": k,
                 "similar_setups": neighbor_records[:5],
                 "note": (

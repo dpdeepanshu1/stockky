@@ -173,3 +173,113 @@ Yahoo Finance data via `yfinance` is used for convenience in the MVP under its
 public terms; for anything beyond personal/research use, prefer official NSE/
 BSE APIs or a licensed data vendor. This platform is informational — it is not
 investment advice.
+
+
+# Stockky — Changes Manifest
+
+This folder contains every file edited or created across this session, at its
+correct repo path. Files not listed here (the other 7 backend services, the
+rest of the frontend, prediction-service) were read for context but not
+modified — your base copies are already correct.
+
+## services/training-service/
+- **app.py** — CORS added; `from evaluator import` typo fixed (`evaluate`);
+  automatic T+1/T+5 evaluation scheduling on every recorded prediction;
+  `get_training_status()` now reads durable DB state (TrainingRun +
+  ModelRegistry) instead of ephemeral local files; dedup guard on
+  `store_prediction` (same symbol+decision+day = same pick, regardless of
+  caller); six previously-dropped fields wired through
+  (`market_sentiment_adjustment`, `holding_period`, `support`, `resistance`,
+  `sector`, `valuation`, `feature_snapshot`); new endpoints:
+  `/api/metrics/daily`, `/api/metrics/weekly`, `/api/actionable/commit`,
+  `/api/trades*`, `/api/portfolio/*`, `/api/stock/history/{symbol}`,
+  `/api/train/progress`, `/api/lock/clear`.
+- **train.py** — new `train_pick_success_model()`: trains a classifier on
+  the system's own real BUY/PREPARE TO BUY picks and their real outcomes,
+  replacing the old OHLCV regressor (kept, unused, as `--legacy-ohlcv`).
+  Champion/challenger promotion (compares new model's F1 against current
+  production before replacing it). `label_source` toggle (`t1_outcome` /
+  `trade_pnl`). Live stage-by-stage progress tracking for the animated UI.
+  Fixed a real crash-risk: all-NaN feature columns (rsi/volume_ratio are
+  currently always null) were reaching the scaler unguarded.
+- **evaluate.py** — `update_prediction_success()` was defined but never
+  called anywhere — now wired into `evaluate_t1`/`evaluate_t5`. Fixed 0/1/2
+  labeling: real failures were being written identically to "not yet
+  evaluated", silently biasing both the KNN search and the classifier.
+- **scanner.py** — now loads and scores with the trained model (gated by
+  `model_type` so a stale non-classifier artifact can't get used by
+  accident). Fixed the same NaN-propagation bug as train.py, in the KNN
+  distance calculation specifically — was producing meaningless neighbor
+  rankings on every call given today's data gaps.
+- **models.py** — added `PaperTrade`, `PortfolioAccount`,
+  `PortfolioTransaction` tables, with `ensure_schema` migration entries so
+  they actually get added via `ALTER TABLE` on an already-deployed DB.
+- **trades.py** — new file. Paper trading against one shared dummy balance
+  (not a fresh pot per trade). Weekly-cycle exits: target/stop-loss exit
+  immediately, otherwise reviewed every 7 days, closed if already up 3%+,
+  held into next week otherwise, 21-day hard cap.
+
+## services/api-gateway/main.py
+- Value-adjusted top-pick ranking (₹2000 cap + fundamentals-weighted bonus
+  for low-price stocks) at all 3 scan finalization points.
+- Real scan cancellation (`POST /scan/cancel/{task_id}`) — checked
+  periodically inside `run_scan_parallel`, finalizes with whatever was
+  actually scored so far instead of an empty result.
+- Self-pruning scan universe — symbols with 10 consecutive non-actionable
+  scans get excluded from future universe builds (watchlist exempt), so the
+  universe actually evolves instead of a static list reshuffling.
+- Event data passthrough fixed — was discarding everything except
+  `next_earnings_date`; now passes the full raw dict through.
+- Precise holding-period date-range estimates, alongside the existing
+  (often static) `holding_period` string.
+- Working async Gemini summary generator with truncation detection
+  (`finishReason == MAX_TOKENS`) and clean fallback to the existing
+  template — only wired into the async scan path, which has a client
+  available; the two sync paths still use the template only.
+
+## services/scheduler-service/run_once.py
+- Fixed a real bug: daily/Telegram picks were taken in arbitrary batch-
+  completion order, not ranked by score at all. Now uses the same
+  value-adjusted ranking as the gateway.
+
+## services/fundamental-analysis-service/indianapi_fallback.py
+- New file, not yet integrated (that service's `main.py` was read but the
+  call site was never spliced in — needs your confirmation of exactly
+  where the existing Yahoo Finance fetch lives). IndianAPI fallback used
+  only when Yahoo fails, 5-trading-day cache aligned to NSE market open,
+  rate-limited to 1 req/sec via Redis. Uses `upstash_redis.Redis`
+  (confirmed via the actual codebase, not guessed).
+
+## frontend/src/
+- **api.ts** — fixed a systemic path bug: every method I'd added was
+  missing the `/api/` prefix the gateway's catch-all proxy requires.
+  Cross-checked against the gateway's actual routing this time.
+- **App.tsx** — real Stop Scan button wired to the now-real cancel
+  endpoint; Trades tab registered in navigation.
+- **components/ScanPanel.tsx** — "Add All Actionable to Training" button;
+  value-adjusted picks section; "all actionable" list also sorted by
+  value-adjusted score, not raw order.
+- **components/Training.tsx** — animated stage-tracker panel polling
+  `/api/train/progress`; daily/weekly pick-tracking card; manual T+1/T+5
+  evaluation trigger buttons (fallback for when scheduler isn't running).
+- **components/Trades.tsx** — full portfolio-page rewrite: balance header,
+  add-funds modal, expandable position cards with inline charts, daily/
+  weekly trade reports.
+- **components/StockChart.tsx** — new file. 1D/5D/1M/1Y/5Y price chart
+  using `recharts` (already a project dependency).
+- **components/DecisionCard.tsx** — "Trade This" button + confirmation
+  modal; model recommendation panel (training-service's real signal,
+  separate from `combined_score`); event data rendering; holding-period
+  estimate display.
+
+## Known open items (need more files or your decision)
+- `technical-analysis-service` still doesn't populate `rsi`/`macd`/`ema`/
+  `volume_ratio` in the payload to training-service — I have that file now
+  but haven't yet made this specific fix.
+- `market-sentiment-service` is defined as a URL in api-gateway but never
+  actually called anywhere — a real, previously-hidden integration gap.
+- `indianapi_fallback.py` needs wiring into `fundamental-analysis-service`'s
+  actual Yahoo-fetch call site.
+- Whether `TRAINING_DATABASE_URL` is actually a persistent Postgres in your
+  Render deployment, or still the SQLite default — this determines whether
+  any of the training-service work here actually survives a restart.

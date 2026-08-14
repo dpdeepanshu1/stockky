@@ -11,7 +11,7 @@ import asyncio
 import logging
 import difflib
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Optional, Set, Dict, Union
 
@@ -397,6 +397,19 @@ def _build_scan_universe() -> List[str]:
         fallback = ["RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HCLTECH", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK"]
         clean = fallback
 
+    # Prune symbols that have gone UNIVERSE_PRUNE_AFTER_WEAK_SCANS consecutive
+    # scans without a BUY NOW / PREPARE TO BUY, so they stop occupying a slot
+    # in the 300-symbol cap below — this is what makes the universe actually
+    # evolve over time, not just get reshuffled by whatever the live sources
+    # happen to return this cycle. Watchlist symbols are always kept
+    # regardless of performance; a user's own watchlist is never auto-pruned.
+    watchlist_set = set(_load_watchlist())
+    before_prune = len(clean)
+    clean = [s for s in clean if s in watchlist_set or not _is_symbol_pruned(s)]
+    pruned_count = before_prune - len(clean)
+    if pruned_count:
+        logger.info(f"Universe pruning: excluded {pruned_count} chronically-unproductive symbols")
+
     result = clean[:300]
     _redis_set(SCAN_UNIVERSE_KEY, result, ttl=21600)
     logger.info(f"Scan universe built: {len(result)} symbols")
@@ -490,6 +503,110 @@ def _normalize_decision_response(raw, symbol: str) -> dict:
     merged = {**default, **raw}
     return merged
 
+# ── Value-buying adjustment for top-pick ranking ────────────────────────────
+# A stock priced under Rs 2000 with already-decent fundamentals gets a score
+# bonus (bigger the further under Rs 2000), so a Rs 200 stock with solid
+# fundamentals is favored over a Rs 1900 stock, all else equal. Cheap alone
+# isn't rewarded — only cheap + fundamentally sound. Stocks over Rs 2000 are
+# excluded entirely from "recommendations" (top picks), though they still
+# appear normally in all_results — this only changes which ones get
+# surfaced as headline picks (and what Send Top 5 / notifications send).
+VALUE_PRICE_CAP = 2000.0
+VALUE_BONUS_MAX = 8.0
+VALUE_MIN_FUNDAMENTAL_FOR_BONUS = 50.0
+
+def _value_adjusted_score(r: dict):
+    """Returns (adjusted_score, eligible_for_top_pick)."""
+    price = r.get("close")
+    combined = r.get("combined_score", 0) or 0
+    if price is None or price <= 0:
+        return combined, True
+    eligible = price <= VALUE_PRICE_CAP
+    if not eligible:
+        return combined, False
+    fundamental = r.get("fundamental_score", 0) or 0
+    bonus = (
+        (1 - price / VALUE_PRICE_CAP) * VALUE_BONUS_MAX
+        if fundamental >= VALUE_MIN_FUNDAMENTAL_FOR_BONUS
+        else 0.0
+    )
+    return combined + bonus, True
+
+def _select_top_picks(actionable: list, limit: int = 5) -> list:
+    """Value-adjusted ranking for recommendations specifically — the raw
+    combined_score sort on results/all_results is left untouched."""
+    eligible = [r for r in actionable if _value_adjusted_score(r)[1]]
+    eligible.sort(key=lambda r: _value_adjusted_score(r)[0], reverse=True)
+    return eligible[:limit]
+
+# ── More precise holding period ─────────────────────────────────────────────
+# decision-engine's holding_period is often a static "2-6 weeks" string, or
+# "N/A" when unset. Rather than leave that vague default, estimate an actual
+# calendar date range from how far the target is from entry: a target close
+# to entry implies a shorter expected move, a distant target implies more
+# time is needed for it to play out. This is a heuristic, not a model
+# prediction — it's meant to replace a meaningless placeholder with a
+# concrete date range, not to claim precision the system doesn't have.
+def _estimate_holding_period(entry_price, target_price, decision: str):
+    if not entry_price or not target_price or entry_price <= 0:
+        return None
+    move_pct = abs(target_price - entry_price) / entry_price * 100
+    if decision == "BUY NOW":
+        # Faster-triggering setups: scale trading days to the size of the move.
+        min_days = max(3, round(move_pct * 1.2))
+        max_days = max(min_days + 5, round(move_pct * 2.5))
+    else:
+        min_days = max(5, round(move_pct * 1.8))
+        max_days = max(min_days + 7, round(move_pct * 3.5))
+    min_days, max_days = min(min_days, 60), min(max_days, 90)  # sanity cap
+    start = datetime.now(IST).date()
+    end_min = start + timedelta(days=min_days)
+    end_max = start + timedelta(days=max_days)
+    return {
+        "min_days": min_days,
+        "max_days": max_days,
+        "expected_by_earliest": end_min.isoformat(),
+        "expected_by_latest": end_max.isoformat(),
+        "label": f"{min_days}-{max_days} trading days (by {end_min.strftime('%d %b')}–{end_max.strftime('%d %b')})",
+    }
+
+# ── Symbol performance tracking (for a self-pruning scan universe) ─────────
+# After every scan, record whether each symbol produced anything actionable.
+# _build_scan_universe() below excludes symbols that have gone this many
+# consecutive scans without a BUY NOW / PREPARE TO BUY, so the universe
+# actually evolves over time — unproductive names drop out, freeing room for
+# fresh candidates from the same live sources — rather than a static list
+# just getting reshuffled by whatever the live sources happen to return.
+# Watchlist symbols are exempt: a user's own watchlist is never auto-pruned.
+SYMBOL_PERF_KEY_PREFIX = "stockky:symbol_perf:"
+UNIVERSE_PRUNE_AFTER_WEAK_SCANS = 10
+UNIVERSE_GRACE_PERIOD_SCANS = 3
+SYMBOL_PERF_TTL = 30 * 86400  # 30-day rolling window
+
+def _record_symbol_outcomes(results: list):
+    for r in results:
+        symbol = r.get("symbol")
+        decision = r.get("decision")
+        if not symbol or decision in (None, "ERROR"):
+            continue
+        key = SYMBOL_PERF_KEY_PREFIX + symbol
+        state = _redis_get(key) or {"weak_streak": 0, "total_scans": 0, "last_actionable_at": None}
+        state["total_scans"] = state.get("total_scans", 0) + 1
+        if decision in ("BUY NOW", "PREPARE TO BUY"):
+            state["weak_streak"] = 0
+            state["last_actionable_at"] = datetime.now(IST).isoformat()
+        else:
+            state["weak_streak"] = state.get("weak_streak", 0) + 1
+        _redis_set(key, state, ttl=SYMBOL_PERF_TTL)
+
+def _is_symbol_pruned(symbol: str) -> bool:
+    state = _redis_get(SYMBOL_PERF_KEY_PREFIX + symbol)
+    if not state:
+        return False
+    if state.get("total_scans", 0) < UNIVERSE_GRACE_PERIOD_SCANS:
+        return False
+    return state.get("weak_streak", 0) >= UNIVERSE_PRUNE_AFTER_WEAK_SCANS
+
 # ── Fallback helpers with caching ──────────────────────────────────────────
 def _fetch_price_from_quote(symbol: str) -> Optional[float]:
     try:
@@ -564,6 +681,94 @@ async def _fetch_prediction_cached(symbol: str, client: httpx.AsyncClient) -> tu
     return None, None
 
 # ── Hinglish & GenAI summary ──────────────────────────────────────────────
+# ── Gemini-powered summary (optional — falls back to the Hinglish template
+# below if GEMINI_API_KEY isn't set, or if the call fails/times out/gets
+# truncated) ─────────────────────────────────────────────────────────────
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+# Free-tier Gemini has its own RPM limit, independent of MAX_PARALLEL_WORKERS
+# (which bounds calls to decision-engine, not Gemini) — a scan running 10
+# concurrent symbol analyses shouldn't also fire 10 concurrent Gemini calls.
+GEMINI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("GEMINI_MAX_CONCURRENT", "3")))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "400"))
+
+def _build_gemini_prompt(data: dict) -> str:
+    decision = data.get("decision")
+    symbol = data.get("symbol") or "this stock"
+    entry = data.get("entry_range") or {}
+    reasons = data.get("reasons") or {}
+    tech_reasons = "; ".join(reasons.get("technical", [])[:2])
+    fund_reasons = "; ".join(reasons.get("fundamental", [])[:2])
+    return (
+        f"Write a 2-3 sentence trading summary in Hinglish (mixed Hindi-English, "
+        f"as commonly used by Indian retail traders) for {symbol}. "
+        f"Decision: {decision}. Combined score: {data.get('combined_score')}/100. "
+        f"Entry range: {entry.get('low')}-{entry.get('high')}, target: {data.get('target')}, "
+        f"stop-loss: {data.get('stop_loss')}. "
+        f"Technical reasons: {tech_reasons or 'none listed'}. "
+        f"Fundamental reasons: {fund_reasons or 'none listed'}. "
+        f"Keep it natural and complete — do not trail off mid-sentence, and do not "
+        f"just list numbers without context. End with a clear, complete thought."
+    )
+
+async def _generate_ai_summary(data: dict, client: httpx.AsyncClient) -> str:
+    """Returns a Gemini-generated summary, or falls back to the template
+    in _generate_summary() below on any failure — including a truncated
+    response (finishReason == MAX_TOKENS), which is the classic symptom
+    of maxOutputTokens being set too low and cutting the sentence off
+    mid-thought."""
+    if not GEMINI_API_KEY:
+        return _generate_summary(data)
+    try:
+        async with GEMINI_SEMAPHORE:
+            resp = await client.post(
+                GEMINI_URL,
+                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": _build_gemini_prompt(data)}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+                        "temperature": 0.6,
+                    },
+                },
+                timeout=15,
+            )
+        if resp.status_code != 200:
+            logger.warning(f"Gemini call failed ({resp.status_code}) for {data.get('symbol')} — using template")
+            return _generate_summary(data)
+
+        payload = resp.json()
+        candidates = payload.get("candidates") or []
+        if not candidates:
+            return _generate_summary(data)
+
+        candidate = candidates[0]
+        finish_reason = candidate.get("finishReason")
+        parts = (candidate.get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts).strip()
+
+        if not text:
+            return _generate_summary(data)
+        if finish_reason == "MAX_TOKENS":
+            # Truncated mid-generation — exactly the "doesn't complete its
+            # sentence" bug. Don't return a cut-off response; use the
+            # template instead of showing something that looks broken.
+            logger.warning(f"Gemini response truncated (MAX_TOKENS) for {data.get('symbol')} — using template")
+            return _generate_summary(data)
+        if text[-1] not in ".!?।\"'”)":
+            # Didn't hit MAX_TOKENS but still doesn't end on sentence-ending
+            # punctuation — treat as suspect and fall back rather than show
+            # a sentence fragment.
+            logger.warning(f"Gemini response looks incomplete for {data.get('symbol')} — using template")
+            return _generate_summary(data)
+        return text
+    except Exception as e:
+        logger.warning(f"Gemini summary failed for {data.get('symbol')}: {e} — using template")
+        return _generate_summary(data)
+
+# ── Hinglish template summary (fallback / default when Gemini isn't
+# configured) ───────────────────────────────────────────────────────────
 def _generate_summary(data) -> str:
     if not data or not isinstance(data, dict):
         return "Data unavailable"
@@ -711,11 +916,20 @@ async def _analyze_one_symbol_ultra(
                     normalized["fundamental_metrics"] = fund_metrics
                     normalized["fundamental_fallback"] = fund_fallback
 
-                if event_data and event_data.get("next_earnings_date"):
-                    normalized["event_risk"] = True
-                    reasons = normalized.get("reasons", {})
-                    reasons["event"] = [f"Earnings due: {event_data['next_earnings_date']}"]
-                    normalized["reasons"] = reasons
+                if event_data:
+                    # Previously only next_earnings_date survived here —
+                    # whatever else event-tracker-service returns (bulk
+                    # deals, insider trades, mutual fund holding changes,
+                    # etc.) was silently discarded. Passing the raw dict
+                    # through lets the frontend show it; this gateway
+                    # doesn't know that service's exact schema to pick
+                    # specific fields out of it without guessing.
+                    normalized["event_data"] = event_data
+                    if event_data.get("next_earnings_date"):
+                        normalized["event_risk"] = True
+                        reasons = normalized.get("reasons", {})
+                        reasons["event"] = [f"Earnings due: {event_data['next_earnings_date']}"]
+                        normalized["reasons"] = reasons
 
                 if news_data:
                     normalized["news_score"] = news_data.get("news_score")
@@ -728,7 +942,17 @@ async def _analyze_one_symbol_ultra(
                     normalized["prediction_score"] = pred_score
                     normalized["prediction_note"] = pred_note
 
-                normalized["natural_language_summary"] = _generate_summary(normalized)
+                # Adds a concrete calendar-date holding period estimate
+                # alongside whatever decision-engine's own holding_period
+                # string is (often a static "2-6 weeks" or "N/A") — kept as
+                # a separate field so nothing that already reads
+                # holding_period breaks.
+                entry = normalized.get("entry_range") or {}
+                entry_price = entry.get("low") or normalized.get("close")
+                normalized["holding_period_estimate"] = _estimate_holding_period(
+                    entry_price, normalized.get("target"), normalized.get("decision")
+                )
+                normalized["natural_language_summary"] = await _generate_ai_summary(normalized, client)
                 return normalized
 
             except httpx.HTTPError as e:
@@ -775,6 +999,7 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
 
     sem = asyncio.Semaphore(MAX_PARALLEL_WORKERS)
     limits = httpx.Limits(max_keepalive_connections=200, max_connections=200)
+    cancelled = False
     async with httpx.AsyncClient(timeout=240, limits=limits) as client:
         tasks = [
             _analyze_one_symbol_ultra(sym, client, sem)
@@ -792,7 +1017,16 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
                 logger.error(f"Task failed: {e}")
             processed += 1
             elapsed = round(time.time() - start_time, 1)
-            if processed % 5 == 0 or processed == total:
+
+            # Checked every 3rd completion rather than every one, so a
+            # cancel request is picked up quickly without adding a Redis
+            # round-trip to every single symbol's completion.
+            if processed % 3 == 0:
+                task_state = _redis_get(SCAN_TASK_PREFIX + task_id)
+                if task_state and task_state.get("cancel_requested"):
+                    cancelled = True
+
+            if processed % 5 == 0 or processed == total or cancelled:
                 _redis_set(SCAN_TASK_PREFIX + task_id, {
                     "status": "running",
                     "total": total,
@@ -802,10 +1036,18 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
                     "error": None,
                 }, ttl=3600)
 
+            if cancelled:
+                logger.info(f"Scan {task_id} cancelled after {processed}/{total} symbols — finalizing with partial results")
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                break
+
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
 
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
-    top_picks = actionable[:5]
+    top_picks = _select_top_picks(actionable, limit=5)
+    _record_symbol_outcomes(results)  # feeds universe self-pruning — see _build_scan_universe
     watchlist_candidates = []
     if not top_picks:
         watchlist_candidates = results[:3]
@@ -824,6 +1066,8 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
         market_mood = "Cautious"
 
     verdict = f"{len(top_picks)} strong opportunity(ies) found" if top_picks else "DO NOT BUY ANY STOCK TODAY — market conditions cautious"
+    if cancelled:
+        verdict = f"Scan stopped early ({processed}/{total} stocks checked) — " + verdict
 
     final_result = {
         "scanned": len(results),
@@ -833,6 +1077,7 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
         "watchlist_candidates": watchlist_candidates,
         "verdict": verdict,
         "market_mood": market_mood,
+        "cancelled": cancelled,
         "market_stats": {
             "buy_signals": buy_count,
             "sell_signals": sell_count,
@@ -846,7 +1091,7 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
     _redis_set(SCAN_TASK_PREFIX + task_id, {
         "status": "done",
         "total": total,
-        "processed": total,
+        "processed": processed,
         "elapsed": round(time.time() - start_time, 1),
         "result": final_result,
         "error": None,
@@ -1219,11 +1464,16 @@ def run_scan(force_refresh: bool = False):
 
                 if normalized.get("event_risk") is False and not normalized.get("reasons", {}).get("event"):
                     events = _fetch_events(symbol)
-                    if events and events.get("next_earnings_date"):
-                        normalized["event_risk"] = True
-                        reasons = normalized.get("reasons", {})
-                        reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
-                        normalized["reasons"] = reasons
+                    if events:
+                        # See the async analyzer's equivalent block for why
+                        # the full dict is passed through, not just
+                        # next_earnings_date.
+                        normalized["event_data"] = events
+                        if events.get("next_earnings_date"):
+                            normalized["event_risk"] = True
+                            reasons = normalized.get("reasons", {})
+                            reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
+                            normalized["reasons"] = reasons
 
                 if normalized.get("prediction_score") is None:
                     try:
@@ -1236,6 +1486,16 @@ def run_scan(force_refresh: bool = False):
                     except Exception as e:
                         logger.warning(f"Prediction service lookup failed during scan for {symbol}: {e}")
 
+                # Adds a concrete calendar-date holding period estimate
+                # alongside whatever decision-engine's own holding_period
+                # string is (often a static "2-6 weeks" or "N/A") — kept as
+                # a separate field so nothing that already reads
+                # holding_period breaks.
+                entry = normalized.get("entry_range") or {}
+                entry_price = entry.get("low") or normalized.get("close")
+                normalized["holding_period_estimate"] = _estimate_holding_period(
+                    entry_price, normalized.get("target"), normalized.get("decision")
+                )
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
             except httpx.HTTPError as e:
@@ -1244,7 +1504,8 @@ def run_scan(force_refresh: bool = False):
 
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
-    top_picks = actionable[:5]
+    top_picks = _select_top_picks(actionable, limit=5)
+    _record_symbol_outcomes(results)  # feeds universe self-pruning — see _build_scan_universe
     watchlist_candidates = []
     if not top_picks:
         watchlist_candidates = results[:3]
@@ -1349,6 +1610,21 @@ def get_scan_status(task_id: str):
             data["estimated_remaining"] = None
     return data
 
+@app.post("/scan/cancel/{task_id}")
+def cancel_scan(task_id: str):
+    """Requests cancellation of a running scan. run_scan_parallel checks
+    this flag periodically (every 3rd completion) and, once seen, stops
+    collecting further results and finalizes the task as 'done' with
+    whatever was actually scored so far."""
+    data = _redis_get(SCAN_TASK_PREFIX + task_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Task not found or expired")
+    if data.get("status") != "running":
+        return {"status": "already_finished", "task_status": data.get("status")}
+    data["cancel_requested"] = True
+    _redis_set(SCAN_TASK_PREFIX + task_id, data, ttl=3600)
+    return {"status": "cancel_requested", "processed_so_far": data.get("processed", 0), "total": data.get("total", 0)}
+
 # ── Watchlist-only scan ──────────────────────────────────────────────────
 @app.get("/scan/watchlist")
 def scan_watchlist():
@@ -1405,11 +1681,16 @@ def scan_watchlist():
 
                 if normalized.get("event_risk") is False and not normalized.get("reasons", {}).get("event"):
                     events = _fetch_events(symbol)
-                    if events and events.get("next_earnings_date"):
-                        normalized["event_risk"] = True
-                        reasons = normalized.get("reasons", {})
-                        reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
-                        normalized["reasons"] = reasons
+                    if events:
+                        # See the async analyzer's equivalent block for why
+                        # the full dict is passed through, not just
+                        # next_earnings_date.
+                        normalized["event_data"] = events
+                        if events.get("next_earnings_date"):
+                            normalized["event_risk"] = True
+                            reasons = normalized.get("reasons", {})
+                            reasons["event"] = [f"Earnings due: {events['next_earnings_date']}"]
+                            normalized["reasons"] = reasons
 
                 if normalized.get("prediction_score") is None:
                     try:
@@ -1422,6 +1703,16 @@ def scan_watchlist():
                     except Exception as e:
                         logger.warning(f"Prediction service lookup failed during watchlist scan for {symbol}: {e}")
 
+                # Adds a concrete calendar-date holding period estimate
+                # alongside whatever decision-engine's own holding_period
+                # string is (often a static "2-6 weeks" or "N/A") — kept as
+                # a separate field so nothing that already reads
+                # holding_period breaks.
+                entry = normalized.get("entry_range") or {}
+                entry_price = entry.get("low") or normalized.get("close")
+                normalized["holding_period_estimate"] = _estimate_holding_period(
+                    entry_price, normalized.get("target"), normalized.get("decision")
+                )
                 normalized["natural_language_summary"] = _generate_summary(normalized)
                 results.append(normalized)
             except httpx.HTTPError as e:
@@ -1430,7 +1721,8 @@ def scan_watchlist():
 
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
-    top_picks = actionable[:5]
+    top_picks = _select_top_picks(actionable, limit=5)
+    _record_symbol_outcomes(results)  # feeds universe self-pruning — see _build_scan_universe
 
     buy_count = len([r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")])
     sell_count = len([r for r in results if r.get("decision") == "SELL"])

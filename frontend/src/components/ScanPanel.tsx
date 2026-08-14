@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ScanResult, Decision } from "../api";
+import { useState, useMemo } from "react";
+import { ScanResult, Decision, api, ActionablePick } from "../api";
 import { decisionStyle } from "../decisionStyle";
 
 interface Props {
@@ -11,12 +11,86 @@ interface Props {
   onSendAllActionable: () => Promise<void>; 
 }
 
+// Value-buying adjustment: a stock priced under Rs 2000 with already-decent
+// fundamentals gets a score bonus (bigger the further under 2000, so a
+// Rs 200 stock is favored over a Rs 1900 stock, all else equal) — cheap
+// alone isn't rewarded, only cheap + fundamentally sound, so this doesn't
+// just push penny stocks to the top. Stocks over Rs 2000 are excluded
+// entirely from the value-adjusted "Top Picks" ranking, per the Rs 2000
+// cap, though they still appear normally in "All results" below —
+// nothing is hidden, this is an additional ranked view, not a filter on
+// the underlying data.
+const PRICE_CAP = 2000;
+const VALUE_BONUS_MAX = 8; // max points added to combined_score
+const MIN_FUNDAMENTAL_FOR_BONUS = 50; // out of 100 — "good stock", not just cheap
+
+function valueAdjustedScore(d: Decision): { score: number; eligible: boolean; bonus: number } {
+  const price = d.close;
+  if (price == null || price <= 0) return { score: d.combined_score, eligible: true, bonus: 0 };
+  const eligible = price <= PRICE_CAP;
+  if (!eligible) return { score: d.combined_score, eligible: false, bonus: 0 };
+  const isGoodStock = d.fundamental_score >= MIN_FUNDAMENTAL_FOR_BONUS;
+  const bonus = isGoodStock ? (1 - price / PRICE_CAP) * VALUE_BONUS_MAX : 0;
+  return { score: d.combined_score + bonus, eligible: true, bonus: Math.round(bonus * 10) / 10 };
+}
+
+export function toActionablePick(d: Decision): ActionablePick {
+  return {
+    symbol: d.symbol,
+    decision: d.decision,
+    confidence: d.confidence,
+    price: d.close ?? 0,
+    target: d.target,
+    stop_loss: d.stop_loss,
+    entry_range_low: d.entry_range?.low ?? null,
+    entry_range_high: d.entry_range?.high ?? null,
+    combined_score: d.combined_score,
+    technical_score: d.technical_score,
+    fundamental_score: d.fundamental_score,
+    news_score: d.news_score,
+    prediction_score: d.prediction_score,
+    market_score: d.market_score,
+    training_score: d.training_score,
+    event_risk: d.event_risk,
+    holding_period: d.holding_period,
+    support: d.support,
+    resistance: d.resistance,
+    sector: d.sector,
+    valuation: d.valuation,
+    market_sentiment_adjustment: d.market_sentiment_adjustment,
+    debt_to_equity: d.fundamental_metrics?.debt_to_equity ?? null,
+    roe: d.fundamental_metrics?.roe ?? null,
+    roce: null, // not present in Decision/FundamentalMetrics from api-gateway today
+    rsi: null, macd: null, ema: null, volume_ratio: null, // decision-engine doesn't populate these yet either
+    market_mood: null, nifty_change_pct: null, sensex_change_pct: null, // not exposed on Decision today
+  };
+}
+
 export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, onSendTopPicks, onSendAllActionable }: Props) {
   const allSorted = [...result.all_results].sort((a, b) => b.combined_score - a.combined_score);
-  
+
+  const valueAdjustedTopPicks = useMemo(() => {
+    return result.all_results
+      .filter((d) => d.decision === "BUY NOW" || d.decision === "PREPARE TO BUY")
+      .map((d) => ({ decision: d, ...valueAdjustedScore(d) }))
+      .filter((x) => x.eligible)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+  }, [result.all_results]);
+
+  const allActionable = useMemo(
+    () =>
+      result.all_results
+        .filter((d) => d.decision === "BUY NOW" || d.decision === "PREPARE TO BUY")
+        .sort((a, b) => valueAdjustedScore(b).score - valueAdjustedScore(a).score),
+    [result.all_results]
+  );
+
   // Local loading states for animations
   const [isSendingTelegram, setIsSendingTelegram] = useState<"top5" | "all" | null>(null);
   const [addingWatchlist, setAddingWatchlist] = useState<string | null>(null);
+  const [committingTraining, setCommittingTraining] = useState(false);
+  const [commitMessage, setCommitMessage] = useState<string | null>(null);
 
   const handleSendTopPicks = async () => {
     setIsSendingTelegram("top5");
@@ -42,6 +116,31 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, 
       await onAddToWatchlist(symbol);
     } finally {
       setAddingWatchlist(null);
+    }
+  };
+
+  const handleAddActionableToTraining = async () => {
+    if (allActionable.length === 0) {
+      setCommitMessage("No BUY NOW / PREPARE TO BUY picks in this scan.");
+      setTimeout(() => setCommitMessage(null), 4000);
+      return;
+    }
+    setCommittingTraining(true);
+    setCommitMessage(null);
+    try {
+      const { results } = await api.commitActionablePicks(allActionable.map(toActionablePick));
+      const stored = results.filter((r) => r.record_status === "stored").length;
+      const already = results.filter((r) => r.record_status === "already_recorded").length;
+      const tradesOpened = results.filter((r) => r.trade_status === "opened").length;
+      setCommitMessage(
+        `${stored} new, ${already} already recorded · ${tradesOpened} trades opened`
+      );
+    } catch (err) {
+      console.error(err);
+      setCommitMessage("Failed — /api/actionable/commit may not be routed through the gateway yet.");
+    } finally {
+      setCommittingTraining(false);
+      setTimeout(() => setCommitMessage(null), 6000);
     }
   };
 
@@ -94,7 +193,24 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, 
             "📤 Send All Actionable"
           )}
         </button>
+        <button
+          onClick={handleAddActionableToTraining}
+          disabled={committingTraining}
+          className="font-mono text-xs bg-mint/20 border border-mint/40 rounded-lg px-4 py-2 transition hover:bg-mint/30 disabled:opacity-50 flex items-center gap-2"
+        >
+          {committingTraining ? (
+            <>
+              <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-mint animate-spin"></span>
+              Adding...
+            </>
+          ) : (
+            `🎓 Add All Actionable to Training (${allActionable.length})`
+          )}
+        </button>
       </div>
+      {commitMessage && (
+        <div className="font-mono text-xs text-mist/70 -mt-3">{commitMessage}</div>
+      )}
 
       {/* Verdict banner */}
       {result.recommendations.length === 0 ? (
@@ -136,6 +252,45 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, 
             ))}
           </div>
         </>
+      )}
+
+      {/* Value-adjusted Top Picks: client-side re-rank applying the Rs 2000
+          cap + low-price/good-fundamentals bonus. Additive to the section
+          above, not a replacement — result.recommendations above still
+          reflects api-gateway's own ranking untouched, since Telegram
+          sends and anything scheduler-service records still key off that,
+          not this view. */}
+      {valueAdjustedTopPicks.length > 0 && (
+        <div>
+          <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">
+            💎 Value-Adjusted Top Picks (≤ ₹{PRICE_CAP}, bonus for good fundamentals at a low price)
+          </div>
+          <div className="grid md:grid-cols-3 gap-4">
+            {valueAdjustedTopPicks.map((x, i) => (
+              <div
+                key={x.decision.symbol}
+                onClick={() => onSelect(x.decision.symbol)}
+                className="rounded-xl border border-mint/40 bg-mint/5 p-4 cursor-pointer hover:border-mint/70 transition"
+              >
+                <div className="flex items-center justify-between mb-1">
+                  <span className="font-mono text-xs text-mist/50">#{i + 1}</span>
+                  <span className="font-mono text-xs text-mint">+{x.bonus} bonus</span>
+                </div>
+                <div className="font-display text-lg text-paper">{x.decision.symbol}</div>
+                <div className="font-mono text-xs text-mist/60">
+                  ₹{x.decision.close} · fundamentals {x.decision.fundamental_score}/100
+                </div>
+                <div className="font-mono text-xs text-mist/60 mt-1">
+                  raw {x.decision.combined_score} → adjusted {Math.round(x.score * 10) / 10}
+                </div>
+              </div>
+            ))}
+          </div>
+          <p className="text-mist/40 text-[11px] mt-2">
+            Client-side ranking only — doesn't change what api-gateway recorded as
+            "recommendations" for this scan, or what Send Top 5 sends.
+          </p>
+        </div>
       )}
 
       {/* Watchlist candidates (fallback) */}

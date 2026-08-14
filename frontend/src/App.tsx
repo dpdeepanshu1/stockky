@@ -11,6 +11,7 @@ import SystemCheck from "./components/SystemCheck";
 import MarketMovers from "./components/MarketMovers";
 import ServiceManager from "./components/ServiceManager";
 import Training from "./components/Training";
+import Trades from "./components/Trades";
 // ── NEW: import Market Sentiment Header ──
 import MarketSentimentHeader from "./components/MarketSentimentHeader";
 
@@ -21,7 +22,7 @@ type ViewState =
   | { mode: "scan"; data: ScanResult }
   | { mode: "error"; message: string };
 
-type Tab = "dashboard" | "notifications" | "training";
+type Tab = "dashboard" | "notifications" | "training" | "trades";
 
 export default function App() {
   const [systemReady, setSystemReady] = useState(false);
@@ -102,6 +103,7 @@ export default function App() {
     setView({ mode: "loading", label: "Starting market scan..." });
     lastRequestType.current = "scan";
     setScanTaskId(null);
+    setCancelRequested(false);
     if (pollInterval) clearInterval(pollInterval);
     try {
       const { task_id } = await api.scanStart();
@@ -163,7 +165,34 @@ export default function App() {
     }
   }
 
-  // Enhanced Retry handler with wake-up logic
+  // Requests cancellation and keeps polling — the backend picks up the
+  // cancel flag on its next check (every 3rd completed symbol, so this
+  // isn't instant) and finalizes the task as "done" with whatever was
+  // scored so far. pollScanStatus already knows how to move to the scan
+  // results view once status flips to "done", so this doesn't need its
+  // own separate handling for that — just marks the UI as "stopping" and
+  // lets the normal poll loop pick up the finalized partial result.
+  const [stoppingScan, setStoppingScan] = useState(false);
+  const [cancelRequested, setCancelRequested] = useState(false);
+  async function handleStopScan() {
+    if (!scanTaskId) return;
+    setStoppingScan(true);
+    setCancelRequested(true);
+    try {
+      const result = await api.scanCancel(scanTaskId);
+      setStatusMessage(
+        `Stopping — finishing up (${result.processed_so_far ?? "?"}/${result.total ?? "?"} scanned so far)...`
+      );
+    } catch (e) {
+      console.warn("Cancel request failed", e);
+      setStatusMessage("Could not reach the scan service to stop it — it may finish on its own.");
+      setCancelRequested(false);
+    } finally {
+      setStoppingScan(false);
+    }
+  }
+
+
   const handleRetry = async () => {
     if (isRetrying) return;
     setIsRetrying(true);
@@ -287,6 +316,9 @@ export default function App() {
               <TabButton active={tab === "training"} onClick={() => setTab("training")}>
                 Training
               </TabButton>
+              <TabButton active={tab === "trades"} onClick={() => setTab("trades")}>
+                Trades
+              </TabButton>
             </nav>
           </div>
           <div className="flex items-center gap-2">
@@ -378,6 +410,8 @@ export default function App() {
           <NotificationsPanel />
         ) : tab === "training" ? (
           <Training />
+        ) : tab === "trades" ? (
+          <Trades />
         ) : (
           <>
             {/* Dashboard content */}
@@ -477,6 +511,15 @@ export default function App() {
                         </p>
                       )}
                     </div>
+                  )}
+                  {scanTaskId && (
+                    <button
+                      onClick={handleStopScan}
+                      disabled={stoppingScan || cancelRequested}
+                      className="mt-4 font-mono text-xs text-signal-avoid border border-signal-avoid/40 rounded-lg px-3 py-2 hover:bg-signal-avoid/10 transition disabled:opacity-50 w-full"
+                    >
+                      {cancelRequested ? "Stopping — finishing up..." : "⏹ Stop Scan"}
+                    </button>
                   )}
                   <div className="mt-6">
                     <Pipeline running={true} />

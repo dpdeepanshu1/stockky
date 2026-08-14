@@ -133,6 +133,81 @@ class PredictionOutcome(Base):
     created_at = Column(DateTime, default=ist_now)
 
 
+class PortfolioAccount(Base):
+    """
+    Singleton (always id=1): the shared dummy-money pool every paper trade
+    draws capital from and returns proceeds to. Replaces the earlier
+    design where every trade got its own fresh Rs 1,00,000 regardless of
+    what else was open — that didn't model a real account, where opening
+    five positions actually uses up the same pool of money. Top up via
+    deposit_funds(); balance moves automatically as trades open/close.
+    """
+    __tablename__ = "portfolio_account"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cash_balance = Column(Float, nullable=False, default=100000.0)
+    total_deposited = Column(Float, nullable=False, default=100000.0)
+    realized_pnl = Column(Float, nullable=False, default=0.0)
+    updated_at = Column(DateTime, default=ist_now)
+
+
+class PortfolioTransaction(Base):
+    """Audit trail for every balance movement — deposits, capital locked
+    into a trade on open, proceeds returned on close. Lets the daily/
+    weekly trade reports reconstruct what happened without recomputing
+    from PaperTrade rows alone, and makes the running balance auditable."""
+    __tablename__ = "portfolio_transactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    transaction_type = Column(String(20), nullable=False, index=True)  # deposit | trade_open | trade_close
+    amount = Column(Float, nullable=False)  # positive = credit, negative = debit
+    trade_id = Column(String(50), nullable=True, index=True)
+    balance_after = Column(Float, nullable=False)
+    note = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=ist_now, index=True)
+
+
+class PaperTrade(Base):
+    """
+    A simulated position sized against a dummy capital allocation (e.g.
+    Rs 1,00,000), opened against a real recorded prediction. Closed trade
+    P&L is a more honest training signal than t1_success/t5_success alone:
+    those are a binary same/next-day heuristic, this tracks what actually
+    holding the position would have returned, checked daily against real
+    price data, with the same target/stop-loss decision-engine set.
+    """
+    __tablename__ = "paper_trades"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_id = Column(String(50), unique=True, nullable=False, index=True)
+    prediction_id = Column(String(50), nullable=False, index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+
+    capital_allocated = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    entry_date = Column(DateTime, nullable=False, index=True)
+
+    target = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    max_holding_days = Column(Integer, default=21)  # hard cap: see weekly review logic in trades.py
+    weeks_held = Column(Integer, nullable=False, default=0)  # incremented at each weekly review checkpoint
+    last_weekly_review_at = Column(DateTime, nullable=True)
+
+    status = Column(String(20), nullable=False, default="OPEN", index=True)  # OPEN | CLOSED
+    exit_price = Column(Float, nullable=True)
+    exit_date = Column(DateTime, nullable=True)
+    exit_reason = Column(String(30), nullable=True)  # target_hit | stop_loss_hit | max_holding_period | manual
+
+    current_price = Column(Float, nullable=True)
+    last_marked_at = Column(DateTime, nullable=True)
+
+    pnl_amount = Column(Float, nullable=True)
+    pnl_pct = Column(Float, nullable=True)
+
+    created_at = Column(DateTime, default=ist_now)
+
+
 class TrainingRun(Base):
     """Tracks each training pipeline run with configuration and performance."""
     __tablename__ = "training_runs"
@@ -417,6 +492,27 @@ def ensure_schema(engine):
             'walk_forward_metrics': 'JSON',
             'fold_details': 'JSON',
             'created_at': 'TIMESTAMP',
+        }
+        with engine.connect() as conn:
+            for col_name, col_type in required_columns.items():
+                if col_name not in existing_columns:
+                    alter_sql = f'ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}'
+                    conn.execute(text(alter_sql))
+                    conn.commit()
+                    print(f"Added column {col_name} to {table_name}")
+
+    # ---- paper_trades ----
+    # weeks_held / last_weekly_review_at are new this round (weekly-cycle
+    # review logic in trades.py). On a fresh DB, create_tables() already
+    # creates paper_trades with every column via SQLAlchemy — this only
+    # matters for a database where paper_trades already existed from an
+    # earlier deploy and needs these two columns added in place.
+    table_name = "paper_trades"
+    if inspector.has_table(table_name):
+        existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
+        required_columns = {
+            'weeks_held': 'INTEGER',
+            'last_weekly_review_at': 'TIMESTAMP',
         }
         with engine.connect() as conn:
             for col_name, col_type in required_columns.items():

@@ -3,28 +3,23 @@ Outcome evaluation for predictions.
 Enhanced to support comprehensive metrics, batch evaluation, and summary statistics.
 """
 import logging
-import os
 from datetime import datetime, timedelta
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session
 import yfinance as yf
 import numpy as np
 import pandas as pd
 
+# ✅ Absolute import
 import models as db_models
 from metrics import calculate_sharpe, calculate_sortino, max_drawdown, cumulative_return, win_rate, profit_factor
 
 logger = logging.getLogger("training-service.evaluate")
 
-# ---------- Database setup ----------
-DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./training.db')
-engine = create_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(bind=engine)
+# ---------- Existing T+1 / T+5 evaluators (kept intact, with minor enhancements) ----------
 
-# ---------- Existing T+1 / T+5 evaluators ----------
 def evaluate_t1(prediction_id: str):
     """Evaluate a prediction on T+1 (next trading day)."""
-    db = SessionLocal()
+    db = Session()
     try:
         pred = db.query(db_models.PredictionSnapshot).filter(
             db_models.PredictionSnapshot.prediction_id == prediction_id
@@ -95,9 +90,13 @@ def evaluate_t1(prediction_id: str):
     finally:
         db.close()
 
+    # Propagate onto PredictionSnapshot outside the try/finally above so
+    # it still runs even though that block already closed its own session.
+    update_prediction_success(prediction_id)
+
 def evaluate_t5(prediction_id: str):
     """Evaluate a prediction on T+5 (approximately one week)."""
-    db = SessionLocal()
+    db = Session()
     try:
         pred = db.query(db_models.PredictionSnapshot).filter(
             db_models.PredictionSnapshot.prediction_id == prediction_id
@@ -169,14 +168,18 @@ def evaluate_t5(prediction_id: str):
     finally:
         db.close()
 
-# ---------- Batch evaluation and summary functions ----------
+    update_prediction_success(prediction_id)
+
+# ---------- NEW: Batch evaluation and summary functions ----------
+
 def evaluate_pending_predictions(period: str = 'T+1'):
     """
     Evaluate all predictions that do not yet have an outcome for the given period.
     period: 'T+1' or 'T+5'
     """
-    db = SessionLocal()
+    db = Session()
     try:
+        # Find predictions without outcome for this period
         subquery = db.query(db_models.PredictionOutcome.prediction_id).filter(
             db_models.PredictionOutcome.evaluation_period == period
         ).subquery()
@@ -200,14 +203,16 @@ def compute_training_metrics():
     Aggregate all outcomes and compute overall performance metrics.
     Returns a dict with metrics like Sharpe, Sortino, win rate, etc.
     """
-    db = SessionLocal()
+    db = Session()
     try:
+        # Fetch all T+1 outcomes with return_pct
         outcomes_t1 = db.query(db_models.PredictionOutcome).filter(
             db_models.PredictionOutcome.evaluation_period == 'T+1',
             db_models.PredictionOutcome.return_pct.isnot(None)
         ).all()
         returns_t1 = [o.return_pct / 100.0 for o in outcomes_t1 if o.return_pct is not None]
         
+        # For T+5
         outcomes_t5 = db.query(db_models.PredictionOutcome).filter(
             db_models.PredictionOutcome.evaluation_period == 'T+5',
             db_models.PredictionOutcome.return_pct.isnot(None)
@@ -248,9 +253,25 @@ def compute_training_metrics():
 
 def update_prediction_success(prediction_id: str):
     """
-    Update the prediction snapshot with overall success flag (if T+1 and T+5 both success, mark as overall success).
+    Propagate PredictionOutcome results back onto the PredictionSnapshot's
+    denormalized t1_success/t5_success/overall_success columns. These are
+    what scanner.py's KNN search and train.py's pick-success classifier
+    both query against — without this running, PredictionOutcome fills up
+    correctly but PredictionSnapshot never reflects it, and both consumers
+    see zero evaluated rows forever.
+
+    Uses 0 = pending, 1 = success, 2 = failed. Previously this only ever
+    wrote 0 or 1 (`else 0` for a failure, same as never-evaluated), so a
+    real failure and "not yet evaluated" were indistinguishable — anything
+    that actually failed silently vanished from scanner.py's `in_([1, 2])`
+    filter instead of counting as a failed setup.
+
+    t1_success and t5_success are each set as soon as their own outcome
+    exists, independently — previously both were held back until T+5 also
+    existed, so t1_success stayed at its default for however long the T+5
+    window takes, even though the T+1 result was already known.
     """
-    db = SessionLocal()
+    db = Session()
     try:
         pred = db.query(db_models.PredictionSnapshot).filter(
             db_models.PredictionSnapshot.prediction_id == prediction_id
@@ -260,14 +281,30 @@ def update_prediction_success(prediction_id: str):
         outcomes = db.query(db_models.PredictionOutcome).filter(
             db_models.PredictionOutcome.prediction_id == prediction_id
         ).all()
-        if len(outcomes) < 2:
+        if not outcomes:
             return
+
         t1 = next((o for o in outcomes if o.evaluation_period == 'T+1'), None)
         t5 = next((o for o in outcomes if o.evaluation_period == 'T+5'), None)
-        if t1 and t5:
-            pred.t1_success = t1.success
-            pred.t5_success = t5.success
-            pred.overall_success = 1 if (t1.success and t5.success) else 0
+
+        changed = False
+        if t1 is not None:
+            new_t1 = 1 if t1.success else 2
+            if pred.t1_success != new_t1:
+                pred.t1_success = new_t1
+                changed = True
+        if t5 is not None:
+            new_t5 = 1 if t5.success else 2
+            if pred.t5_success != new_t5:
+                pred.t5_success = new_t5
+                changed = True
+        if t1 is not None and t5 is not None:
+            new_overall = 1 if (t1.success and t5.success) else 2
+            if pred.overall_success != new_overall:
+                pred.overall_success = new_overall
+                changed = True
+
+        if changed:
             db.commit()
             logger.info(f"Updated success flags for {prediction_id}")
     except Exception as e:

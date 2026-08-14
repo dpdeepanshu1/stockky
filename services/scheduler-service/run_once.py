@@ -55,6 +55,35 @@ _redis = Redis(
 
 BUY_FAMILY = {"BUY NOW", "PREPARE TO BUY", "HOLD"}
 
+# Mirrors api-gateway's _value_adjusted_score/_select_top_picks exactly —
+# duplicated here because this is a standalone script with no shared
+# import path to api-gateway's process. Keep these two in sync if the
+# constants change.
+VALUE_PRICE_CAP = 2000.0
+VALUE_BONUS_MAX = 8.0
+VALUE_MIN_FUNDAMENTAL_FOR_BONUS = 50.0
+
+def _value_adjusted_score(r: dict):
+    price = r.get("close")
+    combined = r.get("combined_score", 0) or 0
+    if price is None or price <= 0:
+        return combined, True
+    eligible = price <= VALUE_PRICE_CAP
+    if not eligible:
+        return combined, False
+    fundamental = r.get("fundamental_score", 0) or 0
+    bonus = (
+        (1 - price / VALUE_PRICE_CAP) * VALUE_BONUS_MAX
+        if fundamental >= VALUE_MIN_FUNDAMENTAL_FOR_BONUS
+        else 0.0
+    )
+    return combined + bonus, True
+
+def _select_top_picks(actionable: list, limit: int = 5) -> list:
+    eligible = [r for r in actionable if _value_adjusted_score(r)[1]]
+    eligible.sort(key=lambda r: _value_adjusted_score(r)[0], reverse=True)
+    return eligible[:limit]
+
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "15"))          # max symbols per batch
 MAX_CONCURRENT_BATCHES = int(os.getenv("MAX_CONCURRENT_BATCHES", "3"))
@@ -135,6 +164,14 @@ def sync_event_subscriptions():
 
 
 def run_event_check():
+    """Notifies on changes returned by event-tracker-service's /check.
+    NOTE: filtering these to "recent or upcoming only" (not stale/past)
+    needs to happen in event-tracker-service itself, where the actual
+    date fields for each change live — this script only receives
+    change["symbol"]/change["changes"] (list of description strings, no
+    structured date), so there's nothing here to filter on without
+    guessing a field name that might not exist. See the event-tracker
+    file for where this actually needs fixing."""
     try:
         resp = httpx.get(f"{EVENT_TRACKER_URL}/check", timeout=60)
         resp.raise_for_status()
@@ -211,11 +248,18 @@ def run_scan() -> Dict[str, Any]:
     if valid_results:
         check_decision_changes(valid_results)
 
-    # Top 5 picks
-    picks = [
+    # Top 5 picks — previously just took the first 5 actionable results in
+    # whatever order the parallel batches happened to complete (not sorted
+    # by score at all), so Telegram notifications and store_daily_picks
+    # were showing arbitrary picks, not the best ones. Now ranked the same
+    # way api-gateway's own recommendations are: value-adjusted score
+    # (Rs 2000 cap + low-price/good-fundamentals bonus), not raw
+    # combined_score alone.
+    actionable = [
         r for r in valid_results
         if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")
-    ][:5]
+    ]
+    picks = _select_top_picks(actionable, limit=5)
 
     return {
         "verdict": "Batch scan completed" + (" (partial)" if timed_out else ""),

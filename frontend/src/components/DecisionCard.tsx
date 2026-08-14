@@ -1,6 +1,8 @@
-import { useState } from "react";
-import { Decision } from "../api";
+import { useState, useEffect } from "react";
+import { Decision, api, TrainingScore } from "../api";
 import { decisionStyle } from "../decisionStyle";
+import StockChart from "./StockChart";
+import { toActionablePick } from "./ScanPanel";
 
 interface Props {
   data: Decision;
@@ -13,6 +15,30 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const style = decisionStyle[data.decision] ?? decisionStyle["DO NOT BUY"];
   const isBullish = data.decision === "BUY NOW" || data.decision === "PREPARE TO BUY";
   const [isAddingWatchlist, setIsAddingWatchlist] = useState(false);
+
+  // NEW: Trade This
+  const [showTradeModal, setShowTradeModal] = useState(false);
+  const [tradeCapital, setTradeCapital] = useState("100000");
+  const [tradingInProgress, setTradingInProgress] = useState(false);
+  const [tradeResult, setTradeResult] = useState<string | null>(null);
+
+  // NEW: model's own trading recommendation (training-service's KNN +
+  // classifier signal), fetched lazily since it's a separate call from
+  // decision-engine's combined_score.
+  const [trainingScore, setTrainingScore] = useState<TrainingScore | null>(null);
+  const [loadingTrainingScore, setLoadingTrainingScore] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setTrainingScore(null);
+    setLoadingTrainingScore(true);
+    api
+      .getTrainingScore(data.symbol)
+      .then((r) => { if (!cancelled) setTrainingScore(r); })
+      .catch(() => { /* no history for this symbol yet, or endpoint unreachable — fine, panel just won't show */ })
+      .finally(() => { if (!cancelled) setLoadingTrainingScore(false); });
+    return () => { cancelled = true; };
+  }, [data.symbol]);
 
   // ── UPDATED: Include Market Sentiment and Training scores ──
   const scores = [
@@ -38,6 +64,32 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
       await onAddToWatchlist(data.symbol);
     } finally {
       setIsAddingWatchlist(false);
+    }
+  };
+
+  const handleTradeThis = async () => {
+    const capital = parseFloat(tradeCapital);
+    if (!capital || capital <= 0) {
+      setTradeResult("Enter a valid amount");
+      return;
+    }
+    setTradingInProgress(true);
+    setTradeResult(null);
+    try {
+      const { results } = await api.commitActionablePicks([toActionablePick(data)], capital, true);
+      const r = results[0];
+      if (r.trade_status === "opened") {
+        setTradeResult(`✅ Trade opened (${r.trade_id}) — recorded to training too.`);
+      } else if (r.trade_status === "already_open_or_closed") {
+        setTradeResult(`Already have a position from today's pick (${r.trade_id}).`);
+      } else {
+        setTradeResult(`Could not open trade: ${r.trade_status}`);
+      }
+    } catch (err) {
+      console.error(err);
+      setTradeResult("Failed to open trade — check the Trades tab / gateway routing.");
+    } finally {
+      setTradingInProgress(false);
     }
   };
 
@@ -130,8 +182,16 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
           </div>
         )}
         
-        {/* Watchlist Button in Header */}
-        <div className="mt-4 flex justify-end">
+        {/* Watchlist + Trade buttons */}
+        <div className="mt-4 flex justify-end gap-2">
+          {isBullish && (
+            <button
+              onClick={() => setShowTradeModal(true)}
+              className="text-[10px] font-mono transition border px-3 py-1 rounded flex items-center gap-1 bg-emerald-500/15 border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/25"
+            >
+              💰 Trade This
+            </button>
+          )}
           <button
             onClick={handleAddToWatchlist}
             disabled={isAddingWatchlist}
@@ -152,6 +212,87 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
           </button>
         </div>
       </div>
+
+      {/* Trade This confirmation modal */}
+      {showTradeModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/70 backdrop-blur-sm p-4">
+          <div className="bg-graphite border border-slate/60 rounded-2xl p-6 w-full max-w-sm">
+            <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-1">
+              Trade {data.symbol}
+            </h3>
+            <p className="text-mist/50 text-xs mb-4">
+              Opens a paper trade at ₹{data.close ?? "current price"} using dummy capital from your
+              shared portfolio balance, and records this pick to training either way.
+            </p>
+            <div className="flex items-center gap-2 mb-4">
+              <span className="font-mono text-lg text-mist">₹</span>
+              <input
+                type="number"
+                value={tradeCapital}
+                onChange={(e) => setTradeCapital(e.target.value)}
+                className="flex-1 bg-ink/50 border border-slate/40 rounded-lg px-3 py-2 font-mono text-lg text-paper focus:outline-none focus:border-emerald-500/60"
+                autoFocus
+              />
+            </div>
+            {tradeResult && (
+              <p className="text-xs font-mono text-mist/70 mb-4">{tradeResult}</p>
+            )}
+            <div className="flex gap-2">
+              <button
+                onClick={() => { setShowTradeModal(false); setTradeResult(null); }}
+                className="flex-1 text-xs font-mono uppercase tracking-wider border border-slate/40 rounded-lg py-2 text-mist hover:text-paper transition"
+              >
+                {tradeResult ? "Close" : "Cancel"}
+              </button>
+              {!tradeResult && (
+                <button
+                  onClick={handleTradeThis}
+                  disabled={tradingInProgress}
+                  className="flex-1 text-xs font-mono uppercase tracking-wider bg-emerald-500/20 border border-emerald-500/50 text-emerald-400 rounded-lg py-2 hover:bg-emerald-500/30 transition disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {tradingInProgress && (
+                    <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-emerald-400 animate-spin" />
+                  )}
+                  {tradingInProgress ? "Opening..." : "Confirm Trade"}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Price chart */}
+      <StockChart symbol={data.symbol} />
+
+      {/* Model's own trading recommendation, from training-service's real
+          pick history — separate signal from decision-engine's combined_score,
+          based on what actually happened to similar past setups. */}
+      {loadingTrainingScore ? (
+        <div className="rounded-xl border border-slate/40 bg-graphite/30 p-4 text-xs text-mist/40 font-mono flex items-center gap-2">
+          <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-mist/40 animate-spin" />
+          Checking model recommendation...
+        </div>
+      ) : trainingScore ? (
+        <div className="rounded-xl border border-signal-prepare/30 bg-graphite p-5">
+          <h3 className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">
+            🤖 Model Recommendation
+          </h3>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
+            <MetricItem label="Training Score" value={`${trainingScore.training_score}`} />
+            <MetricItem label="T+1 Success" value={`${trainingScore.t1_success_probability}%`} />
+            <MetricItem label="T+5 Success" value={`${trainingScore.t5_success_probability}%`} />
+            <MetricItem
+              label="Model Confidence"
+              value={trainingScore.model_success_probability == null ? "—" : `${trainingScore.model_success_probability}%`}
+            />
+          </div>
+          {trainingScore.similar_setups && trainingScore.similar_setups.length > 0 && (
+            <div className="text-xs text-mist/60">
+              Based on {trainingScore.similar_setups.length} similar past setups in this system's own history.
+            </div>
+          )}
+        </div>
+      ) : null}
 
       {/* Price levels + Score breakdown */}
       <div className="grid grid-cols-2 gap-4">
@@ -242,10 +383,31 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
       </div>
 
       {/* Holding period */}
-      {data.holding_period !== "N/A" && (
-        <div className="rounded-xl border border-slate bg-graphite px-5 py-4 font-mono text-xs text-mist flex justify-between">
-          <span className="uppercase tracking-widest">Suggested holding period</span>
-          <span className="text-paper">{data.holding_period}</span>
+      {(data.holding_period !== "N/A" || data.holding_period_estimate) && (
+        <div className="rounded-xl border border-slate bg-graphite px-5 py-4 font-mono text-xs text-mist">
+          <div className="flex justify-between">
+            <span className="uppercase tracking-widest">Suggested holding period</span>
+            <span className="text-paper">{data.holding_period}</span>
+          </div>
+          {data.holding_period_estimate && (
+            <div className="mt-2 pt-2 border-t border-slate/30 flex justify-between text-mist/70">
+              <span className="uppercase tracking-widest text-[10px]">Estimated date range</span>
+              <span className="text-paper">{data.holding_period_estimate.label}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Event update — raw pass-through from event-tracker-service, shape
+          isn't fixed on the gateway side, so this renders defensively:
+          arrays of strings as bullets, small key/value objects as a list,
+          otherwise falls back to compact JSON so nothing is silently lost. */}
+      {data.event_data && Object.keys(data.event_data).length > 0 && (
+        <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
+          <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">
+            📅 Event Update
+          </h4>
+          <EventDataView data={data.event_data} />
         </div>
       )}
 
@@ -260,6 +422,49 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
           </p>
         </div>
       )}
+    </div>
+  );
+}
+
+function EventDataView({ data }: { data: Record<string, unknown> }) {
+  return (
+    <div className="space-y-2">
+      {Object.entries(data).map(([key, value]) => {
+        if (value == null) return null;
+        const label = key.replace(/_/g, " ");
+        if (Array.isArray(value)) {
+          if (value.length === 0) return null;
+          return (
+            <div key={key}>
+              <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
+              <ul className="space-y-1">
+                {value.map((item, i) => (
+                  <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
+                    <span className="text-slate mt-1 shrink-0">–</span>
+                    <span>{typeof item === "string" ? item : JSON.stringify(item)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          );
+        }
+        if (typeof value === "object") {
+          return (
+            <div key={key}>
+              <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
+              <pre className="text-xs text-mist/70 whitespace-pre-wrap font-mono bg-ink/30 rounded p-2">
+                {JSON.stringify(value, null, 2)}
+              </pre>
+            </div>
+          );
+        }
+        return (
+          <div key={key} className="flex justify-between text-sm">
+            <span className="text-mist/50 font-mono text-[10px] uppercase tracking-wider self-center">{label}</span>
+            <span className="text-paper">{String(value)}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }

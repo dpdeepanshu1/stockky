@@ -1,7 +1,7 @@
 // frontend/src/components/Training.tsx
 
 import { useEffect, useState, useRef } from "react";
-import { api, TrainingStatusResponse } from "../api";
+import { api, TrainingStatusResponse, PeriodRollupItem, TrainingProgress } from "../api";
 
 export default function Training() {
   const [status, setStatus] = useState<TrainingStatusResponse | null>(null);
@@ -17,6 +17,19 @@ export default function Training() {
   const [summaryMetrics, setSummaryMetrics] = useState<any>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [loadingInsights, setLoadingInsights] = useState(false);
+
+  // NEW: daily/weekly pick-tracking rollup
+  const [periodView, setPeriodView] = useState<"daily" | "weekly">("daily");
+  const [periodRollup, setPeriodRollup] = useState<PeriodRollupItem[]>([]);
+  const [loadingRollup, setLoadingRollup] = useState(false);
+
+  // NEW: manual intervention controls (for when scheduler-service isn't running)
+  const [runningT1, setRunningT1] = useState(false);
+  const [runningT5, setRunningT5] = useState(false);
+
+  // NEW: animated live training progress
+  const [trainProgress, setTrainProgress] = useState<TrainingProgress | null>(null);
+  const progressPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const timerIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -43,18 +56,24 @@ export default function Training() {
   const fetchPredictionHistory = async () => {
     setLoadingHistory(true);
     try {
-      const response = await fetch(
-        `${import.meta.env.VITE_API_URL}/training/api/predictions/history?limit=20`,
-        { headers: { "Content-Type": "application/json" } }
-      );
-      if (response.ok) {
-        const data = await response.json();
-        setPredictions(data.predictions || []);
-      }
+      const data = await api.getPredictionHistory(20);
+      setPredictions(data.predictions || []);
     } catch (err) {
       console.error("Failed to fetch prediction history:", err);
     } finally {
       setLoadingHistory(false);
+    }
+  };
+
+  const fetchPeriodRollup = async (view: "daily" | "weekly") => {
+    setLoadingRollup(true);
+    try {
+      const data = view === "daily" ? await api.getDailyRollup(30) : await api.getWeeklyRollup(12);
+      setPeriodRollup(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error("Failed to fetch period rollup:", err);
+    } finally {
+      setLoadingRollup(false);
     }
   };
 
@@ -93,20 +112,32 @@ export default function Training() {
 
   const clearLock = async () => {
     try {
-      const response = await fetch(
-        `${import.meta.env.VITE_API_URL}/training/lock`,
-        { method: "DELETE" }
-      );
-      if (response.ok) {
-        showToast("success", "Training lock cleared.");
-        return true;
-      } else {
-        showToast("error", "Failed to clear lock.");
-        return false;
-      }
+      await api.clearTrainingLock();
+      showToast("success", "Training lock cleared.");
+      return true;
     } catch {
-      showToast("error", "Error clearing lock.");
+      showToast("error", "Failed to clear lock.");
       return false;
+    }
+  };
+
+  // Manual fallback for evaluate_t1/evaluate_t5, in case scheduler-service
+  // isn't running. Sweeps every pending prediction, same endpoint the
+  // backend would call on a cron.
+  const runEvaluation = async (period: "t1" | "t5") => {
+    const setRunning = period === "t1" ? setRunningT1 : setRunningT5;
+    setRunning(true);
+    try {
+      await api.triggerEvaluation(period);
+      showToast("info", `${period.toUpperCase()} evaluation sweep started.`);
+      setTimeout(() => {
+        fetchPredictionHistory();
+        fetchPeriodRollup(periodView);
+      }, 5000);
+    } catch {
+      showToast("error", `Failed to trigger ${period.toUpperCase()} evaluation.`);
+    } finally {
+      setRunning(false);
     }
   };
 
@@ -116,11 +147,39 @@ export default function Training() {
     fetchPredictionHistory();
     fetchInsights();
     fetchSummaryMetrics();
+    fetchPeriodRollup("daily");
     return () => {
       if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    fetchPeriodRollup(periodView);
+  }, [periodView]);
+
+  // Poll /api/train/progress while a run is active, for the animated panel.
+  useEffect(() => {
+    const isActive = training || status?.training_in_progress;
+    if (!isActive) {
+      if (progressPollRef.current) clearInterval(progressPollRef.current);
+      return;
+    }
+    const poll = async () => {
+      try {
+        const p = await api.getTrainingProgress();
+        setTrainProgress(p);
+      } catch {
+        // Progress endpoint may not be routed through the gateway yet —
+        // fail quietly, the rest of the training UI still works without it.
+      }
+    };
+    poll();
+    progressPollRef.current = setInterval(poll, 2000);
+    return () => {
+      if (progressPollRef.current) clearInterval(progressPollRef.current);
+    };
+  }, [training, status?.training_in_progress]);
 
   // ---------- UI helpers ----------
   const showToast = (type: "success" | "error" | "info", message: string) => {
@@ -290,6 +349,56 @@ export default function Training() {
     );
   };
 
+  const renderPeriodRollup = () => {
+    if (loadingRollup) return <Spinner />;
+    if (periodRollup.length === 0) {
+      return (
+        <p className="text-mist/40 text-sm py-2">
+          No picks recorded in this window yet. Every BUY NOW / PREPARE TO BUY
+          from a market scan lands here once decision-engine records it.
+        </p>
+      );
+    }
+    return (
+      <div className="overflow-x-auto mt-2">
+        <table className="w-full text-xs font-mono">
+          <thead>
+            <tr className="text-mist/50 border-b border-slate/40">
+              <th className="text-left py-1 pr-3">{periodView === "daily" ? "Date" : "Week"}</th>
+              <th className="text-right py-1 px-2">Picks</th>
+              <th className="text-right py-1 px-2">Buy Now</th>
+              <th className="text-right py-1 px-2">Prepare</th>
+              <th className="text-right py-1 px-2">T+1 Success</th>
+              <th className="text-right py-1 px-2">T+1 Avg</th>
+              <th className="text-right py-1 px-2">T+5 Success</th>
+              <th className="text-right py-1 px-2">T+5 Avg</th>
+              <th className="text-right py-1 pl-2">Pending</th>
+            </tr>
+          </thead>
+          <tbody>
+            {periodRollup.map((row) => (
+              <tr key={row.period} className="border-b border-slate/30">
+                <td className="py-1 pr-3 text-paper">{row.period}</td>
+                <td className="text-right py-1 px-2 text-mist/80">{row.predictions_recorded}</td>
+                <td className="text-right py-1 px-2 text-mist/80">{row.buy_now}</td>
+                <td className="text-right py-1 px-2 text-mist/80">{row.prepare_to_buy}</td>
+                <td className={`text-right py-1 px-2 ${row.t1_success_rate == null ? "text-mist/40" : row.t1_success_rate >= 50 ? "text-signal-buy" : "text-red-400"}`}>
+                  {row.t1_success_rate == null ? "—" : `${row.t1_success_rate}%`}
+                </td>
+                <td className="text-right py-1 px-2 text-mist/60">{row.t1_avg_return_pct == null ? "—" : `${row.t1_avg_return_pct}%`}</td>
+                <td className={`text-right py-1 px-2 ${row.t5_success_rate == null ? "text-mist/40" : row.t5_success_rate >= 50 ? "text-signal-buy" : "text-red-400"}`}>
+                  {row.t5_success_rate == null ? "—" : `${row.t5_success_rate}%`}
+                </td>
+                <td className="text-right py-1 px-2 text-mist/60">{row.t5_avg_return_pct == null ? "—" : `${row.t5_avg_return_pct}%`}</td>
+                <td className="text-right py-1 pl-2 text-mist/50">{row.t1_pending}/{row.t5_pending}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
   const renderPredictionHistory = () => {
     if (loadingHistory) return <Spinner />;
     if (!predictions.length) return <p className="text-mist/40 text-sm">No predictions recorded yet.</p>;
@@ -432,28 +541,95 @@ export default function Training() {
         </div>
       </div>
 
-      {/* Training in progress card */}
+      {/* Manual intervention: for when scheduler-service isn't running these on
+          its own cron. Each button hits the same endpoint the automation would. */}
+      <div className="bg-graphite border border-slate/60 rounded-xl p-4">
+        <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">
+          🛠️ Manual Controls (use if automation isn't running)
+        </h3>
+        <div className="flex flex-wrap gap-3">
+          <button
+            onClick={() => runEvaluation("t1")}
+            disabled={runningT1}
+            className="font-mono text-xs px-4 py-2 rounded-lg bg-slate/30 text-mist hover:bg-slate/50 transition disabled:opacity-50 flex items-center gap-2"
+          >
+            {runningT1 ? <Spinner /> : null} Run T+1 Evaluation Sweep
+          </button>
+          <button
+            onClick={() => runEvaluation("t5")}
+            disabled={runningT5}
+            className="font-mono text-xs px-4 py-2 rounded-lg bg-slate/30 text-mist hover:bg-slate/50 transition disabled:opacity-50 flex items-center gap-2"
+          >
+            {runningT5 ? <Spinner /> : null} Run T+5 Evaluation Sweep
+          </button>
+        </div>
+        <p className="text-mist/40 text-[11px] mt-2">
+          Trade mark-to-market has its own manual trigger on the Trades tab.
+        </p>
+      </div>
+
+      {/* Training in progress: animated stage pipeline */}
       {(training || status?.training_in_progress) && (
-        <div className="bg-graphite border border-signal-prepare/30 rounded-xl p-5 animate-pulse">
-          <div className="flex items-center gap-4">
+        <div className="bg-graphite border border-signal-prepare/30 rounded-xl p-5">
+          <div className="flex items-center gap-4 mb-4">
             <Spinner size="lg" />
             <div>
               <h3 className="font-display text-lg text-signal-prepare">
                 {training ? "Training in progress..." : "Training is running in background..."}
               </h3>
-              <div className="flex flex-wrap gap-6 mt-2 text-sm">
+              <div className="flex flex-wrap gap-6 mt-1 text-sm">
                 <div>
                   <span className="text-mist/60">Elapsed: </span>
                   <span className="font-mono text-paper">{formatTime(elapsedSeconds)}</span>
                 </div>
               </div>
-              <div className="mt-2 text-xs text-mist/40">
-                The page auto‑updates when done. You can also click Refresh or Stop.
-              </div>
             </div>
+          </div>
+
+          <StageTracker stage={trainProgress?.stage} />
+
+          {trainProgress?.detail && Object.keys(trainProgress.detail).length > 0 && (
+            <div className="mt-4 bg-ink/40 border border-slate/30 rounded-lg p-3 font-mono text-xs">
+              {trainProgress.detail.dataset_size != null && (
+                <div className="text-mist/70">
+                  Dataset: <span className="text-paper">{String(trainProgress.detail.dataset_size)}</span> examples across{" "}
+                  <span className="text-paper">{String(trainProgress.detail.num_symbols)}</span> symbols
+                </div>
+              )}
+              {Array.isArray(trainProgress.detail.symbols_sample) && trainProgress.detail.symbols_sample.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {(trainProgress.detail.symbols_sample as string[]).map((s, i) => (
+                    <span
+                      key={s}
+                      className="bg-signal-prepare/10 border border-signal-prepare/30 text-signal-prepare rounded px-2 py-0.5 text-[10px]"
+                      style={{ animation: `fadeInUp 0.3s ease-out ${i * 0.05}s both` }}
+                    >
+                      {s}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {trainProgress.detail.train_samples != null && trainProgress.detail.holdout_samples != null && (
+                <div className="text-mist/70 mt-2">
+                  Split: <span className="text-paper">{String(trainProgress.detail.train_samples)}</span> train /{" "}
+                  <span className="text-paper">{String(trainProgress.detail.holdout_samples)}</span> holdout
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="mt-2 text-xs text-mist/40">
+            The page auto‑updates when done. You can also click Refresh or Stop.
           </div>
         </div>
       )}
+
+      <style>{`
+        @keyframes fadeInUp {
+          from { opacity: 0; transform: translateY(4px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+      `}</style>
 
       {/* Status Cards */}
       {loading ? (
@@ -540,6 +716,29 @@ export default function Training() {
             </div>
           )}
 
+          {/* Daily / Weekly Pick Tracking */}
+          <div className="bg-graphite border border-slate/60 rounded-xl p-5">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="font-mono text-xs text-mist uppercase tracking-widest">
+                📅 Pick Tracking (T+1 / T+5 by {periodView === "daily" ? "day" : "week"})
+              </h3>
+              <div className="flex gap-1 bg-ink/40 border border-slate/40 rounded-lg p-0.5">
+                {(["daily", "weekly"] as const).map((v) => (
+                  <button
+                    key={v}
+                    onClick={() => setPeriodView(v)}
+                    className={`px-3 py-1 text-xs font-mono uppercase rounded-md transition-colors ${
+                      periodView === v ? "bg-slate/60 text-paper" : "text-mist/50 hover:text-mist"
+                    }`}
+                  >
+                    {v}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {renderPeriodRollup()}
+          </div>
+
           {/* Prediction History */}
           <div className="bg-graphite border border-slate/60 rounded-xl p-5">
             <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
@@ -577,6 +776,57 @@ export default function Training() {
 }
 
 // ── Helper Components ──
+
+const TRAINING_STAGES: { key: string; label: string }[] = [
+  { key: "loading_data", label: "Loading" },
+  { key: "data_loaded", label: "Loaded" },
+  { key: "splitting", label: "Splitting" },
+  { key: "fitting_model", label: "Fitting" },
+  { key: "evaluating", label: "Evaluating" },
+  { key: "saving_model", label: "Saving" },
+  { key: "done", label: "Done" },
+];
+
+function StageTracker({ stage }: { stage?: string }) {
+  const currentIdx = TRAINING_STAGES.findIndex((s) => s.key === stage);
+  return (
+    <div className="flex items-center">
+      {TRAINING_STAGES.map((s, i) => {
+        const isDone = currentIdx > i || stage === "done";
+        const isCurrent = currentIdx === i && stage !== "done";
+        return (
+          <div key={s.key} className="flex items-center flex-1 last:flex-none">
+            <div className="flex flex-col items-center gap-1">
+              <div
+                className={`w-3 h-3 rounded-full border-2 transition-all duration-300 ${
+                  isDone
+                    ? "bg-signal-buy border-signal-buy"
+                    : isCurrent
+                    ? "bg-signal-prepare border-signal-prepare animate-pulse scale-125"
+                    : "bg-transparent border-slate/50"
+                }`}
+              />
+              <span
+                className={`text-[9px] font-mono uppercase whitespace-nowrap ${
+                  isDone ? "text-signal-buy" : isCurrent ? "text-signal-prepare" : "text-mist/30"
+                }`}
+              >
+                {s.label}
+              </span>
+            </div>
+            {i < TRAINING_STAGES.length - 1 && (
+              <div
+                className={`h-0.5 flex-1 mx-1 transition-all duration-500 ${
+                  isDone ? "bg-signal-buy" : "bg-slate/30"
+                }`}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 function Spinner({ size = "sm" }: { size?: "sm" | "lg" }) {
   const dimension = size === "lg" ? "w-8 h-8" : "w-4 h-4";

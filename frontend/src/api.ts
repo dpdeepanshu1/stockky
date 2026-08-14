@@ -66,6 +66,19 @@ export interface Decision {
   data_insufficient?: boolean;
   fundamental_fallback?: boolean;
   event_score_delta?: number;
+  // NEW: raw pass-through from event-tracker-service — shape isn't fixed
+  // on the gateway side (it just forwards whatever that service returns),
+  // so treat as unknown and render defensively.
+  event_data?: Record<string, unknown> | null;
+  // NEW: concrete calendar-date estimate alongside the (often static)
+  // holding_period string.
+  holding_period_estimate?: {
+    min_days: number;
+    max_days: number;
+    expected_by_earliest: string;
+    expected_by_latest: string;
+    label: string;
+  } | null;
 }
 
 export interface ScanResult {
@@ -218,12 +231,159 @@ export interface TrainingScore {
   training_score: number;
   t1_success_probability: number;
   t5_success_probability: number;
+  model_success_probability: number | null;
   historical_similarity: number;
   similar_setups: Array<{
     symbol: string;
     similarity: number;
     outcome: string;
   }>;
+}
+
+// ── NEW: prediction history / rollups / trades / actionable-commit ──
+// These call NEW api-gateway routes (see the spec at the end of this file's
+// companion chat message) that don't exist yet — added here so the
+// frontend and training-service contract is defined and ready, but each
+// will 404 until api-gateway adds a matching route.
+
+export interface PredictionHistoryItem {
+  prediction_id: string;
+  symbol: string;
+  timestamp: string;
+  decision: string;
+  price: number;
+  t1_success: number; // 0 pending, 1 success, 2 failed
+  t5_success: number;
+  outcomes: Array<{ period: string; return_pct: number | null; success: number }>;
+}
+
+export interface PeriodRollupItem {
+  period: string;
+  predictions_recorded: number;
+  unique_symbols: number;
+  buy_now: number;
+  prepare_to_buy: number;
+  t1_evaluated: number;
+  t1_success_rate: number | null;
+  t1_avg_return_pct: number | null;
+  t5_evaluated: number;
+  t5_success_rate: number | null;
+  t5_avg_return_pct: number | null;
+  t1_pending: number;
+  t5_pending: number;
+}
+
+export interface PaperTrade {
+  trade_id: string;
+  prediction_id: string;
+  symbol: string;
+  capital_allocated: number;
+  entry_price: number;
+  quantity: number;
+  entry_date: string;
+  target: number | null;
+  stop_loss: number | null;
+  status: "OPEN" | "CLOSED";
+  current_price: number | null;
+  exit_price: number | null;
+  exit_date: string | null;
+  exit_reason: string | null;
+  pnl_amount: number | null;
+  pnl_pct: number | null;
+  last_marked_at: string | null;
+}
+
+// Replaces the old fixed-pot-per-trade TradeSummary shape — trades now
+// share one portfolio balance (see trades.py), so the summary reports
+// cash_balance/total_equity instead of a simple capital_deployed total.
+export interface PortfolioSummary {
+  cash_balance: number;
+  total_deposited: number;
+  realized_pnl: number;
+  open_positions_value: number;
+  open_positions_pnl: number;
+  total_equity: number;
+  open_positions: number;
+  closed_positions: number;
+  win_rate: number | null;
+}
+
+export interface TradeReportBucket {
+  period: string;
+  trades_opened: number;
+  trades_closed: number;
+  realized_pnl: number;
+  wins: number;
+  losses: number;
+  capital_deployed: number;
+  win_rate: number | null;
+}
+
+export interface StockHistoryPoint {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface StockHistory {
+  symbol: string;
+  period: string;
+  points: StockHistoryPoint[];
+  change_pct: number | null;
+}
+
+export interface TrainingProgress {
+  stage: "idle" | "loading_data" | "data_loaded" | "splitting" | "fitting_model" | "evaluating" | "saving_model" | "done" | "aborted";
+  detail: Record<string, unknown>;
+  timestamp: number | null;
+  elapsed?: number | null;
+}
+
+export interface ActionablePick {
+  symbol: string;
+  decision: string;
+  confidence: string;
+  price: number;
+  target?: number | null;
+  stop_loss?: number | null;
+  entry_range_low?: number | null;
+  entry_range_high?: number | null;
+  combined_score: number;
+  technical_score: number;
+  fundamental_score: number;
+  news_score?: number | null;
+  prediction_score?: number | null;
+  market_score: number;
+  training_score: number;
+  event_risk: boolean;
+  market_mood?: string | null;
+  nifty_change_pct?: number | null;
+  sensex_change_pct?: number | null;
+  rsi?: number | null;
+  macd?: string | null;
+  ema?: string | null;
+  volume_ratio?: number | null;
+  debt_to_equity?: number | null;
+  roe?: number | null;
+  roce?: number | null;
+  holding_period?: string | null;
+  support?: number | null;
+  resistance?: number | null;
+  sector?: string | null;
+  valuation?: string | null;
+  market_sentiment_adjustment?: number | null;
+  feature_snapshot?: Record<string, unknown> | null;
+}
+
+export interface ActionableCommitResult {
+  symbol: string;
+  prediction_id: string;
+  record_status: "stored" | "already_recorded";
+  trade_id: string | null;
+  trade_status: string;
 }
 
 // ───────────────────────────────────────────────
@@ -326,6 +486,15 @@ export const api = {
   scanStatus: (taskId: string) =>
     request<ScanStatus>(`/scan/status/${taskId}`, undefined, 2, 10000),
 
+  /** Cancels a running scan. api-gateway checks this periodically inside
+   * run_scan_parallel (every 3rd completed symbol) and finalizes the task
+   * as "done" with whatever was actually scored so far, instead of an
+   * empty or error result. */
+  scanCancel: (taskId: string) =>
+    request<{ status: string; processed_so_far?: number; total?: number }>(
+      `/scan/cancel/${taskId}`, { method: "POST" }, 1, 10000
+    ),
+
   scanWatchlist: () =>
     request<ScanResult>("/scan/watchlist", undefined, 2, 120000),
 
@@ -413,21 +582,112 @@ export const api = {
     ),
 
   // ─── Training Service endpoints ───
+  //
+  // api-gateway has 3 specific /training/* routes (status, train, score)
+  // that hit training-service's bare aliases (/model-status, /train,
+  // /training-score/{symbol}) with no query-param passthrough — plus a
+  // catch-all `@app.api_route("/training/{path:path}")` that forwards
+  // everything else to training-service verbatim, including query
+  // params. Every method below except getTrainingStatus/getTrainingScore
+  // goes through that catch-all, so the path here must exactly match the
+  // real training-service route including its /api/ prefix — no new
+  // gateway routes are needed for any of these, they already work.
 
-  /** Get the current training status (matches TrainingStatusResponse) */
+  /** Get the current training status (matches TrainingStatusResponse).
+   * Hits the specific gateway route -> training-service's bare /model-status. */
   getTrainingStatus: () =>
     request<TrainingStatusResponse>("/training/status", undefined, 2, 30000),
 
-  /** Trigger a new training run. Returns { status: string, service_url?: string } */
-  triggerTraining: () =>
+  /** Trigger a new training run. Goes through the catch-all (not the
+   * specific /training/train route, which doesn't forward query params)
+   * so label_source actually reaches training-service's /api/train. */
+  triggerTraining: (labelSource: "t1_outcome" | "trade_pnl" = "t1_outcome") =>
     request<TriggerTrainingResponse>(
-      "/training/train",
+      `/training/api/train?label_source=${labelSource}`,
       { method: "POST" },
       2,
       60000
     ),
 
-  /** Get training score for a specific symbol */
+  /** Get training score for a specific symbol. Hits the specific gateway
+   * route -> training-service's bare /training-score/{symbol}. */
   getTrainingScore: (symbol: string) =>
     request<TrainingScore>(`/training/score/${symbol}`, undefined, 2, 30000),
+
+  /** Stop a running training job — actually interrupts the fit in
+   * progress (abort_event / XGBoost callback), not just unblocks a new
+   * run. Goes through the catch-all to training-service's bare DELETE /lock. */
+  clearTrainingLock: () =>
+    request<{ status: string }>("/training/lock", { method: "DELETE" }, 1, 15000),
+
+  /** Recent predictions with T+1/T+5 outcomes. */
+  getPredictionHistory: (limit = 20) =>
+    request<{ predictions: PredictionHistoryItem[]; total: number }>(
+      `/training/api/predictions/history?limit=${limit}`, undefined, 2, 30000
+    ),
+
+  /** Day-by-day pick tracking. */
+  getDailyRollup: (days = 30) =>
+    request<PeriodRollupItem[]>(`/training/api/metrics/daily?days=${days}`, undefined, 2, 30000),
+
+  /** Week-by-week pick tracking. */
+  getWeeklyRollup: (weeks = 12) =>
+    request<PeriodRollupItem[]>(`/training/api/metrics/weekly?weeks=${weeks}`, undefined, 2, 30000),
+
+  /** Manual evaluation sweep. */
+  triggerEvaluation: (period: "t1" | "t5") =>
+    request<{ status: string }>(`/training/api/evaluate/${period}`, { method: "POST" }, 1, 30000),
+
+  /** The "Add all actionable stocks to training" / "Trade This" button. */
+  commitActionablePicks: (picks: ActionablePick[], capitalPerTrade = 100000, openTrades = true) =>
+    request<{ results: ActionableCommitResult[] }>(
+      "/training/api/actionable/commit",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ picks, capital_per_trade: capitalPerTrade, open_trades: openTrades }),
+      },
+      1,
+      60000
+    ),
+
+  getTrades: (status: "open" | "closed" | "all" = "all") =>
+    request<PaperTrade[]>(`/training/api/trades?status=${status}`, undefined, 2, 30000),
+
+  /** Returns PortfolioSummary — trades share one balance, see trades.py. */
+  getTradesSummary: () =>
+    request<PortfolioSummary>("/training/api/trades/summary", undefined, 2, 30000),
+
+  /** Same data, clearer name. */
+  getPortfolioSummary: () =>
+    request<PortfolioSummary>("/training/api/portfolio/summary", undefined, 2, 30000),
+
+  depositFunds: (amount: number, note?: string) =>
+    request<{ status: string; cash_balance: number; total_deposited: number }>(
+      "/training/api/portfolio/deposit",
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ amount, note }) },
+      1,
+      15000
+    ),
+
+  getDailyTradeReport: (days = 30) =>
+    request<TradeReportBucket[]>(`/training/api/trades/report/daily?days=${days}`, undefined, 2, 30000),
+
+  getWeeklyTradeReport: (weeks = 12) =>
+    request<TradeReportBucket[]>(`/training/api/trades/report/weekly?weeks=${weeks}`, undefined, 2, 30000),
+
+  /** period: "1d" | "5d" | "1mo" | "1y" | "5y" */
+  getStockHistory: (symbol: string, period: "1d" | "5d" | "1mo" | "1y" | "5y" = "1mo") =>
+    request<StockHistory>(`/training/api/stock/history/${symbol}?period=${period}`, undefined, 2, 30000),
+
+  getTrainingProgress: () =>
+    request<TrainingProgress>("/training/api/train/progress", undefined, 1, 10000),
+
+  markTradesToMarket: () =>
+    request<{ status: string }>("/training/api/trades/mark-to-market", { method: "POST" }, 1, 30000),
+
+  closeTrade: (tradeId: string) =>
+    request<{ status: string; trade_id: string; exit_price: number; pnl_pct: number }>(
+      `/training/api/trades/${tradeId}/close`, { method: "POST" }, 1, 30000
+    ),
 };
