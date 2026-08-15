@@ -40,7 +40,7 @@ function getNewsItems(data: Decision): NewsItem[] {
   return items;
 }
 
-// ── Sentiment scoring based on news titles ──
+// ── Sentiment scoring ──
 function computeNewsSentimentScore(newsItems: NewsItem[]): number {
   if (!newsItems.length) return 50;
 
@@ -526,7 +526,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* ── EVENT UPDATE (cleaned, no JSON) ── */}
+      {/* ── EVENT UPDATE ── */}
       {data.event_data && Object.keys(data.event_data).length > 0 && (
         <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
           <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">
@@ -536,28 +536,26 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* ── NEWS SECTION with score, fundamentals, and 7-day filter ── */}
+      {/* ── NEWS SECTION with 14-day filter ── */}
       {(() => {
         const newsItemsList = getNewsItems(data);
         if (newsItemsList.length === 0) return null;
 
-        // Sort newest first
         const sorted = [...newsItemsList].sort((a, b) => {
           const da = a.published ? new Date(a.published).getTime() : 0;
           const db = b.published ? new Date(b.published).getTime() : 0;
           return db - da;
         });
 
-        // ── Only show news from the last 7 days ──
-        const oneWeekAgo = new Date();
-        oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-        
+        // ── Filter: only news from the last 14 days ──
+        const twoWeeksAgo = new Date();
+        twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
+
         const recentNews = sorted.filter(item => {
           if (!item.published) return false;
-          return new Date(item.published) >= oneWeekAgo;
+          return new Date(item.published) >= twoWeeksAgo;
         });
 
-        // If no news in the last 7 days, show a friendly message
         if (recentNews.length === 0) {
           return (
             <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
@@ -565,10 +563,10 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
                 <h4 className="font-mono text-xs text-mist uppercase tracking-widest">
                   📰 News
                 </h4>
-                <span className="text-xs text-mist/40">No recent news (last 7 days)</span>
+                <span className="text-xs text-mist/40">No recent news (last 14 days)</span>
               </div>
               <p className="text-sm text-mist/60 italic">
-                No news articles found for the last 7 days.
+                No news articles found for the last 14 days.
               </p>
             </div>
           );
@@ -614,7 +612,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
             {previous.length > 0 && (
               <div>
                 <h5 className="text-sm font-medium text-blue-600 dark:text-blue-400 mb-1.5">
-                  📄 Previous News (last 7 days)
+                  📄 Previous News (last 14 days)
                 </h5>
                 {previous.map((item, idx) => (
                   <NewsItemWithFundamentals
