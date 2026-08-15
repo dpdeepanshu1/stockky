@@ -1,7 +1,8 @@
 """
-Event Tracker Service v0.4.3
+Event Tracker Service v0.4.4
 -----------------------------
-Reduced rate‑limit errors by caching yfinance API calls.
+Dynamically fetches company name from yfinance for any symbol.
+Works for ALL stocks, not just those in NAME_HINTS.
 """
 import os
 import json
@@ -25,7 +26,7 @@ from upstash_redis import Redis
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("event-tracker-service")
 
-app = FastAPI(title="Stockky Event Tracker Service", version="0.4.3")
+app = FastAPI(title="Stockky Event Tracker Service", version="0.4.4")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 EVENT_CACHE_TTL = 4 * 3600
@@ -37,9 +38,11 @@ EVENT_FALLBACK_PREFIX = "stockky:event:fallback:"
 EVENTS_LIST_CACHE_KEY = "stockky:events_list"
 EVENTS_LIST_CACHE_TTL = 3600
 
-# ── In‑memory cache for yfinance calls ──
+# ── In‑memory cache for yfinance calls and company names ──
 _yf_cache: Dict[str, Dict[str, Any]] = {}
+_company_name_cache: Dict[str, str] = {}
 CACHE_TTL_SECONDS = 300  # 5 minutes
+COMPANY_NAME_CACHE_TTL = 3600  # 1 hour (company name rarely changes)
 
 def cached_yf(method_name: str):
     """Decorator to cache results of yfinance methods with TTL."""
@@ -61,6 +64,7 @@ def cached_yf(method_name: str):
             return result
         return wrapper
     return decorator
+
 
 # ── Redis ──────────────────────────────────────────────────────────────────────
 _redis = None
@@ -130,9 +134,27 @@ _yf_ticker_cache: Dict[str, yf.Ticker] = {}
 def _get_ticker(symbol: str) -> yf.Ticker:
     if symbol not in _yf_ticker_cache:
         _yf_ticker_cache[symbol] = yf.Ticker(symbol)
-        # set timezone to IST for consistency
         _yf_ticker_cache[symbol]._tz = "Asia/Kolkata"
     return _yf_ticker_cache[symbol]
+
+def _get_company_name(symbol: str) -> str:
+    """Get the long company name from yfinance, with fallback to the symbol."""
+    if symbol in _company_name_cache:
+        return _company_name_cache[symbol]
+    
+    ticker = _get_ticker(symbol)
+    try:
+        info = ticker.info
+        name = info.get('longName') or info.get('shortName') or symbol.replace(".NS", "").replace(".BO", "")
+        # Cache it
+        _company_name_cache[symbol] = name
+        logger.info(f"Company name for {symbol}: {name}")
+        return name
+    except Exception as e:
+        logger.warning(f"Could not fetch company name for {symbol}: {e}")
+        fallback = symbol.replace(".NS", "").replace(".BO", "")
+        _company_name_cache[symbol] = fallback
+        return fallback
 
 @cached_yf("get_earnings_dates")
 def _get_earnings_dates(symbol: str, limit: int = 1):
@@ -207,55 +229,25 @@ def _get_news(symbol: str):
         return None
 
 
-# ── Keyword variants ──
+# ── Keyword variants (now using company name from yfinance) ──
 def _get_keywords(symbol: str) -> List[str]:
+    """Return a list of keywords to search in news feeds."""
+    company = _get_company_name(symbol)
     base = symbol.replace(".NS", "").replace(".BO", "").upper()
-    name_hints = {
-        "TCS": "Tata Consultancy Services",
-        "INFY": "Infosys",
-        "HDFCBANK": "HDFC Bank",
-        "ICICIBANK": "ICICI Bank",
-        "RELIANCE": "Reliance Industries",
-        "HCLTECH": "HCL Technologies",
-        "COFORGE": "Coforge",
-        "ANGELONE": "Angel One",
-        "ADANIPOWER": "Adani Power",
-        "BEL": "Bharat Electronics",
-        "HAL": "Hindustan Aeronautics",
-        "TATAMOTORS": "Tata Motors",
-        "SBIN": "State Bank of India",
-        "PWL": "PhysicsWallah",
-    }
-    company = name_hints.get(base, base)
+    # Also add the raw symbol as lowercase and uppercase
     return [company, base, base.lower(), company.lower()]
 
 
 # ── News sources ──
 
 def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]:
-    base = symbol.replace(".NS", "").replace(".BO", "").upper()
-    name_hints = {
-        "TCS": "Tata Consultancy Services",
-        "INFY": "Infosys",
-        "HDFCBANK": "HDFC Bank",
-        "ICICIBANK": "ICICI Bank",
-        "RELIANCE": "Reliance Industries",
-        "HCLTECH": "HCL Technologies",
-        "COFORGE": "Coforge",
-        "ANGELONE": "Angel One",
-        "ADANIPOWER": "Adani Power",
-        "BEL": "Bharat Electronics",
-        "HAL": "Hindustan Aeronautics",
-        "TATAMOTORS": "Tata Motors",
-        "SBIN": "State Bank of India",
-        "PWL": "PhysicsWallah",
-    }
-    company = name_hints.get(base, base)
+    """Fetch from Google News RSS using the company name."""
+    company = _get_company_name(symbol)
     query = quote(company)
     feed_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
     try:
         parsed = feedparser.parse(feed_url)
-        logger.info(f"Google News feed entries: {len(parsed.entries)}")
+        logger.info(f"Google News feed entries for {symbol}: {len(parsed.entries)}")
         if getattr(parsed, "bozo", False) and not parsed.entries:
             logger.warning("Google News RSS feed returned empty for %s", symbol)
             return []
@@ -284,7 +276,7 @@ def _fetch_moneycontrol_news(symbol: str, max_items: int = 5) -> List[Dict[str, 
     feed_url = "https://www.moneycontrol.com/rss/latestnews.xml"
     try:
         parsed = feedparser.parse(feed_url)
-        logger.info(f"Moneycontrol feed entries: {len(parsed.entries)}")
+        logger.info(f"Moneycontrol feed entries for {symbol}: {len(parsed.entries)}")
         items = []
         cutoff = datetime.utcnow() - timedelta(days=30)
         for entry in parsed.entries[:50]:
@@ -307,7 +299,7 @@ def _fetch_moneycontrol_news(symbol: str, max_items: int = 5) -> List[Dict[str, 
                     break
         return items
     except Exception as e:
-        logger.warning("Moneycontrol fetch failed: %s", e)
+        logger.warning("Moneycontrol fetch failed for %s: %s", symbol, e)
         return []
 
 
@@ -316,7 +308,7 @@ def _fetch_economic_times(symbol: str, max_items: int = 5) -> List[Dict[str, Any
     feed_url = "https://economictimes.indiatimes.com/rssfeedstopstories.cms"
     try:
         parsed = feedparser.parse(feed_url)
-        logger.info(f"Economic Times feed entries: {len(parsed.entries)}")
+        logger.info(f"Economic Times feed entries for {symbol}: {len(parsed.entries)}")
         items = []
         cutoff = datetime.utcnow() - timedelta(days=30)
         for entry in parsed.entries[:50]:
@@ -339,7 +331,7 @@ def _fetch_economic_times(symbol: str, max_items: int = 5) -> List[Dict[str, Any
                     break
         return items
     except Exception as e:
-        logger.warning("Economic Times fetch failed: %s", e)
+        logger.warning("Economic Times fetch failed for %s: %s", symbol, e)
         return []
 
 
@@ -348,7 +340,7 @@ def _fetch_cnbc_tv18(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
     feed_url = "https://www.cnbctv18.com/feed/"
     try:
         parsed = feedparser.parse(feed_url)
-        logger.info(f"CNBC TV18 feed entries: {len(parsed.entries)}")
+        logger.info(f"CNBC TV18 feed entries for {symbol}: {len(parsed.entries)}")
         items = []
         cutoff = datetime.utcnow() - timedelta(days=30)
         for entry in parsed.entries[:50]:
@@ -371,7 +363,7 @@ def _fetch_cnbc_tv18(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
                     break
         return items
     except Exception as e:
-        logger.warning("CNBC TV18 fetch failed: %s", e)
+        logger.warning("CNBC TV18 fetch failed for %s: %s", symbol, e)
         return []
 
 
@@ -395,31 +387,31 @@ def _fetch_news_from_multiple_sources(symbol: str, max_total: int = 15) -> List[
 
     # 1. Yahoo Finance
     yf_news = _fetch_yf_news(symbol)
-    logger.info(f"Yahoo Finance news: {len(yf_news)} items")
+    logger.info(f"Yahoo Finance news for {symbol}: {len(yf_news)} items")
     if yf_news:
         all_news.extend(yf_news)
 
     # 2. Google News
     google_news = _fetch_google_news(symbol, max_items=8)
-    logger.info(f"Google News: {len(google_news)} items")
+    logger.info(f"Google News for {symbol}: {len(google_news)} items")
     if google_news:
         all_news.extend(google_news)
 
     # 3. Moneycontrol
     mc_news = _fetch_moneycontrol_news(symbol, max_items=5)
-    logger.info(f"Moneycontrol: {len(mc_news)} items")
+    logger.info(f"Moneycontrol for {symbol}: {len(mc_news)} items")
     if mc_news:
         all_news.extend(mc_news)
 
     # 4. Economic Times
     et_news = _fetch_economic_times(symbol, max_items=5)
-    logger.info(f"Economic Times: {len(et_news)} items")
+    logger.info(f"Economic Times for {symbol}: {len(et_news)} items")
     if et_news:
         all_news.extend(et_news)
 
     # 5. CNBC TV18
     cnbc_news = _fetch_cnbc_tv18(symbol, max_items=5)
-    logger.info(f"CNBC TV18: {len(cnbc_news)} items")
+    logger.info(f"CNBC TV18 for {symbol}: {len(cnbc_news)} items")
     if cnbc_news:
         all_news.extend(cnbc_news)
 
@@ -435,7 +427,7 @@ def _fetch_news_from_multiple_sources(symbol: str, max_total: int = 15) -> List[
     # Sort by published date (newest first)
     unique.sort(key=lambda x: x.get("published") or "", reverse=True)
 
-    logger.info(f"Total unique news after dedup: {len(unique)}")
+    logger.info(f"Total unique news for {symbol} after dedup: {len(unique)}")
     return unique[:max_total]
 
 
@@ -454,7 +446,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
 
     logger.info(f"=== Fetching fresh events for {sym} ===")
 
-    # Use cached yfinance calls (they have their own internal caching)
+    # Use cached yfinance calls
     earnings_dates = _get_earnings_dates(sym, limit=1)
     next_earnings = None
     if earnings_dates is not None and not earnings_dates.empty:
@@ -601,7 +593,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
 def root():
     return {
         "service": "Stockky Event Tracker Service",
-        "version": "0.4.3",
+        "version": "0.4.4",
         "status": "running",
         "endpoints": {
             "/health": "GET",
