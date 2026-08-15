@@ -1,13 +1,7 @@
 """
-Event Tracker Service v0.4.0
+Event Tracker Service v0.4.1
 -----------------------------
-Tracks material corporate events for subscribed NSE symbols.
-State is persisted in Upstash Redis so restarts don't lose subscriptions.
-
-v0.4.0 changes:
-  - Added multiple news sources: Moneycontrol, Economic Times, CNBC TV18
-  - Merges news from all sources, deduplicates by title, sorts by date
-  - Cutoff for recent news set to 7 days
+Added detailed logging for multi‑source news fetching.
 """
 import os
 import json
@@ -21,6 +15,7 @@ from urllib.parse import quote
 
 import yfinance as yf
 import feedparser
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -29,17 +24,17 @@ from upstash_redis import Redis
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("event-tracker-service")
 
-app = FastAPI(title="Stockky Event Tracker Service", version="0.4.0")
+app = FastAPI(title="Stockky Event Tracker Service", version="0.4.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-EVENT_CACHE_TTL = 4 * 3600          # 4 hours
-EMPTY_NEWS_CACHE_TTL = 3600         # 1 hour
-EVENT_FALLBACK_TTL = 30 * 24 * 3600 # 30 days
+EVENT_CACHE_TTL = 4 * 3600
+EMPTY_NEWS_CACHE_TTL = 3600
+EVENT_FALLBACK_TTL = 30 * 24 * 3600
 STATE_KEY = "stockky:event_state"
 EVENT_CACHE_PREFIX = "stockky:event:"
 EVENT_FALLBACK_PREFIX = "stockky:event:fallback:"
 EVENTS_LIST_CACHE_KEY = "stockky:events_list"
-EVENTS_LIST_CACHE_TTL = 3600        # 1 hour
+EVENTS_LIST_CACHE_TTL = 3600
 
 _redis = None
 try:
@@ -114,10 +109,9 @@ def _yf_call(fn, label: str, sym: str, max_retries: int = 3, base_delay: float =
             time.sleep(wait)
 
 
-# ── Multiple news sources ──
+# ── News sources ──
 
 def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]:
-    """Fetch news from Google News RSS."""
     name_hints = {
         "TCS": "Tata Consultancy Services",
         "INFY": "Infosys",
@@ -144,11 +138,12 @@ def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]
             logger.warning("Google News RSS feed returned empty for %s", symbol)
             return []
         items = []
+        cutoff = datetime.utcnow() - timedelta(days=30)
         for entry in parsed.entries[:max_items]:
             published = None
             if getattr(entry, "published_parsed", None):
                 published = datetime(*entry.published_parsed[:6])
-            if published and published < datetime.utcnow() - timedelta(days=30):
+            if published and published < cutoff:
                 continue
             items.append({
                 "title": entry.title,
@@ -163,12 +158,14 @@ def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]
 
 
 def _fetch_moneycontrol_news(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
-    """Fetch latest news from Moneycontrol RSS and filter by symbol."""
+    """Fetch from Moneycontrol RSS with httpx fallback."""
+    keyword = symbol.replace(".NS", "").replace(".BO", "").upper()
     feed_url = "https://www.moneycontrol.com/rss/latestnews.xml"
     try:
+        # Try feedparser first
         parsed = feedparser.parse(feed_url)
-        keyword = symbol.replace(".NS", "").replace(".BO", "").upper()
         items = []
+        cutoff = datetime.utcnow() - timedelta(days=30)
         for entry in parsed.entries[:50]:
             title = entry.title.lower()
             desc = entry.description.lower() if hasattr(entry, "description") else ""
@@ -176,7 +173,7 @@ def _fetch_moneycontrol_news(symbol: str, max_items: int = 5) -> List[Dict[str, 
                 published = None
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
                     published = datetime(*entry.published_parsed[:6])
-                if published and published < datetime.utcnow() - timedelta(days=30):
+                if published and published < cutoff:
                     continue
                 items.append({
                     "title": entry.title,
@@ -188,17 +185,45 @@ def _fetch_moneycontrol_news(symbol: str, max_items: int = 5) -> List[Dict[str, 
                     break
         return items
     except Exception as e:
-        logger.warning("Moneycontrol RSS failed: %s", e)
-        return []
+        logger.warning("Moneycontrol feedparser failed: %s, trying httpx", e)
+        # Fallback to httpx
+        try:
+            with httpx.Client(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as client:
+                resp = client.get(feed_url)
+                resp.raise_for_status()
+                parsed = feedparser.parse(resp.text)
+                items = []
+                cutoff = datetime.utcnow() - timedelta(days=30)
+                for entry in parsed.entries[:50]:
+                    title = entry.title.lower()
+                    desc = entry.description.lower() if hasattr(entry, "description") else ""
+                    if keyword.lower() in title or keyword.lower() in desc:
+                        published = None
+                        if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                            published = datetime(*entry.published_parsed[:6])
+                        if published and published < cutoff:
+                            continue
+                        items.append({
+                            "title": entry.title,
+                            "publisher": "Moneycontrol",
+                            "published": published.isoformat() if published else None,
+                            "url": entry.link,
+                        })
+                        if len(items) >= max_items:
+                            break
+                return items
+        except Exception as e2:
+            logger.warning("Moneycontrol httpx fallback also failed: %s", e2)
+            return []
 
 
 def _fetch_economic_times(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
-    """Fetch news from Economic Times RSS."""
+    keyword = symbol.replace(".NS", "").replace(".BO", "").upper()
     feed_url = "https://economictimes.indiatimes.com/rssfeedstopstories.cms"
     try:
         parsed = feedparser.parse(feed_url)
-        keyword = symbol.replace(".NS", "").replace(".BO", "").upper()
         items = []
+        cutoff = datetime.utcnow() - timedelta(days=30)
         for entry in parsed.entries[:50]:
             title = entry.title.lower()
             desc = entry.description.lower() if hasattr(entry, "description") else ""
@@ -206,7 +231,7 @@ def _fetch_economic_times(symbol: str, max_items: int = 5) -> List[Dict[str, Any
                 published = None
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
                     published = datetime(*entry.published_parsed[:6])
-                if published and published < datetime.utcnow() - timedelta(days=30):
+                if published and published < cutoff:
                     continue
                 items.append({
                     "title": entry.title,
@@ -218,17 +243,17 @@ def _fetch_economic_times(symbol: str, max_items: int = 5) -> List[Dict[str, Any
                     break
         return items
     except Exception as e:
-        logger.warning("Economic Times RSS failed: %s", e)
+        logger.warning("Economic Times fetch failed: %s", e)
         return []
 
 
 def _fetch_cnbc_tv18(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
-    """Fetch news from CNBC TV18 RSS."""
+    keyword = symbol.replace(".NS", "").replace(".BO", "").upper()
     feed_url = "https://www.cnbctv18.com/feed/"
     try:
         parsed = feedparser.parse(feed_url)
-        keyword = symbol.replace(".NS", "").replace(".BO", "").upper()
         items = []
+        cutoff = datetime.utcnow() - timedelta(days=30)
         for entry in parsed.entries[:50]:
             title = entry.title.lower()
             desc = entry.description.lower() if hasattr(entry, "description") else ""
@@ -236,7 +261,7 @@ def _fetch_cnbc_tv18(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
                 published = None
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
                     published = datetime(*entry.published_parsed[:6])
-                if published and published < datetime.utcnow() - timedelta(days=30):
+                if published and published < cutoff:
                     continue
                 items.append({
                     "title": entry.title,
@@ -248,57 +273,11 @@ def _fetch_cnbc_tv18(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
                     break
         return items
     except Exception as e:
-        logger.warning("CNBC TV18 RSS failed: %s", e)
+        logger.warning("CNBC TV18 fetch failed: %s", e)
         return []
 
 
-def _fetch_news_from_multiple_sources(symbol: str, max_total: int = 15) -> List[Dict[str, Any]]:
-    """Fetch news from all sources, deduplicate, and return sorted by date (newest first)."""
-    all_news = []
-
-    # 1. Yahoo Finance
-    yf_news = _yf_call(lambda: _fetch_yf_news(symbol), "Yahoo Finance news", symbol)
-    if yf_news:
-        all_news.extend(yf_news)
-
-    # 2. Google News
-    google_news = _fetch_google_news(symbol, max_items=8)
-    if google_news:
-        all_news.extend(google_news)
-
-    # 3. Moneycontrol
-    mc_news = _fetch_moneycontrol_news(symbol, max_items=5)
-    if mc_news:
-        all_news.extend(mc_news)
-
-    # 4. Economic Times
-    et_news = _fetch_economic_times(symbol, max_items=5)
-    if et_news:
-        all_news.extend(et_news)
-
-    # 5. CNBC TV18
-    cnbc_news = _fetch_cnbc_tv18(symbol, max_items=5)
-    if cnbc_news:
-        all_news.extend(cnbc_news)
-
-    # Deduplicate by title (case-insensitive, trimmed)
-    seen = set()
-    unique = []
-    for item in all_news:
-        key = item["title"].strip().lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-
-    # Sort by published date (newest first)
-    unique.sort(key=lambda x: x.get("published") or "", reverse=True)
-
-    # Limit total
-    return unique[:max_total]
-
-
 def _fetch_yf_news(symbol: str) -> List[Dict[str, Any]]:
-    """Helper to fetch yfinance news and format."""
     ticker = yf.Ticker(symbol)
     try:
         news = ticker.news
@@ -318,25 +297,74 @@ def _fetch_yf_news(symbol: str) -> List[Dict[str, Any]]:
         return []
 
 
-# ── Core event fetch (with Redis cache and fallback) ─────────────────────────
+def _fetch_news_from_multiple_sources(symbol: str, max_total: int = 15) -> List[Dict[str, Any]]:
+    all_news = []
+
+    # 1. Yahoo Finance
+    yf_news = _fetch_yf_news(symbol)
+    logger.info(f"Yahoo Finance news: {len(yf_news)} items")
+    if yf_news:
+        all_news.extend(yf_news)
+
+    # 2. Google News
+    google_news = _fetch_google_news(symbol, max_items=8)
+    logger.info(f"Google News: {len(google_news)} items")
+    if google_news:
+        all_news.extend(google_news)
+
+    # 3. Moneycontrol
+    mc_news = _fetch_moneycontrol_news(symbol, max_items=5)
+    logger.info(f"Moneycontrol: {len(mc_news)} items")
+    if mc_news:
+        all_news.extend(mc_news)
+
+    # 4. Economic Times
+    et_news = _fetch_economic_times(symbol, max_items=5)
+    logger.info(f"Economic Times: {len(et_news)} items")
+    if et_news:
+        all_news.extend(et_news)
+
+    # 5. CNBC TV18
+    cnbc_news = _fetch_cnbc_tv18(symbol, max_items=5)
+    logger.info(f"CNBC TV18: {len(cnbc_news)} items")
+    if cnbc_news:
+        all_news.extend(cnbc_news)
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for item in all_news:
+        key = item["title"].strip().lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    # Sort by published date (newest first)
+    unique.sort(key=lambda x: x.get("published") or "", reverse=True)
+
+    # Log final count
+    logger.info(f"Total unique news after dedup: {len(unique)}")
+    return unique[:max_total]
+
+
+# ── Core event fetch ──────────────────────────────────────────────────────────
 def _fetch_events(symbol: str, force: bool = False) -> dict:
     sym = _normalize(symbol)
     cache_key = f"{EVENT_CACHE_PREFIX}{sym}"
 
     if not force:
         cached = _redis_get(cache_key)
-        if cached:
-            if cached.get("recent_news") and len(cached.get("recent_news", [])) > 0:
-                logger.info("Event cache hit for %s with %d news", sym, len(cached["recent_news"]))
-                return cached
-            else:
-                logger.info("Cache for %s has empty news; will fetch fresh", sym)
+        if cached and cached.get("recent_news") and len(cached["recent_news"]) > 0:
+            logger.info(f"Event cache hit for {sym} with {len(cached['recent_news'])} news")
+            return cached
+        elif cached:
+            logger.info(f"Cache for {sym} has empty news; will fetch fresh")
 
-    logger.info("Fetching fresh events for %s", sym)
+    logger.info(f"=== Fetching fresh events for {sym} ===")
     ticker = yf.Ticker(sym)
     ticker._tz = "Asia/Kolkata"
 
-    # Earnings, dividends, splits, insider, analyst, institutional (same as before)
+    # Existing yfinance data (unchanged)
     next_earnings = None
     earnings_dates = _yf_call(lambda: ticker.get_earnings_dates(limit=1), "Earnings dates", sym)
     if earnings_dates is not None and not earnings_dates.empty:
@@ -411,7 +439,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # ── News from multiple sources ──
+    # ── Multi-source news ──
     recent_news = _fetch_news_from_multiple_sources(sym, max_total=15)
 
     # Earnings surprise
@@ -460,18 +488,17 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
     ])
 
     if has_real_data:
-        ttl = EVENT_CACHE_TTL
+        ttl = EVENT_CACHE_TTL if recent_news else EMPTY_NEWS_CACHE_TTL
         if not recent_news:
-            ttl = EMPTY_NEWS_CACHE_TTL
-            logger.info("No news for %s; caching with short TTL (%d s)", sym, ttl)
+            logger.info(f"No news for {sym}; caching with short TTL ({ttl}s)")
         _redis_set(cache_key, {**result, "cached": True}, ttl=ttl)
         _redis_set(fallback_key, result, ttl=EVENT_FALLBACK_TTL)
+        logger.info(f"Finished fetching events for {sym}: {len(recent_news)} news items")
         return result
 
-    # Fallback
     stale = _redis_get(fallback_key)
     if stale:
-        logger.info("Live fetch for %s came back empty; serving fallback", sym)
+        logger.info(f"Live fetch for {sym} empty; serving fallback")
         stale = {**stale, "cached": True, "stale": True}
         _redis_set(cache_key, stale, ttl=900)
         return stale
@@ -479,21 +506,21 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
     return result
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+# ── Routes (unchanged) ──
 @app.get("/")
 def root():
     return {
         "service": "Stockky Event Tracker Service",
-        "version": "0.4.0",
+        "version": "0.4.1",
         "status": "running",
         "endpoints": {
-            "/health": "GET – health check",
-            "/events/{symbol}": "GET – full event snapshot",
-            "/events/{symbol}?force=true": "GET – bypass cache",
-            "/subscribe": "POST – subscribe symbols",
-            "/subscriptions": "GET – list subscriptions",
-            "/check": "GET – check for changes",
-            "/symbols_with_events": "GET – list symbols with upcoming events",
+            "/health": "GET",
+            "/events/{symbol}": "GET full snapshot",
+            "/events/{symbol}?force=true": "GET bypass cache",
+            "/subscribe": "POST",
+            "/subscriptions": "GET",
+            "/check": "GET",
+            "/symbols_with_events": "GET",
         },
     }
 
@@ -540,7 +567,7 @@ def check_for_changes():
         prev_div = previous.get("last_dividend") or {}
         cur_div = current.get("last_dividend") or {}
         if prev_div.get("date") != cur_div.get("date") and cur_div.get("date"):
-            diff_reasons.append(f"New dividend declared: ₹{cur_div.get('amount')} on {cur_div.get('date')}")
+            diff_reasons.append(f"New dividend: ₹{cur_div.get('amount')} on {cur_div.get('date')}")
         prev_split = previous.get("last_split") or {}
         cur_split = current.get("last_split") or {}
         if prev_split.get("date") != cur_split.get("date") and cur_split.get("date"):
