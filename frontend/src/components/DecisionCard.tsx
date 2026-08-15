@@ -4,7 +4,7 @@ import { decisionStyle } from "../decisionStyle";
 import StockChart from "./StockChart";
 import { toActionablePick } from "./ScanPanel";
 
-// ── NEW: Types & helper for structured news ──
+// ── Types & helper for structured news ──
 interface NewsItem {
   title: string;
   publisher: string;
@@ -15,7 +15,6 @@ interface NewsItem {
 function getNewsItems(data: Decision): NewsItem[] {
   const items: NewsItem[] = [];
 
-  // 1) Try structured news from event_data
   if (data.event_data && typeof data.event_data === 'object') {
     const newsArray = data.event_data['news'] || data.event_data['recent_news'];
     if (Array.isArray(newsArray)) {
@@ -32,7 +31,6 @@ function getNewsItems(data: Decision): NewsItem[] {
     }
   }
 
-  // 2) Fallback to plain reasons.news (titles only, no timestamps)
   if (items.length === 0 && data.reasons.news) {
     for (const title of data.reasons.news) {
       items.push({ title, publisher: '', published: '', url: '' });
@@ -46,7 +44,7 @@ interface Props {
   data: Decision;
   onBack: () => void;
   onSearchRelated: (symbol: string) => void;
-  onAddToWatchlist: (symbol: string) => void; // NEW Prop
+  onAddToWatchlist: (symbol: string) => void;
 }
 
 export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWatchlist }: Props) {
@@ -54,15 +52,11 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const isBullish = data.decision === "BUY NOW" || data.decision === "PREPARE TO BUY";
   const [isAddingWatchlist, setIsAddingWatchlist] = useState(false);
 
-  // NEW: Trade This
   const [showTradeModal, setShowTradeModal] = useState(false);
   const [tradeCapital, setTradeCapital] = useState("10000");
   const [tradingInProgress, setTradingInProgress] = useState(false);
   const [tradeResult, setTradeResult] = useState<string | null>(null);
 
-  // NEW: model's own trading recommendation (training-service's KNN +
-  // classifier signal), fetched lazily since it's a separate call from
-  // decision-engine's combined_score.
   const [trainingScore, setTrainingScore] = useState<TrainingScore | null>(null);
   const [loadingTrainingScore, setLoadingTrainingScore] = useState(false);
 
@@ -73,12 +67,11 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
     api
       .getTrainingScore(data.symbol)
       .then((r) => { if (!cancelled) setTrainingScore(r); })
-      .catch(() => { /* no history for this symbol yet, or endpoint unreachable — fine, panel just won't show */ })
+      .catch(() => {})
       .finally(() => { if (!cancelled) setLoadingTrainingScore(false); });
     return () => { cancelled = true; };
   }, [data.symbol]);
 
-  // ── UPDATED: Include Market Sentiment and Training scores ──
   const scores = [
     { label: "Technical", value: data.technical_score },
     { label: "Fundamental", value: data.fundamental_score },
@@ -91,13 +84,18 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const metrics = data.fundamental_metrics;
   const hasMetrics = metrics && Object.values(metrics).some(v => v != null);
   const hasPrice = data.close != null;
-  
-  // ── MODIFIED: hide plain news list if structured news exists ──
+
+  // Hide plain news reason list if structured news exists
   const hasNews = data.reasons.news && data.reasons.news.length > 0 &&
     !(data.event_data && (data.event_data.news || data.event_data.recent_news));
 
   const hasEvent = data.reasons.event && data.reasons.event.length > 0;
   const hasMarket = data.reasons.market && data.reasons.market.length > 0;
+
+  // Filter out fallback message from fundamental reasons
+  const fundamentalReasons = data.reasons.fundamental.filter(
+    item => !item.startsWith("Live data was temporarily unavailable")
+  );
 
   const handleAddToWatchlist = async () => {
     if (isAddingWatchlist) return;
@@ -135,7 +133,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
     }
   };
 
-  // ── Helper to format adjustment with sign ──
   const formatAdjustment = (adj: number) => {
     if (adj === 0) return "±0";
     return adj > 0 ? `+${adj}` : `${adj}`;
@@ -171,7 +168,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
             </div>
             <div className="text-xs text-mist/60 mt-1 flex items-center justify-end gap-2">
               <span>Combined {data.combined_score}/100</span>
-              {/* ── NEW: Show adjustment ── */}
               {data.market_sentiment_adjustment !== undefined && data.market_sentiment_adjustment !== 0 && (
                 <span className={`text-xs font-medium ${data.market_sentiment_adjustment > 0 ? 'text-signal-buy' : 'text-signal-sell'}`}>
                   ({formatAdjustment(data.market_sentiment_adjustment)})
@@ -181,7 +177,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
           </div>
         </div>
 
-        {/* Event risk banner */}
         {data.event_risk && (
           <div className="mt-6 rounded-lg border border-signal-hold/40 bg-signal-hold/10 px-4 py-3 text-sm text-signal-hold font-mono flex items-start gap-2">
             <span>⚠</span>
@@ -189,7 +184,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
           </div>
         )}
 
-        {/* Trade levels */}
         {isBullish && data.entry_range && hasPrice && (
           <div className="grid grid-cols-3 gap-4 mt-8 pt-6 border-t border-slate/40">
             <div>
@@ -224,7 +218,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
           </div>
         )}
         
-        {/* Watchlist + Trade buttons */}
         <div className="mt-4 flex justify-end gap-2">
           {isBullish && (
             <button
@@ -255,7 +248,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       </div>
 
-      {/* Trade This confirmation modal */}
       {showTradeModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/70 backdrop-blur-sm p-4">
           <div className="bg-graphite border border-slate/60 rounded-2xl p-6 w-full max-w-sm">
@@ -303,12 +295,8 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* Price chart */}
       <StockChart symbol={data.symbol} />
 
-      {/* Model's own trading recommendation, from training-service's real
-          pick history — separate signal from decision-engine's combined_score,
-          based on what actually happened to similar past setups. */}
       {loadingTrainingScore ? (
         <div className="rounded-xl border border-slate/40 bg-graphite/30 p-4 text-xs text-mist/40 font-mono flex items-center gap-2">
           <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-mist/40 animate-spin" />
@@ -336,7 +324,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       ) : null}
 
-      {/* Price levels + Score breakdown */}
       <div className="grid grid-cols-2 gap-4">
         <div className="rounded-xl border border-slate bg-graphite p-5">
           <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">Price levels</div>
@@ -360,7 +347,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       </div>
 
-      {/* Fundamental Metrics */}
       {metrics && (
         <div className="rounded-xl border border-slate/60 bg-graphite/30 p-5">
           <h3 className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">
@@ -408,23 +394,20 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* Reasons – including News, Event, Market, Training */}
       <div className="grid md:grid-cols-2 gap-4">
         <ReasonList title="Technical" items={data.reasons.technical} />
-        <ReasonList title="Fundamental" items={data.reasons.fundamental} />
+        <ReasonList title="Fundamental" items={fundamentalReasons} />
         {hasNews && <ReasonList title="News" items={data.reasons.news!} />}
         {data.reasons.prediction && data.reasons.prediction.length > 0 && (
           <ReasonList title="AI Prediction" items={data.reasons.prediction} />
         )}
         {hasEvent && <ReasonList title="Event Tracker" items={data.reasons.event!} />}
-        {/* ── NEW: Market Sentiment reasons ── */}
         {hasMarket && <ReasonList title="Market Sentiment" items={data.reasons.market!} />}
         {data.reasons.training && data.reasons.training.length > 0 && (
           <ReasonList title="Training Intelligence" items={data.reasons.training} />
         )}
       </div>
 
-      {/* Holding period */}
       {(data.holding_period !== "N/A" || data.holding_period_estimate) && (
         <div className="rounded-xl border border-slate bg-graphite px-5 py-4 font-mono text-xs text-mist">
           <div className="flex justify-between">
@@ -440,9 +423,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* Long-term hold — a separate signal from the short-term decision
-          above. A stock can be a strong long-term candidate independent
-          of whether right now is a good entry timing-wise. */}
       {data.long_term_hold && (
         <div className="rounded-xl border border-signal-buy/40 bg-signal-buy/5 px-5 py-4">
           <div className="flex items-center gap-2 font-mono text-xs uppercase tracking-widest text-signal-buy">
@@ -460,10 +440,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* Event update — raw pass-through from event-tracker-service, shape
-          isn't fixed on the gateway side, so this renders defensively:
-          arrays of strings as bullets, small key/value objects as a list,
-          otherwise falls back to compact JSON so nothing is silently lost. */}
+      {/* ── EVENT UPDATE (cleaned, no JSON) ── */}
       {data.event_data && Object.keys(data.event_data).length > 0 && (
         <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
           <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">
@@ -473,21 +450,18 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* ── NEW: NEWS SECTION ── */}
+      {/* ── NEWS SECTION ── */}
       {(() => {
         const newsItems = getNewsItems(data);
         if (newsItems.length === 0) return null;
 
-        // Sort newest first
         const sorted = [...newsItems].sort((a, b) => {
           const da = a.published ? new Date(a.published).getTime() : 0;
           const db = b.published ? new Date(b.published).getTime() : 0;
           return db - da;
         });
 
-        const recent = sorted.slice(0, 1); // most recent
-
-        // Filter previous news to those within the last 6 months
+        const recent = sorted.slice(0, 1);
         const sixMonthsAgo = new Date();
         sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
         const previous = sorted.slice(1).filter(item => {
@@ -500,7 +474,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
             <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">
               📰 News
             </h4>
-
             {recent.length > 0 && (
               <div className="mb-4">
                 <h5 className="text-sm font-medium text-green-600 dark:text-green-400 mb-1.5">
@@ -509,7 +482,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
                 <NewsItemComponent item={recent[0]} />
               </div>
             )}
-
             {previous.length > 0 && (
               <div>
                 <h5 className="text-sm font-medium text-blue-600 dark:text-blue-400 mb-1.5">
@@ -524,7 +496,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         );
       })()}
 
-      {/* Natural-language Hinglish summary */}
       {data.natural_language_summary && (
         <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
           <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
@@ -541,7 +512,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
 
 // ── Helper Components ──
 
-// NEW: News item renderer with timestamp & link
 function NewsItemComponent({ item }: { item: NewsItem }) {
   const date = item.published ? new Date(item.published) : null;
   const formattedDate = date
@@ -577,14 +547,71 @@ function NewsItemComponent({ item }: { item: NewsItem }) {
   );
 }
 
+// ── Improved EventDataView – no raw JSON ──
 function EventDataView({ data }: { data: Record<string, unknown> }) {
+  // Skip keys that are handled elsewhere or are redundant
+  const skipKeys = new Set(['news', 'recent_news', 'symbol']);
+  const entries = Object.entries(data).filter(([key]) => !skipKeys.has(key));
+
+  if (entries.length === 0) {
+    return <p className="text-sm text-mist/40 italic">No additional event data.</p>;
+  }
+
   return (
-    <div className="space-y-2">
-      {Object.entries(data).map(([key, value]) => {
+    <div className="space-y-3">
+      {entries.map(([key, value]) => {
+        const label = key.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
         if (value == null) return null;
-        const label = key.replace(/_/g, " ");
+
+        // ── Array of strings ──
         if (Array.isArray(value)) {
           if (value.length === 0) return null;
+          if (value.every(item => typeof item === 'string')) {
+            return (
+              <div key={key}>
+                <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
+                <ul className="space-y-1">
+                  {value.map((item, i) => (
+                    <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
+                      <span className="text-slate mt-1 shrink-0">–</span>
+                      <span>{item}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            );
+          }
+
+          // ── Array of objects ──
+          if (value.every(item => typeof item === 'object' && item !== null)) {
+            return (
+              <div key={key}>
+                <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
+                <div className="space-y-2">
+                  {value.map((item, idx) => {
+                    const obj = item as Record<string, any>;
+                    // Try to extract a meaningful title
+                    const title = obj.title || obj.name || obj.description || obj.event || 'Item';
+                    // Collect extra details
+                    const details = Object.entries(obj)
+                      .filter(([k]) => !['title', 'name', 'description', 'event'].includes(k))
+                      .map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v}`)
+                      .join(' · ');
+                    return (
+                      <div key={idx} className="border-b border-slate/30 pb-2 last:border-0">
+                        <div className="text-sm text-paper font-medium">{title}</div>
+                        {details && (
+                          <div className="text-xs text-mist/60">{details}</div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          }
+
+          // ── Fallback: show as bullet list (no JSON) ──
           return (
             <div key={key}>
               <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
@@ -592,27 +619,39 @@ function EventDataView({ data }: { data: Record<string, unknown> }) {
                 {value.map((item, i) => (
                   <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
                     <span className="text-slate mt-1 shrink-0">–</span>
-                    <span>{typeof item === "string" ? item : JSON.stringify(item)}</span>
+                    <span>{String(item)}</span>
                   </li>
                 ))}
               </ul>
             </div>
           );
         }
-        if (typeof value === "object") {
+
+        // ── Object (non-array) ──
+        if (typeof value === 'object' && value !== null) {
+          const obj = value as Record<string, unknown>;
           return (
             <div key={key}>
               <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
-              <pre className="text-xs text-mist/70 whitespace-pre-wrap font-mono bg-ink/30 rounded p-2">
-                {JSON.stringify(value, null, 2)}
-              </pre>
+              <div className="bg-ink/30 rounded p-2 space-y-1">
+                {Object.entries(obj).map(([k, v]) => (
+                  <div key={k} className="flex justify-between text-sm">
+                    <span className="text-mist/60 capitalize">{k.replace(/_/g, ' ')}</span>
+                    <span className="text-paper">{String(v)}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           );
         }
+
+        // ── Primitive values ──
+        let displayValue = String(value);
+        if (typeof value === 'boolean') displayValue = value ? 'Yes' : 'No';
         return (
           <div key={key} className="flex justify-between text-sm">
-            <span className="text-mist/50 font-mono text-[10px] uppercase tracking-wider self-center">{label}</span>
-            <span className="text-paper">{String(value)}</span>
+            <span className="text-mist/50 font-mono text-[10px] uppercase tracking-wider">{label}</span>
+            <span className="text-paper">{displayValue}</span>
           </div>
         );
       })}
