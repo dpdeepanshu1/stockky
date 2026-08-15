@@ -1,7 +1,11 @@
 """
-Event Tracker Service v0.4.1
+Event Tracker Service v0.4.2
 -----------------------------
-Added detailed logging for multi‑source news fetching.
+Improved multi‑source news fetching:
+- Uses multiple keyword variants (company name, ticker, symbol)
+- Google News uses only company name for broader matches
+- Increased cutoff to 30 days
+- Detailed logging of feed entry counts
 """
 import os
 import json
@@ -24,7 +28,7 @@ from upstash_redis import Redis
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("event-tracker-service")
 
-app = FastAPI(title="Stockky Event Tracker Service", version="0.4.1")
+app = FastAPI(title="Stockky Event Tracker Service", version="0.4.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 EVENT_CACHE_TTL = 4 * 3600
@@ -109,9 +113,9 @@ def _yf_call(fn, label: str, sym: str, max_retries: int = 3, base_delay: float =
             time.sleep(wait)
 
 
-# ── News sources ──
-
-def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]:
+# ── Keyword variants ──
+def _get_keywords(symbol: str) -> List[str]:
+    base = symbol.replace(".NS", "").replace(".BO", "").upper()
     name_hints = {
         "TCS": "Tata Consultancy Services",
         "INFY": "Infosys",
@@ -128,12 +132,38 @@ def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]
         "SBIN": "State Bank of India",
         "PWL": "PhysicsWallah",
     }
+    company = name_hints.get(base, base)
+    # Return variants: company name, base symbol, and the symbol without suffix
+    return [company, base, base.lower(), company.lower()]
+
+
+# ── News sources ──
+
+def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]:
+    """Fetch from Google News RSS using company name (no extra words)."""
     base = symbol.replace(".NS", "").replace(".BO", "").upper()
-    query = name_hints.get(base, base) + " NSE stock"
-    encoded_query = quote(query)
-    feed_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-IN&gl=IN&ceid=IN:en"
+    name_hints = {
+        "TCS": "Tata Consultancy Services",
+        "INFY": "Infosys",
+        "HDFCBANK": "HDFC Bank",
+        "ICICIBANK": "ICICI Bank",
+        "RELIANCE": "Reliance Industries",
+        "HCLTECH": "HCL Technologies",
+        "COFORGE": "Coforge",
+        "ANGELONE": "Angel One",
+        "ADANIPOWER": "Adani Power",
+        "BEL": "Bharat Electronics",
+        "HAL": "Hindustan Aeronautics",
+        "TATAMOTORS": "Tata Motors",
+        "SBIN": "State Bank of India",
+        "PWL": "PhysicsWallah",
+    }
+    company = name_hints.get(base, base)
+    query = quote(company)  # just the company name
+    feed_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
     try:
         parsed = feedparser.parse(feed_url)
+        logger.info(f"Google News feed entries: {len(parsed.entries)}")
         if getattr(parsed, "bozo", False) and not parsed.entries:
             logger.warning("Google News RSS feed returned empty for %s", symbol)
             return []
@@ -158,18 +188,18 @@ def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]
 
 
 def _fetch_moneycontrol_news(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
-    """Fetch from Moneycontrol RSS with httpx fallback."""
-    keyword = symbol.replace(".NS", "").replace(".BO", "").upper()
+    keywords = _get_keywords(symbol)
     feed_url = "https://www.moneycontrol.com/rss/latestnews.xml"
     try:
-        # Try feedparser first
         parsed = feedparser.parse(feed_url)
+        logger.info(f"Moneycontrol feed entries: {len(parsed.entries)}")
         items = []
         cutoff = datetime.utcnow() - timedelta(days=30)
         for entry in parsed.entries[:50]:
             title = entry.title.lower()
             desc = entry.description.lower() if hasattr(entry, "description") else ""
-            if keyword.lower() in title or keyword.lower() in desc:
+            text = title + " " + desc
+            if any(kw.lower() in text for kw in keywords):
                 published = None
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
                     published = datetime(*entry.published_parsed[:6])
@@ -185,49 +215,23 @@ def _fetch_moneycontrol_news(symbol: str, max_items: int = 5) -> List[Dict[str, 
                     break
         return items
     except Exception as e:
-        logger.warning("Moneycontrol feedparser failed: %s, trying httpx", e)
-        # Fallback to httpx
-        try:
-            with httpx.Client(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as client:
-                resp = client.get(feed_url)
-                resp.raise_for_status()
-                parsed = feedparser.parse(resp.text)
-                items = []
-                cutoff = datetime.utcnow() - timedelta(days=30)
-                for entry in parsed.entries[:50]:
-                    title = entry.title.lower()
-                    desc = entry.description.lower() if hasattr(entry, "description") else ""
-                    if keyword.lower() in title or keyword.lower() in desc:
-                        published = None
-                        if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                            published = datetime(*entry.published_parsed[:6])
-                        if published and published < cutoff:
-                            continue
-                        items.append({
-                            "title": entry.title,
-                            "publisher": "Moneycontrol",
-                            "published": published.isoformat() if published else None,
-                            "url": entry.link,
-                        })
-                        if len(items) >= max_items:
-                            break
-                return items
-        except Exception as e2:
-            logger.warning("Moneycontrol httpx fallback also failed: %s", e2)
-            return []
+        logger.warning("Moneycontrol fetch failed: %s", e)
+        return []
 
 
 def _fetch_economic_times(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
-    keyword = symbol.replace(".NS", "").replace(".BO", "").upper()
+    keywords = _get_keywords(symbol)
     feed_url = "https://economictimes.indiatimes.com/rssfeedstopstories.cms"
     try:
         parsed = feedparser.parse(feed_url)
+        logger.info(f"Economic Times feed entries: {len(parsed.entries)}")
         items = []
         cutoff = datetime.utcnow() - timedelta(days=30)
         for entry in parsed.entries[:50]:
             title = entry.title.lower()
             desc = entry.description.lower() if hasattr(entry, "description") else ""
-            if keyword.lower() in title or keyword.lower() in desc:
+            text = title + " " + desc
+            if any(kw.lower() in text for kw in keywords):
                 published = None
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
                     published = datetime(*entry.published_parsed[:6])
@@ -248,16 +252,18 @@ def _fetch_economic_times(symbol: str, max_items: int = 5) -> List[Dict[str, Any
 
 
 def _fetch_cnbc_tv18(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
-    keyword = symbol.replace(".NS", "").replace(".BO", "").upper()
+    keywords = _get_keywords(symbol)
     feed_url = "https://www.cnbctv18.com/feed/"
     try:
         parsed = feedparser.parse(feed_url)
+        logger.info(f"CNBC TV18 feed entries: {len(parsed.entries)}")
         items = []
         cutoff = datetime.utcnow() - timedelta(days=30)
         for entry in parsed.entries[:50]:
             title = entry.title.lower()
             desc = entry.description.lower() if hasattr(entry, "description") else ""
-            if keyword.lower() in title or keyword.lower() in desc:
+            text = title + " " + desc
+            if any(kw.lower() in text for kw in keywords):
                 published = None
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
                     published = datetime(*entry.published_parsed[:6])
@@ -342,7 +348,6 @@ def _fetch_news_from_multiple_sources(symbol: str, max_total: int = 15) -> List[
     # Sort by published date (newest first)
     unique.sort(key=lambda x: x.get("published") or "", reverse=True)
 
-    # Log final count
     logger.info(f"Total unique news after dedup: {len(unique)}")
     return unique[:max_total]
 
@@ -506,12 +511,12 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
     return result
 
 
-# ── Routes (unchanged) ──
+# ── Routes ──
 @app.get("/")
 def root():
     return {
         "service": "Stockky Event Tracker Service",
-        "version": "0.4.1",
+        "version": "0.4.2",
         "status": "running",
         "endpoints": {
             "/health": "GET",
