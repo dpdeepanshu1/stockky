@@ -712,9 +712,15 @@ export const api = {
     request<{ status: string }>("/training/api/trades/mark-to-market", { method: "POST" }, 1, 30000),
 
   clearTradesBackup: () =>
-    request<any>("/api/trades/clear-backup", { method: "POST" }),
+    request<any>("/training/api/trades/clear-backup", { method: "POST" }, 1, 30000),
   listTradeBackups: () =>
-    request<any>("/api/trades/backups", {}),
+    request<any>("/training/api/trades/backups", undefined, 1, 15000),
+  addToTrade: (tradeId: string, qty: number, price?: number) =>
+    request<any>(`/training/api/trades/${tradeId}/add`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ quantity: qty, price }),
+    }, 1, 30000),
   closeTrade: (tradeId: string) =>
     request<{ status: string; trade_id: string; exit_price: number; pnl_pct: number }>(
       `/training/api/trades/${tradeId}/close`, { method: "POST" }, 1, 30000

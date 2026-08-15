@@ -360,30 +360,28 @@ def _decide(
     if already_owned and 35 <= combined < 60:
         return Decision.HOLD
 
-    news_ok = news_score is None or news_score >= 35
-    model_ok = prediction_score is None or prediction_score >= 50
-    resistance_ok = dist_to_resistance_pct is None or dist_to_resistance_pct > 1
+    # Soft safety signals (penalties / boosts) — NOT hard vetoes.
+    # Hard vetoes were wiping high-score names (e.g. score 67 with tech 78
+    # / fund 100) whenever price sat near resistance or model was quiet.
+    news_penalty = 0
+    if news_score is not None and news_score < 35:
+        news_penalty = 8
+    model_penalty = 0
+    if prediction_score is not None and prediction_score < 45:
+        model_penalty = 5
+    resistance_penalty = 0
+    if dist_to_resistance_pct is not None and dist_to_resistance_pct <= 1:
+        resistance_penalty = 4  # near resistance — caution, not auto-reject
 
-    # Previously required volume_surge (current volume > 1.5x the 20-day
-    # average — a fairly high bar) AND trend_strength in (strong,
-    # moderate) AND technical>=60 AND fundamental>=50, all ANDed together
-    # non-negotiably. A stock with an excellent combined_score (which
-    # already blends technical + fundamental + news + prediction +
-    # market + training signals with their own weights) could still get
-    # rejected purely because volume happened to be merely normal that
-    # day, not surging — one weak input vetoing an otherwise strong
-    # setup. Replaced with thresholds on combined_score plus individual
-    # floors, so no single average-but-not-bad input can veto on its own.
-    #
-    # resistance_ok / news_ok / model_ok stay as genuine hard safety
-    # gates regardless of score — these guard against buying right into
-    # a resistance wall, strongly negative news, or the trained model
-    # actively disagreeing, not against merely-average technicals.
-    if resistance_ok and news_ok and model_ok:
-        if combined >= 72 and technical_score >= 55 and fundamental_score >= 45:
-            return Decision.PREPARE_TO_BUY if event_risk else Decision.BUY_NOW
-        if combined >= 60 or (fundamental_score >= 60 and technical_score >= 45):
-            return Decision.PREPARE_TO_BUY
+    adj = combined - news_penalty - model_penalty - resistance_penalty
+
+    # Score-driven soft rules (short-term focused)
+    if adj >= 68 and technical_score >= 50 and fundamental_score >= 40:
+        return Decision.PREPARE_TO_BUY if event_risk else Decision.BUY_NOW
+    if adj >= 54 or (fundamental_score >= 55 and technical_score >= 50 and adj >= 50):
+        return Decision.PREPARE_TO_BUY
+    if adj >= 60 and technical_score >= 55:
+        return Decision.PREPARE_TO_BUY
 
     if already_owned and combined >= 60:
         return Decision.HOLD

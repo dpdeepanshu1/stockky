@@ -93,14 +93,21 @@ def score_to_decision(
         if score < 40:
             return SELL
         return HOLD
-    # Extended stocks: need higher bar except short momentum setups
-    adj = score - (8 if extended and horizon != "short" else (4 if extended else 0))
+    # Soft penalties — never a hard veto for a high overall score
+    adj = score - (6 if extended and horizon != "short" else (3 if extended else 0))
     if event_risk and horizon == "short":
-        adj -= 5
-    if adj >= 72:
-        return BUY_NOW
-    if adj >= 58:
-        return PREPARE
+        adj -= 4
+    # Short-term is primary focus: slightly lower bars so good setups surface
+    if horizon == "short":
+        if adj >= 66:
+            return BUY_NOW
+        if adj >= 54:
+            return PREPARE
+    else:
+        if adj >= 70:
+            return BUY_NOW
+        if adj >= 58:
+            return PREPARE
     if adj >= 45:
         return HOLD if already_owned else DO_NOT_BUY
     return DO_NOT_BUY

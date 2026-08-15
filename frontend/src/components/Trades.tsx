@@ -139,6 +139,35 @@ export default function Trades() {
     }
   };
 
+
+  const [addMoreId, setAddMoreId] = useState<string | null>(null);
+  const [addQty, setAddQty] = useState("1");
+  const [addPrice, setAddPrice] = useState("");
+  const [adding, setAdding] = useState(false);
+
+  const submitAddMore = async () => {
+    if (!addMoreId) return;
+    const q = parseFloat(addQty);
+    if (!q || q <= 0) {
+      showToast("error", "Enter a valid quantity");
+      return;
+    }
+    setAdding(true);
+    try {
+      const price = addPrice ? parseFloat(addPrice) : undefined;
+      const res = await (api as any).addToTrade(addMoreId, q, price);
+      showToast("success", `Added ${q} shares — new qty ${res.quantity}, avg ₹${res.entry_price}`);
+      setAddMoreId(null);
+      setAddQty("1");
+      setAddPrice("");
+      fetchAll();
+    } catch (err) {
+      showToast("error", `Add failed: ${(err as Error).message || "unknown"}`);
+    } finally {
+      setAdding(false);
+    }
+  };
+
   const submitDeposit = async () => {
     const amount = parseFloat(depositAmount);
     if (!amount || amount <= 0) {
@@ -227,6 +256,29 @@ export default function Trades() {
               ))}
             </ul>
           )}
+        </div>
+      )}
+
+      
+      {addMoreId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/70 backdrop-blur-sm p-4">
+          <div className="bg-graphite border border-slate/60 rounded-2xl p-6 w-full max-w-sm">
+            <h3 className="font-mono text-xs text-mist uppercase tracking-widest mb-1">Buy more</h3>
+            <p className="text-[11px] text-mist/60 mb-4">Add quantity to open position (avg entry updates like Groww)</p>
+            <label className="block text-[10px] font-mono text-mist uppercase mb-1">Quantity</label>
+            <input type="number" min="0.01" step="1" value={addQty} onChange={(e) => setAddQty(e.target.value)}
+              className="w-full bg-ink/50 border border-slate/40 rounded-lg px-3 py-2 font-mono text-lg text-paper mb-3 focus:outline-none focus:border-emerald-500/60" autoFocus />
+            <label className="block text-[10px] font-mono text-mist uppercase mb-1">Price (optional — blank = last entry)</label>
+            <input type="number" min="0" step="0.05" value={addPrice} onChange={(e) => setAddPrice(e.target.value)}
+              className="w-full bg-ink/50 border border-slate/40 rounded-lg px-3 py-2 font-mono text-paper mb-4 focus:outline-none focus:border-emerald-500/60" placeholder="Market / avg" />
+            <div className="flex gap-2">
+              <button onClick={() => setAddMoreId(null)} className="flex-1 text-xs font-mono uppercase border border-slate/40 rounded-lg py-2 text-mist">Cancel</button>
+              <button onClick={submitAddMore} disabled={adding}
+                className="flex-1 text-xs font-mono uppercase bg-emerald-500/20 border border-emerald-500/50 text-emerald-400 rounded-lg py-2 disabled:opacity-50">
+                {adding ? "Adding..." : "Confirm Buy"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

@@ -524,20 +524,18 @@ VALUE_BONUS_MAX = 8.0
 VALUE_MIN_FUNDAMENTAL_FOR_BONUS = 50.0
 
 def _value_adjusted_score(r: dict):
-    """Returns (adjusted_score, eligible_for_top_pick)."""
+    """Returns (adjusted_score, eligible_for_top_pick).
+    Price > VALUE_PRICE_CAP no longer hard-excludes a name — only removes
+    the cheap-stock bonus. High-score large-caps must still surface as picks.
+    """
     price = r.get("close")
     combined = r.get("combined_score", 0) or 0
     if price is None or price <= 0:
         return combined, True
-    eligible = price <= VALUE_PRICE_CAP
-    if not eligible:
-        return combined, False
     fundamental = r.get("fundamental_score", 0) or 0
-    bonus = (
-        (1 - price / VALUE_PRICE_CAP) * VALUE_BONUS_MAX
-        if fundamental >= VALUE_MIN_FUNDAMENTAL_FOR_BONUS
-        else 0.0
-    )
+    bonus = 0.0
+    if price <= VALUE_PRICE_CAP and fundamental >= VALUE_MIN_FUNDAMENTAL_FOR_BONUS:
+        bonus = (1 - price / VALUE_PRICE_CAP) * VALUE_BONUS_MAX
     return combined + bonus, True
 
 def _select_top_picks(actionable: list, limit: int = 5) -> list:
@@ -1184,13 +1182,27 @@ async def run_scan_parallel(task_id: str, universe: List[str], lite: bool = Fals
     def _horizon_picks(results_list, horizon_key, limit=5):
         scored = []
         for r in results_list:
+            if r.get("decision") == "ERROR":
+                continue
             hz = (r.get("horizons") or {}).get(horizon_key) or {}
             sc = hz.get("score")
             if sc is None:
-                sc = r.get("combined_score", 0) if horizon_key == "short" else 0
+                sc = r.get("combined_score", 0) or 0
+                # Mid/long without horizon block: slight discount vs short
+                if horizon_key == "mid":
+                    sc = sc * 0.95
+                elif horizon_key == "long":
+                    sc = (r.get("fundamental_score") or sc) * 0.9 + (r.get("combined_score") or 0) * 0.1
             decision = hz.get("decision") or r.get("decision")
-            if decision in ("BUY NOW", "PREPARE TO BUY") or (horizon_key == "short" and r.get("decision") in ("BUY NOW", "PREPARE TO BUY")):
-                scored.append({**r, "_hz_score": sc, "horizon_focus": horizon_key})
+            # Include BUY/PREPARE always; also include high-score DO NOT BUY as
+            # PREPARE candidates so the Top-5 lists are never empty on a
+            # cautious market day (score bar: short 54, mid 56, long 58).
+            min_sc = {"short": 54, "mid": 56, "long": 58}.get(horizon_key, 54)
+            if decision in ("BUY NOW", "PREPARE TO BUY") or (sc or 0) >= min_sc:
+                row = {**r, "_hz_score": sc, "horizon_focus": horizon_key}
+                if decision == "DO NOT BUY" and (sc or 0) >= min_sc:
+                    row = {**row, "decision": "PREPARE TO BUY", "promoted_from_score": True}
+                scored.append(row)
         scored.sort(key=lambda x: x.get("_hz_score", 0), reverse=True)
         return scored[:limit]
     top_picks_short = _horizon_picks(results, "short")

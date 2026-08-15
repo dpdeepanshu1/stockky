@@ -43,6 +43,9 @@ export default function Training() {
 
       // If training is active in UI and backend says it's not running anymore
       if (training && !data.training_in_progress) {
+        // Training finished on server — stop local timer/UI
+        setTraining(false);
+        if (timerIntervalRef.current) { clearInterval(timerIntervalRef.current); timerIntervalRef.current = null; }
         const succeeded = Boolean(data.production_model_exists && data.last_training);
         stopTraining(succeeded);
       }
@@ -239,7 +242,7 @@ export default function Training() {
 
     try {
       const response = await api.triggerTraining();
-      if (response.status === "started" || response.status === "Training started successfully") {
+      if (response.status === "started" || response.status === "Training started successfully" || (response as any).ok === true || String(response.status || "").toLowerCase().includes("start")) {
         startTraining();
         showToast("info", "⏳ Training started. This may take a few minutes.");
       } else {

@@ -454,3 +454,58 @@ def list_trade_backups():
     os.makedirs(BACKUP_DIR, exist_ok=True)
     files = sorted([p for p in os.listdir(BACKUP_DIR) if p.endswith(".json")], reverse=True)
     return {"backups": files}
+
+
+def add_quantity_to_trade(db_session, trade_id: str, quantity: float, price=None):
+    """Add more shares to an open paper trade (Groww-style average-up)."""
+    try:
+        from models import PaperTrade, PortfolioAccount
+    except Exception as e:
+        return {"ok": False, "error": f"models unavailable: {e}"}
+    if quantity is None or float(quantity) <= 0:
+        return {"ok": False, "error": "quantity must be > 0"}
+    quantity = float(quantity)
+    try:
+        if db_session is None:
+            # best-effort without session: cannot mutate DB
+            return {"ok": False, "error": "database session required on server"}
+        trade = db_session.query(PaperTrade).filter_by(id=trade_id).first()
+        if not trade:
+            return {"ok": False, "error": "trade not found"}
+        if getattr(trade, "status", "open") not in ("open", "OPEN", None):
+            return {"ok": False, "error": "trade is not open"}
+        entry = float(getattr(trade, "entry_price", 0) or 0)
+        old_qty = float(getattr(trade, "quantity", 0) or 0)
+        px = float(price) if price is not None else entry
+        if px <= 0:
+            return {"ok": False, "error": "invalid price"}
+        cost = px * quantity
+        # deduct cash if portfolio account exists
+        try:
+            acct = db_session.query(PortfolioAccount).first()
+            if acct is not None and hasattr(acct, "cash_balance"):
+                if float(acct.cash_balance) < cost:
+                    return {"ok": False, "error": "insufficient cash balance"}
+                acct.cash_balance = float(acct.cash_balance) - cost
+        except Exception:
+            pass
+        new_qty = old_qty + quantity
+        new_entry = ((entry * old_qty) + (px * quantity)) / new_qty if new_qty else px
+        trade.quantity = new_qty
+        trade.entry_price = round(new_entry, 4)
+        db_session.commit()
+        return {
+            "ok": True,
+            "trade_id": trade_id,
+            "quantity": new_qty,
+            "entry_price": trade.entry_price,
+            "added": quantity,
+            "added_price": px,
+            "cost": cost,
+        }
+    except Exception as e:
+        try:
+            db_session.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "error": str(e)}

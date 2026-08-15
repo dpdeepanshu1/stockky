@@ -891,3 +891,34 @@ def api_list_trade_backups():
         return list_trade_backups()
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/trades/{trade_id}/add")
+async def api_add_to_trade(trade_id: str, request: Request):
+    """Groww-style add more quantity to an open paper position."""
+    try:
+        body = await request.json()
+        qty = float(body.get("quantity") or 0)
+        price = body.get("price")
+        if qty <= 0:
+            raise HTTPException(status_code=400, detail="quantity must be > 0")
+        from trades import add_quantity_to_trade
+        # Prefer real DB session if available
+        db = None
+        try:
+            db = SessionLocal()
+        except Exception:
+            db = None
+        result = add_quantity_to_trade(db, trade_id, qty, price)
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error", "add failed"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
