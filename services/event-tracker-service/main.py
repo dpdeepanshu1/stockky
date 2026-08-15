@@ -1,15 +1,13 @@
 """
-Event Tracker Service v0.3.1
+Event Tracker Service v0.3.2
 -----------------------------
 Tracks material corporate events for subscribed NSE symbols.
 State is persisted in Upstash Redis so restarts don't lose subscriptions.
 
-v0.3.1 changes (merged from v0.3.0 + v0.3.1):
-  - Added /symbols_with_events endpoint with Redis caching (1hr TTL).
-  - Added earnings_surprise, bulk_deals, fii_dii_net_flow fields.
-  - Improved earnings date fetching using ticker.get_earnings_dates().
-  - Extended /check diff to include earnings surprise and bulk deals.
-  - Retained robust fallback caching, retry logic, and rate‑limit handling.
+v0.3.2 changes:
+  - Enhanced news fetching: fallback to Google News RSS if yfinance news empty
+  - Merges news from both sources (deduplicated by title)
+  - Increased max news items to 10
 """
 import os
 import json
@@ -18,9 +16,11 @@ import time
 import random
 import logging
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Dict, Any
+from urllib.parse import quote
 
 import yfinance as yf
+import feedparser
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -29,7 +29,7 @@ from upstash_redis import Redis
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("event-tracker-service")
 
-app = FastAPI(title="Stockky Event Tracker Service", version="0.3.1")
+app = FastAPI(title="Stockky Event Tracker Service", version="0.3.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 EVENT_CACHE_TTL = 4 * 3600          # 4 hours — events don't change minute-to-minute
@@ -115,6 +115,57 @@ def _yf_call(fn, label: str, sym: str, max_retries: int = 3, base_delay: float =
             wait = random.uniform(0, base_delay * (2 ** attempt))
             logger.info("%s retry %d/%d for %s after %.1fs: %s", label, attempt + 1, max_retries, sym, wait, e)
             time.sleep(wait)
+
+
+# ── NEW: Fetch news from Google News RSS ──
+def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]:
+    """Fetch news headlines from Google News RSS for the given symbol."""
+    # Map symbol to a readable company name (use common name for better search)
+    name_hints = {
+        "TCS": "Tata Consultancy Services",
+        "INFY": "Infosys",
+        "HDFCBANK": "HDFC Bank",
+        "ICICIBANK": "ICICI Bank",
+        "RELIANCE": "Reliance Industries",
+        "HCLTECH": "HCL Technologies",
+        "COFORGE": "Coforge",
+        "ANGELONE": "Angel One",
+        "ADANIPOWER": "Adani Power",
+        "BEL": "Bharat Electronics",
+        "HAL": "Hindustan Aeronautics",
+        "TATAMOTORS": "Tata Motors",
+        "SBIN": "State Bank of India",
+        "PWL": "PhysicsWallah",
+    }
+    base = symbol.replace(".NS", "").replace(".BO", "").upper()
+    query = name_hints.get(base, base) + " NSE stock"
+    encoded_query = quote(query)
+    feed_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-IN&gl=IN&ceid=IN:en"
+
+    try:
+        parsed = feedparser.parse(feed_url)
+        if getattr(parsed, "bozo", False) and not parsed.entries:
+            logger.warning("Google News RSS feed returned empty for %s", symbol)
+            return []
+
+        items = []
+        cutoff = datetime.utcnow() - timedelta(days=10)  # only last 10 days
+        for entry in parsed.entries[:max_items]:
+            published = None
+            if getattr(entry, "published_parsed", None):
+                published = datetime(*entry.published_parsed[:6])
+            if published and published < cutoff:
+                continue
+            items.append({
+                "title": entry.title,
+                "publisher": getattr(entry.source, "title", None) if hasattr(entry, "source") else None,
+                "published": published.isoformat() if published else None,
+                "url": entry.link,
+            })
+        return items
+    except Exception as e:
+        logger.warning("Failed to fetch Google News for %s: %s", symbol, e)
+        return []
 
 
 # ── Core event fetch (with Redis cache and fallback) ─────────────────────────
@@ -213,12 +264,12 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # 7. News headlines (last 5)
+    # ── 7. News headlines: first try yfinance, then fallback to Google News ──
     recent_news = []
-    news = _yf_call(lambda: ticker.news, "News", sym)
-    if news:
+    yf_news = _yf_call(lambda: ticker.news, "News", sym)
+    if yf_news:
         try:
-            for item in news[:5]:
+            for item in yf_news[:5]:
                 recent_news.append({
                     "title": item.get("content", {}).get("title") or item.get("title", ""),
                     "publisher": (item.get("content", {}).get("provider", {}) or {}).get("displayName") or item.get("publisher", ""),
@@ -227,6 +278,19 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
                 })
         except Exception:
             pass
+
+    # If yfinance returned fewer than 3 news, supplement with Google News
+    if len(recent_news) < 3:
+        logger.info("yfinance news had only %d items, fetching from Google News RSS", len(recent_news))
+        google_news = _fetch_google_news(sym, max_items=10)
+        # Deduplicate by title (case-insensitive)
+        existing_titles = {n["title"].lower() for n in recent_news if n["title"]}
+        for item in google_news:
+            if item["title"].lower() not in existing_titles:
+                recent_news.append(item)
+                existing_titles.add(item["title"].lower())
+                if len(recent_news) >= 10:
+                    break
 
     # 8. Earnings surprise (new)
     earnings_surprise = None
@@ -300,7 +364,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
 def root():
     return {
         "service": "Stockky Event Tracker Service",
-        "version": "0.3.1",
+        "version": "0.3.2",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
@@ -428,7 +492,7 @@ def check_for_changes():
     }
 
 
-# ── NEW: symbols_with_events endpoint ──────────────────────────────────────────
+# ── symbols_with_events endpoint ──────────────────────────────────────────
 @app.get("/symbols_with_events")
 def symbols_with_events(days_ahead: int = 7):
     """Return a list of subscribed symbols that have an upcoming event
