@@ -1,13 +1,13 @@
 """
-Event Tracker Service v0.3.2
+Event Tracker Service v0.3.3
 -----------------------------
 Tracks material corporate events for subscribed NSE symbols.
 State is persisted in Upstash Redis so restarts don't lose subscriptions.
 
-v0.3.2 changes:
-  - Enhanced news fetching: fallback to Google News RSS if yfinance news empty
-  - Merges news from both sources (deduplicated by title)
-  - Increased max news items to 10
+v0.3.3 changes:
+  - Improved cache logic: if cached news is empty, treat as miss and fetch fresh.
+  - Empty news cached with shorter TTL (1 hour) to retry sooner.
+  - Added Google News RSS fallback for news.
 """
 import os
 import json
@@ -29,10 +29,11 @@ from upstash_redis import Redis
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("event-tracker-service")
 
-app = FastAPI(title="Stockky Event Tracker Service", version="0.3.2")
+app = FastAPI(title="Stockky Event Tracker Service", version="0.3.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 EVENT_CACHE_TTL = 4 * 3600          # 4 hours — events don't change minute-to-minute
+EMPTY_NEWS_CACHE_TTL = 3600         # 1 hour — retry empty news sooner
 EVENT_FALLBACK_TTL = 30 * 24 * 3600 # 30 days for last‑known‑good fallback
 STATE_KEY = "stockky:event_state"
 EVENT_CACHE_PREFIX = "stockky:event:"
@@ -117,10 +118,9 @@ def _yf_call(fn, label: str, sym: str, max_retries: int = 3, base_delay: float =
             time.sleep(wait)
 
 
-# ── NEW: Fetch news from Google News RSS ──
+# ── Fetch news from Google News RSS ──
 def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]:
     """Fetch news headlines from Google News RSS for the given symbol."""
-    # Map symbol to a readable company name (use common name for better search)
     name_hints = {
         "TCS": "Tata Consultancy Services",
         "INFY": "Infosys",
@@ -149,7 +149,7 @@ def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]
             return []
 
         items = []
-        cutoff = datetime.utcnow() - timedelta(days=10)  # only last 10 days
+        cutoff = datetime.utcnow() - timedelta(days=14)  # last 14 days
         for entry in parsed.entries[:max_items]:
             published = None
             if getattr(entry, "published_parsed", None):
@@ -173,18 +173,24 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
     sym = _normalize(symbol)
     cache_key = f"{EVENT_CACHE_PREFIX}{sym}"
 
-    # Return cached data if available and not forced
+    # If not forced, try to serve from cache
     if not force:
         cached = _redis_get(cache_key)
         if cached:
-            logger.info("Event cache hit for %s", sym)
-            return cached
+            # If cached data has no news, treat as cache miss (unless it's a fallback)
+            if cached.get("recent_news") and len(cached.get("recent_news", [])) > 0:
+                logger.info("Event cache hit for %s with news", sym)
+                return cached
+            else:
+                # Cache has empty news – might be stale; we'll fetch fresh but use cached fallback later
+                logger.info("Cache for %s has empty news; will fetch fresh", sym)
+                # Continue to fetch fresh, but keep the cached data as fallback if fresh fails
 
     logger.info("Fetching fresh events for %s from yfinance", sym)
     ticker = yf.Ticker(sym)
     ticker._tz = "Asia/Kolkata"
 
-    # 1. Earnings calendar (using get_earnings_dates for reliability)
+    # 1. Earnings calendar
     next_earnings = None
     earnings_dates = _yf_call(lambda: ticker.get_earnings_dates(limit=1), "Earnings dates", sym)
     if earnings_dates is not None and not earnings_dates.empty:
@@ -217,7 +223,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # 4. Insider transactions (last 3)
+    # 4. Insider transactions
     recent_insider = []
     ins = _yf_call(lambda: ticker.insider_transactions, "Insider transactions", sym)
     if ins is not None and not ins.empty:
@@ -233,7 +239,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # 5. Analyst upgrades/downgrades (last 3)
+    # 5. Analyst actions
     recent_analyst = []
     ud = _yf_call(lambda: ticker.upgrades_downgrades, "Upgrades/downgrades", sym)
     if ud is not None and not ud.empty:
@@ -250,7 +256,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # 6. Institutional holders (top 5)
+    # 6. Institutional holders
     institutional_holders = []
     ih = _yf_call(lambda: ticker.institutional_holders, "Institutional holders", sym)
     if ih is not None and not ih.empty:
@@ -264,7 +270,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # ── 7. News headlines: first try yfinance, then fallback to Google News ──
+    # 7. News headlines: yfinance + Google News fallback
     recent_news = []
     yf_news = _yf_call(lambda: ticker.news, "News", sym)
     if yf_news:
@@ -279,11 +285,10 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # If yfinance returned fewer than 3 news, supplement with Google News
+    # Supplement with Google News if yfinance returned fewer than 3 items
     if len(recent_news) < 3:
         logger.info("yfinance news had only %d items, fetching from Google News RSS", len(recent_news))
         google_news = _fetch_google_news(sym, max_items=10)
-        # Deduplicate by title (case-insensitive)
         existing_titles = {n["title"].lower() for n in recent_news if n["title"]}
         for item in google_news:
             if item["title"].lower() not in existing_titles:
@@ -292,7 +297,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
                 if len(recent_news) >= 10:
                     break
 
-    # 8. Earnings surprise (new)
+    # 8. Earnings surprise
     earnings_surprise = None
     earnings_history = _yf_call(lambda: ticker.earnings_history, "Earnings history", sym)
     if earnings_history is not None and not earnings_history.empty:
@@ -311,7 +316,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # 9. Bulk/Block deals (placeholder – can be extended later)
+    # 9. Bulk/Block deals (placeholder)
     bulk_deals = []
 
     # 10. FII/DII Net Flow (placeholder)
@@ -341,8 +346,13 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
     ])
 
     if has_real_data:
-        # Cache good data with normal TTL and also store as fallback
-        _redis_set(cache_key, {**result, "cached": True}, ttl=EVENT_CACHE_TTL)
+        # Cache with normal TTL, and store fallback
+        ttl = EVENT_CACHE_TTL
+        # If news is empty, use a shorter TTL to retry sooner
+        if not recent_news:
+            ttl = EMPTY_NEWS_CACHE_TTL
+            logger.info("No news found for %s; caching with short TTL (%d s)", sym, ttl)
+        _redis_set(cache_key, {**result, "cached": True}, ttl=ttl)
         _redis_set(fallback_key, result, ttl=EVENT_FALLBACK_TTL)
         return result
 
@@ -351,8 +361,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
     if stale:
         logger.info("Live fetch for %s came back empty; serving last-known-good fallback", sym)
         stale = {**stale, "cached": True, "stale": True}
-        # Short TTL on the poisoned cache so we keep retrying the live path soon
-        _redis_set(cache_key, stale, ttl=900)
+        _redis_set(cache_key, stale, ttl=900)  # short TTL to retry soon
         return stale
 
     # Genuinely nothing available – return empty result
@@ -364,7 +373,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
 def root():
     return {
         "service": "Stockky Event Tracker Service",
-        "version": "0.3.2",
+        "version": "0.3.3",
         "status": "running",
         "endpoints": {
             "/health": "GET – health check",
@@ -407,14 +416,10 @@ def list_subscriptions():
 
 @app.get("/check")
 def check_for_changes():
-    """Diff each subscribed symbol against last known snapshot.
-    Staggered with 1s delay between symbols to avoid Yahoo rate limits.
-    Uses 4hr cache — only fetches fresh data if cache is expired."""
     state = _load_state()
     changes = []
 
     for i, symbol in enumerate(state["subscriptions"]):
-        # Stagger requests: 1 second apart to avoid rate limits
         if i > 0:
             time.sleep(1)
 
@@ -423,25 +428,21 @@ def check_for_changes():
 
         diff_reasons = []
 
-        # Earnings date changed
         if previous.get("next_earnings_date") != current.get("next_earnings_date"):
             diff_reasons.append(
                 f"Earnings date: {previous.get('next_earnings_date')} → {current.get('next_earnings_date')}"
             )
 
-        # New dividend
         prev_div = previous.get("last_dividend") or {}
         cur_div  = current.get("last_dividend") or {}
         if prev_div.get("date") != cur_div.get("date") and cur_div.get("date"):
             diff_reasons.append(f"New dividend declared: ₹{cur_div.get('amount')} on {cur_div.get('date')}")
 
-        # New split
         prev_split = previous.get("last_split") or {}
         cur_split  = current.get("last_split") or {}
         if prev_split.get("date") != cur_split.get("date") and cur_split.get("date"):
             diff_reasons.append(f"Stock split: {cur_split.get('ratio')}:1 on {cur_split.get('date')}")
 
-        # New analyst actions
         prev_keys = {
             (a.get("date", "") + a.get("firm", ""))
             for a in (previous.get("recent_analyst_actions") or [])
@@ -453,7 +454,6 @@ def check_for_changes():
                     f"Analyst: {action.get('firm')} {action.get('action')} → {action.get('to_grade')}"
                 )
 
-        # New insider transactions
         prev_insider_keys = {
             (a.get("date", "") + a.get("insider", ""))
             for a in (previous.get("recent_insider_transactions") or [])
@@ -465,19 +465,15 @@ def check_for_changes():
                     f"Insider {txn.get('transaction')}: {txn.get('insider')} — {txn.get('shares')} shares"
                 )
 
-        # Earnings surprise changed
         prev_surprise = previous.get("earnings_surprise") or {}
         cur_surprise = current.get("earnings_surprise") or {}
         if prev_surprise.get("surprise_pct") != cur_surprise.get("surprise_pct"):
-            diff_reasons.append(
-                f"Earnings surprise: {cur_surprise.get('surprise_pct')}%"
-            )
+            diff_reasons.append(f"Earnings surprise: {cur_surprise.get('surprise_pct')}%")
 
-        # Bulk/Block deals
         prev_bulk = previous.get("bulk_deals") or []
         cur_bulk = current.get("bulk_deals") or []
         if len(cur_bulk) != len(prev_bulk):
-            diff_reasons.append(f"Bulk/Block deal detected")
+            diff_reasons.append("Bulk/Block deal detected")
 
         if diff_reasons:
             changes.append({"symbol": symbol, "changes": diff_reasons, "current": current})
@@ -492,13 +488,8 @@ def check_for_changes():
     }
 
 
-# ── symbols_with_events endpoint ──────────────────────────────────────────
 @app.get("/symbols_with_events")
 def symbols_with_events(days_ahead: int = 7):
-    """Return a list of subscribed symbols that have an upcoming event
-    (earnings, dividend, split) within the next `days_ahead` days.
-    The list is cached in Redis for 1 hour."""
-    # Try to serve from cache
     cached = _redis_get(EVENTS_LIST_CACHE_KEY)
     if cached and isinstance(cached, list):
         logger.info("Serving cached symbols_with_events list")
@@ -516,11 +507,9 @@ def symbols_with_events(days_ahead: int = 7):
     result_symbols = []
 
     for symbol in subscriptions:
-        # Fetch cached event data (do not force fresh fetch)
         cache_key = f"{EVENT_CACHE_PREFIX}{symbol}"
         cached_events = _redis_get(cache_key)
         if not cached_events:
-            # If not cached, skip – we don't want to trigger expensive fetches
             continue
 
         next_earnings = cached_events.get("next_earnings_date")
@@ -533,7 +522,6 @@ def symbols_with_events(days_ahead: int = 7):
             except (ValueError, TypeError):
                 pass
 
-        # Check dividends
         last_div = cached_events.get("last_dividend")
         if last_div and last_div.get("date"):
             try:
@@ -544,7 +532,6 @@ def symbols_with_events(days_ahead: int = 7):
             except (ValueError, TypeError):
                 pass
 
-        # Check splits
         last_split = cached_events.get("last_split")
         if last_split and last_split.get("date"):
             try:
@@ -555,9 +542,7 @@ def symbols_with_events(days_ahead: int = 7):
             except (ValueError, TypeError):
                 pass
 
-    # Deduplicate and sort
     result_symbols = sorted(set(result_symbols))
-    # Cache for 1 hour
     _redis_set(EVENTS_LIST_CACHE_KEY, result_symbols, ttl=EVENTS_LIST_CACHE_TTL)
     logger.info(f"Returning {len(result_symbols)} symbols with upcoming events")
     return {"symbols": result_symbols}
