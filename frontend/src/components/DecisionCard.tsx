@@ -4,6 +4,44 @@ import { decisionStyle } from "../decisionStyle";
 import StockChart from "./StockChart";
 import { toActionablePick } from "./ScanPanel";
 
+// ── NEW: Types & helper for structured news ──
+interface NewsItem {
+  title: string;
+  publisher: string;
+  published: string;
+  url: string;
+}
+
+function getNewsItems(data: Decision): NewsItem[] {
+  const items: NewsItem[] = [];
+
+  // 1) Try structured news from event_data
+  if (data.event_data && typeof data.event_data === 'object') {
+    const newsArray = data.event_data['news'] || data.event_data['recent_news'];
+    if (Array.isArray(newsArray)) {
+      for (const n of newsArray) {
+        if (n.title) {
+          items.push({
+            title: n.title,
+            publisher: n.publisher || '',
+            published: n.published || '',
+            url: n.url || '',
+          });
+        }
+      }
+    }
+  }
+
+  // 2) Fallback to plain reasons.news (titles only, no timestamps)
+  if (items.length === 0 && data.reasons.news) {
+    for (const title of data.reasons.news) {
+      items.push({ title, publisher: '', published: '', url: '' });
+    }
+  }
+
+  return items;
+}
+
 interface Props {
   data: Decision;
   onBack: () => void;
@@ -53,7 +91,11 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const metrics = data.fundamental_metrics;
   const hasMetrics = metrics && Object.values(metrics).some(v => v != null);
   const hasPrice = data.close != null;
-  const hasNews = data.reasons.news && data.reasons.news.length > 0;
+  
+  // ── MODIFIED: hide plain news list if structured news exists ──
+  const hasNews = data.reasons.news && data.reasons.news.length > 0 &&
+    !(data.event_data && (data.event_data.news || data.event_data.recent_news));
+
   const hasEvent = data.reasons.event && data.reasons.event.length > 0;
   const hasMarket = data.reasons.market && data.reasons.market.length > 0;
 
@@ -431,6 +473,57 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
+      {/* ── NEW: NEWS SECTION ── */}
+      {(() => {
+        const newsItems = getNewsItems(data);
+        if (newsItems.length === 0) return null;
+
+        // Sort newest first
+        const sorted = [...newsItems].sort((a, b) => {
+          const da = a.published ? new Date(a.published).getTime() : 0;
+          const db = b.published ? new Date(b.published).getTime() : 0;
+          return db - da;
+        });
+
+        const recent = sorted.slice(0, 1); // most recent
+
+        // Filter previous news to those within the last 6 months
+        const sixMonthsAgo = new Date();
+        sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+        const previous = sorted.slice(1).filter(item => {
+          if (!item.published) return false;
+          return new Date(item.published) >= sixMonthsAgo;
+        });
+
+        return (
+          <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
+            <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">
+              📰 News
+            </h4>
+
+            {recent.length > 0 && (
+              <div className="mb-4">
+                <h5 className="text-sm font-medium text-green-600 dark:text-green-400 mb-1.5">
+                  🔹 Recent Event
+                </h5>
+                <NewsItemComponent item={recent[0]} />
+              </div>
+            )}
+
+            {previous.length > 0 && (
+              <div>
+                <h5 className="text-sm font-medium text-blue-600 dark:text-blue-400 mb-1.5">
+                  📄 Previous News (last 6 months)
+                </h5>
+                {previous.map((item, idx) => (
+                  <NewsItemComponent key={idx} item={item} />
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {/* Natural-language Hinglish summary */}
       {data.natural_language_summary && (
         <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
@@ -442,6 +535,44 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
           </p>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Helper Components ──
+
+// NEW: News item renderer with timestamp & link
+function NewsItemComponent({ item }: { item: NewsItem }) {
+  const date = item.published ? new Date(item.published) : null;
+  const formattedDate = date
+    ? date.toLocaleDateString('en-IN', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'UTC',
+      }) + ' UTC'
+    : 'Date not available';
+
+  return (
+    <div className="border-b border-gray-200 dark:border-gray-700 py-2 last:border-0">
+      {item.url ? (
+        <a
+          href={item.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-blue-600 dark:text-blue-400 hover:underline font-medium"
+        >
+          {item.title}
+        </a>
+      ) : (
+        <span className="font-medium text-gray-800 dark:text-gray-200">{item.title}</span>
+      )}
+      <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+        {item.publisher && <span className="mr-2">{item.publisher}</span>}
+        <span>{formattedDate}</span>
+      </div>
     </div>
   );
 }
@@ -489,7 +620,6 @@ function EventDataView({ data }: { data: Record<string, unknown> }) {
   );
 }
 
-// Helper components (unchanged)
 function PriceLevelBar({ close, support, resistance }: { close: number; support: number; resistance: number }) {
   const range = resistance - support;
   const closePct = range > 0 ? ((close - support) / range) * 100 : 50;
