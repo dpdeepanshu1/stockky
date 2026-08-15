@@ -40,6 +40,46 @@ function getNewsItems(data: Decision): NewsItem[] {
   return items;
 }
 
+// ── NEW: Sentiment scoring based on news titles ──
+function computeNewsSentimentScore(newsItems: NewsItem[]): number {
+  if (!newsItems.length) return 50; // neutral default
+
+  // Simple positive/negative word lists (expand as needed)
+  const positiveWords = new Set([
+    'beat', 'surpass', 'growth', 'strong', 'record', 'outperform', 'positive',
+    'upbeat', 'rally', 'surge', 'jump', 'gain', 'profit', 'upgrade', 'buy',
+    'bullish', 'recovery', 'breakthrough', 'exceed', 'rose', 'higher'
+  ]);
+  const negativeWords = new Set([
+    'miss', 'decline', 'drop', 'fall', 'warning', 'cut', 'downgrade',
+    'loss', 'sell', 'bearish', 'slump', 'plunge', 'collapse', 'debt',
+    'default', 'investigation', 'lawsuit', 'bankruptcy', 'layoff'
+  ]);
+
+  let score = 50; // start neutral
+  let totalWeight = 0;
+
+  for (const item of newsItems) {
+    const words = item.title.toLowerCase().split(/\s+/);
+    let pos = 0, neg = 0;
+    for (const word of words) {
+      const clean = word.replace(/[^a-z]/g, '');
+      if (positiveWords.has(clean)) pos++;
+      if (negativeWords.has(clean)) neg++;
+    }
+    // Each news item contributes ± up to 5 points, weighted by length
+    const weight = Math.min(1, words.length / 10);
+    const impact = (pos - neg) * 2; // range roughly -10..+10
+    score += impact * weight;
+    totalWeight += weight;
+  }
+
+  // Clamp to 0-100 and ensure we don't drift too far from neutral
+  const averageImpact = totalWeight > 0 ? (score - 50) / totalWeight : 0;
+  const finalScore = 50 + Math.min(20, Math.max(-20, averageImpact));
+  return Math.min(100, Math.max(0, Math.round(finalScore)));
+}
+
 interface Props {
   data: Decision;
   onBack: () => void;
@@ -60,6 +100,18 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const [trainingScore, setTrainingScore] = useState<TrainingScore | null>(null);
   const [loadingTrainingScore, setLoadingTrainingScore] = useState(false);
 
+  // ── NEW: Compute news sentiment from actual news items ──
+  const newsItems = getNewsItems(data);
+  const computedNewsScore = newsItems.length > 0 ? computeNewsSentimentScore(newsItems) : data.news_score ?? 50;
+
+  // Determine sentiment label
+  const sentimentLabel = computedNewsScore >= 70 ? 'Positive' :
+                         computedNewsScore >= 50 ? 'Neutral' :
+                         'Negative';
+  const sentimentColor = computedNewsScore >= 70 ? 'text-green-500' :
+                         computedNewsScore >= 50 ? 'text-yellow-500' :
+                         'text-red-500';
+
   useEffect(() => {
     let cancelled = false;
     setTrainingScore(null);
@@ -75,7 +127,8 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const scores = [
     { label: "Technical", value: data.technical_score },
     { label: "Fundamental", value: data.fundamental_score },
-    ...(data.news_score !== null && data.news_score !== undefined ? [{ label: "News", value: data.news_score }] : []),
+    // Use computed news score instead of data.news_score
+    { label: "News", value: computedNewsScore },
     ...(data.prediction_score !== null && data.prediction_score !== undefined ? [{ label: "AI Model", value: data.prediction_score }] : []),
     { label: "Market Sentiment", value: data.market_score ?? 50 },
     { label: "Training", value: data.training_score ?? 50 },
@@ -96,6 +149,9 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const fundamentalReasons = data.reasons.fundamental.filter(
     item => !item.startsWith("Live data was temporarily unavailable")
   );
+
+  // ── State for expanding news fundamentals ──
+  const [expandedNewsIndex, setExpandedNewsIndex] = useState<number | null>(null);
 
   const handleAddToWatchlist = async () => {
     if (isAddingWatchlist) return;
@@ -137,6 +193,23 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
     if (adj === 0) return "±0";
     return adj > 0 ? `+${adj}` : `${adj}`;
   };
+
+  // ── Helper to determine impact from news ──
+  function getNewsImpact(title: string): 'positive' | 'negative' | 'neutral' {
+    const lower = title.toLowerCase();
+    if (/(beat|surpass|growth|strong|record|outperform|positive|upbeat|rally|surge|jump|gain|profit|upgrade|buy|bullish|recovery|exceed|rose|higher)/i.test(lower))
+      return 'positive';
+    if (/(miss|decline|drop|fall|warning|cut|downgrade|loss|sell|bearish|slump|plunge|collapse|debt|default|investigation|lawsuit|bankruptcy|layoff)/i.test(lower))
+      return 'negative';
+    return 'neutral';
+  }
+
+  function getImpactDescription(title: string): string {
+    const impact = getNewsImpact(title);
+    if (impact === 'positive') return '✅ Positive sentiment — likely to support price';
+    if (impact === 'negative') return '⚠️ Negative sentiment — may pressure price';
+    return '⚪ Neutral sentiment — no clear directional bias';
+  }
 
   return (
     <div className="space-y-4">
@@ -450,12 +523,12 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* ── NEWS SECTION ── */}
+      {/* ── NEWS SECTION with score and fundamentals mapping ── */}
       {(() => {
-        const newsItems = getNewsItems(data);
-        if (newsItems.length === 0) return null;
+        const newsItemsList = getNewsItems(data);
+        if (newsItemsList.length === 0) return null;
 
-        const sorted = [...newsItems].sort((a, b) => {
+        const sorted = [...newsItemsList].sort((a, b) => {
           const da = a.published ? new Date(a.published).getTime() : 0;
           const db = b.published ? new Date(b.published).getTime() : 0;
           return db - da;
@@ -471,24 +544,54 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
 
         return (
           <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
-            <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">
-              📰 News
-            </h4>
+            <div className="flex items-center justify-between mb-3">
+              <h4 className="font-mono text-xs text-mist uppercase tracking-widest">
+                📰 News
+              </h4>
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-[10px] text-mist/50">Score:</span>
+                <span className={`font-mono text-sm font-medium ${sentimentColor}`}>
+                  {computedNewsScore}
+                </span>
+                <span className={`text-[10px] font-medium ${sentimentColor}`}>
+                  ({sentimentLabel})
+                </span>
+              </div>
+            </div>
+
             {recent.length > 0 && (
               <div className="mb-4">
                 <h5 className="text-sm font-medium text-green-600 dark:text-green-400 mb-1.5">
                   🔹 Recent Event
                 </h5>
-                <NewsItemComponent item={recent[0]} />
+                <NewsItemWithFundamentals
+                  item={recent[0]}
+                  isExpanded={expandedNewsIndex === 0}
+                  onToggle={() => setExpandedNewsIndex(expandedNewsIndex === 0 ? null : 0)}
+                  fundamentalMetrics={data.fundamental_metrics}
+                  fundamentalScore={data.fundamental_score}
+                  impact={getNewsImpact(recent[0].title)}
+                  impactDescription={getImpactDescription(recent[0].title)}
+                />
               </div>
             )}
+
             {previous.length > 0 && (
               <div>
                 <h5 className="text-sm font-medium text-blue-600 dark:text-blue-400 mb-1.5">
                   📄 Previous News (last 6 months)
                 </h5>
                 {previous.map((item, idx) => (
-                  <NewsItemComponent key={idx} item={item} />
+                  <NewsItemWithFundamentals
+                    key={idx}
+                    item={item}
+                    isExpanded={expandedNewsIndex === idx + 1}
+                    onToggle={() => setExpandedNewsIndex(expandedNewsIndex === idx + 1 ? null : idx + 1)}
+                    fundamentalMetrics={data.fundamental_metrics}
+                    fundamentalScore={data.fundamental_score}
+                    impact={getNewsImpact(item.title)}
+                    impactDescription={getImpactDescription(item.title)}
+                  />
                 ))}
               </div>
             )}
@@ -512,6 +615,151 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
 
 // ── Helper Components ──
 
+// ── NEW: News item with fundamentals mapping and impact badge ──
+function NewsItemWithFundamentals({
+  item,
+  isExpanded,
+  onToggle,
+  fundamentalMetrics,
+  fundamentalScore,
+  impact,
+  impactDescription,
+}: {
+  item: NewsItem;
+  isExpanded: boolean;
+  onToggle: () => void;
+  fundamentalMetrics?: FundamentalMetrics;
+  fundamentalScore?: number;
+  impact: 'positive' | 'negative' | 'neutral';
+  impactDescription: string;
+}) {
+  const date = item.published ? new Date(item.published) : null;
+  const formattedDate = date
+    ? date.toLocaleDateString('en-IN', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'UTC',
+      }) + ' UTC'
+    : 'Date not available';
+
+  const impactColor = impact === 'positive' ? 'text-green-500' :
+                      impact === 'negative' ? 'text-red-500' :
+                      'text-yellow-500';
+  const impactEmoji = impact === 'positive' ? '📈' :
+                      impact === 'negative' ? '📉' :
+                      '⚪';
+
+  return (
+    <div className="border-b border-gray-200 dark:border-gray-700 py-2 last:border-0">
+      <div className="flex items-start gap-2">
+        <span className="text-sm mt-0.5">{impactEmoji}</span>
+        <div className="flex-1">
+          {item.url ? (
+            <a
+              href={item.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-600 dark:text-blue-400 hover:underline font-medium"
+            >
+              {item.title}
+            </a>
+          ) : (
+            <span className="font-medium text-gray-800 dark:text-gray-200">{item.title}</span>
+          )}
+          <div className="flex items-center gap-3 mt-0.5 flex-wrap">
+            <div className="text-xs text-gray-500 dark:text-gray-400">
+              {item.publisher && <span className="mr-2">{item.publisher}</span>}
+              <span>{formattedDate}</span>
+            </div>
+            <span className={`text-[10px] font-medium ${impactColor}`}>
+              {impact.toUpperCase()} impact
+            </span>
+            <button
+              onClick={onToggle}
+              className="text-[10px] font-mono text-mist/50 hover:text-mist transition border border-slate/30 rounded px-2 py-0.5"
+            >
+              {isExpanded ? 'Hide Fundamentals' : 'Show Fundamentals'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {isExpanded && fundamentalMetrics && (
+        <div className="mt-2 ml-6 p-3 bg-ink/30 rounded-lg border border-slate/40">
+          <div className="flex items-center justify-between mb-2">
+            <span className="font-mono text-[10px] text-mist/50 uppercase tracking-wider">
+              📊 Fundamental Impact
+            </span>
+            <span className="text-xs text-mist/60">
+              Score: <span className="font-mono font-medium text-paper">{fundamentalScore ?? 'N/A'}</span>
+            </span>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+            {fundamentalMetrics.revenue_growth !== null && fundamentalMetrics.revenue_growth !== undefined && (
+              <div className="bg-ink/40 rounded px-2 py-1">
+                <div className="text-[9px] text-mist/50 uppercase">Revenue Growth</div>
+                <div className={`text-sm font-mono ${fundamentalMetrics.revenue_growth > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {fundamentalMetrics.revenue_growth.toFixed(1)}%
+                </div>
+              </div>
+            )}
+            {fundamentalMetrics.earnings_growth !== null && fundamentalMetrics.earnings_growth !== undefined && (
+              <div className="bg-ink/40 rounded px-2 py-1">
+                <div className="text-[9px] text-mist/50 uppercase">Earnings Growth</div>
+                <div className={`text-sm font-mono ${fundamentalMetrics.earnings_growth > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {fundamentalMetrics.earnings_growth.toFixed(1)}%
+                </div>
+              </div>
+            )}
+            {fundamentalMetrics.roe !== null && fundamentalMetrics.roe !== undefined && (
+              <div className="bg-ink/40 rounded px-2 py-1">
+                <div className="text-[9px] text-mist/50 uppercase">ROE</div>
+                <div className={`text-sm font-mono ${fundamentalMetrics.roe > 15 ? 'text-green-400' : fundamentalMetrics.roe > 0 ? 'text-yellow-400' : 'text-red-400'}`}>
+                  {fundamentalMetrics.roe.toFixed(1)}%
+                </div>
+              </div>
+            )}
+            {fundamentalMetrics.debt_to_equity !== null && fundamentalMetrics.debt_to_equity !== undefined && (
+              <div className="bg-ink/40 rounded px-2 py-1">
+                <div className="text-[9px] text-mist/50 uppercase">Debt/Equity</div>
+                <div className={`text-sm font-mono ${fundamentalMetrics.debt_to_equity < 1 ? 'text-green-400' : fundamentalMetrics.debt_to_equity < 2 ? 'text-yellow-400' : 'text-red-400'}`}>
+                  {fundamentalMetrics.debt_to_equity.toFixed(1)}
+                </div>
+              </div>
+            )}
+            {fundamentalMetrics.profit_margins !== null && fundamentalMetrics.profit_margins !== undefined && (
+              <div className="bg-ink/40 rounded px-2 py-1">
+                <div className="text-[9px] text-mist/50 uppercase">Net Margin</div>
+                <div className={`text-sm font-mono ${fundamentalMetrics.profit_margins > 10 ? 'text-green-400' : fundamentalMetrics.profit_margins > 0 ? 'text-yellow-400' : 'text-red-400'}`}>
+                  {fundamentalMetrics.profit_margins.toFixed(1)}%
+                </div>
+              </div>
+            )}
+            {fundamentalMetrics.pe_ratio !== null && fundamentalMetrics.pe_ratio !== undefined && (
+              <div className="bg-ink/40 rounded px-2 py-1">
+                <div className="text-[9px] text-mist/50 uppercase">P/E Ratio</div>
+                <div className={`text-sm font-mono ${fundamentalMetrics.pe_ratio < 20 ? 'text-green-400' : fundamentalMetrics.pe_ratio < 30 ? 'text-yellow-400' : 'text-red-400'}`}>
+                  {fundamentalMetrics.pe_ratio.toFixed(1)}
+                </div>
+              </div>
+            )}
+          </div>
+          <div className="mt-2 text-xs text-mist/70 border-t border-slate/30 pt-2">
+            {impactDescription}
+          </div>
+          <div className="mt-1 text-[10px] text-mist/40">
+            💡 News sentiment computed from headlines — score reflects overall tone.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Simple news item (fallback) ──
 function NewsItemComponent({ item }: { item: NewsItem }) {
   const date = item.published ? new Date(item.published) : null;
   const formattedDate = date
