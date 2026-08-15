@@ -40,43 +40,71 @@ function getNewsItems(data: Decision): NewsItem[] {
   return items;
 }
 
-// ── NEW: Sentiment scoring based on news titles ──
+// ── REVISED: Sentiment scoring with higher sensitivity ──
 function computeNewsSentimentScore(newsItems: NewsItem[]): number {
-  if (!newsItems.length) return 50; // neutral default
+  if (!newsItems.length) return 50;
 
-  // Simple positive/negative word lists (expand as needed)
+  // Expanded keyword sets (positive/negative)
   const positiveWords = new Set([
     'beat', 'surpass', 'growth', 'strong', 'record', 'outperform', 'positive',
     'upbeat', 'rally', 'surge', 'jump', 'gain', 'profit', 'upgrade', 'buy',
-    'bullish', 'recovery', 'breakthrough', 'exceed', 'rose', 'higher'
+    'bullish', 'recovery', 'breakthrough', 'exceed', 'rose', 'higher',
+    'earnings', 'revenue', 'income', 'profit', 'margin', 'expansion'
   ]);
   const negativeWords = new Set([
     'miss', 'decline', 'drop', 'fall', 'warning', 'cut', 'downgrade',
     'loss', 'sell', 'bearish', 'slump', 'plunge', 'collapse', 'debt',
-    'default', 'investigation', 'lawsuit', 'bankruptcy', 'layoff'
+    'default', 'investigation', 'lawsuit', 'bankruptcy', 'layoff',
+    'deficit', 'deteriorate'
   ]);
 
-  let score = 50; // start neutral
+  // Bonus phrases that strongly indicate positive news
+  const positivePhrases = [
+    'earnings call', 'strong revenue', 'revenue growth', 'profit beat',
+    'outperform', 'record high', 'positive outlook'
+  ];
+  const negativePhrases = [
+    'earnings miss', 'revenue miss', 'profit warning', 'downgrade',
+    'debt warning', 'losses'
+  ];
+
+  let score = 50;
   let totalWeight = 0;
 
   for (const item of newsItems) {
-    const words = item.title.toLowerCase().split(/\s+/);
+    const title = item.title.toLowerCase();
+    const words = title.split(/\s+/);
     let pos = 0, neg = 0;
-    for (const word of words) {
-      const clean = word.replace(/[^a-z]/g, '');
+
+    // Count positive/negative words
+    for (const w of words) {
+      const clean = w.replace(/[^a-z]/g, '');
       if (positiveWords.has(clean)) pos++;
       if (negativeWords.has(clean)) neg++;
     }
-    // Each news item contributes ± up to 5 points, weighted by length
-    const weight = Math.min(1, words.length / 10);
-    const impact = (pos - neg) * 2; // range roughly -10..+10
+
+    // Check for strong phrases
+    let phraseBonus = 0;
+    for (const phrase of positivePhrases) {
+      if (title.includes(phrase)) phraseBonus += 3;
+    }
+    for (const phrase of negativePhrases) {
+      if (title.includes(phrase)) phraseBonus -= 3;
+    }
+
+    // Weight based on title length (longer = more informative)
+    const weight = Math.min(1, words.length / 4); // was /10, now more weight
+    // Impact: each positive word contributes ~4 points, each negative ~-4
+    const impact = (pos - neg) * 4 + phraseBonus;
     score += impact * weight;
     totalWeight += weight;
   }
 
-  // Clamp to 0-100 and ensure we don't drift too far from neutral
-  const averageImpact = totalWeight > 0 ? (score - 50) / totalWeight : 0;
-  const finalScore = 50 + Math.min(20, Math.max(-20, averageImpact));
+  // Normalize to a per-news average impact
+  const avgImpact = totalWeight > 0 ? (score - 50) / totalWeight : 0;
+  // Clamp average impact to ±30 to avoid extreme swings
+  const clampedAvg = Math.min(30, Math.max(-30, avgImpact));
+  const finalScore = 50 + clampedAvg;
   return Math.min(100, Math.max(0, Math.round(finalScore)));
 }
 
@@ -100,7 +128,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const [trainingScore, setTrainingScore] = useState<TrainingScore | null>(null);
   const [loadingTrainingScore, setLoadingTrainingScore] = useState(false);
 
-  // ── NEW: Compute news sentiment from actual news items ──
+  // ── Compute news sentiment from actual news items ──
   const newsItems = getNewsItems(data);
   const computedNewsScore = newsItems.length > 0 ? computeNewsSentimentScore(newsItems) : data.news_score ?? 50;
 
@@ -197,7 +225,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   // ── Helper to determine impact from news ──
   function getNewsImpact(title: string): 'positive' | 'negative' | 'neutral' {
     const lower = title.toLowerCase();
-    if (/(beat|surpass|growth|strong|record|outperform|positive|upbeat|rally|surge|jump|gain|profit|upgrade|buy|bullish|recovery|exceed|rose|higher)/i.test(lower))
+    if (/(beat|surpass|growth|strong|record|outperform|positive|upbeat|rally|surge|jump|gain|profit|upgrade|buy|bullish|recovery|exceed|rose|higher|earnings)/i.test(lower))
       return 'positive';
     if (/(miss|decline|drop|fall|warning|cut|downgrade|loss|sell|bearish|slump|plunge|collapse|debt|default|investigation|lawsuit|bankruptcy|layoff)/i.test(lower))
       return 'negative';
@@ -615,7 +643,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
 
 // ── Helper Components ──
 
-// ── NEW: News item with fundamentals mapping and impact badge ──
+// ── News item with fundamentals mapping and impact badge ──
 function NewsItemWithFundamentals({
   item,
   isExpanded,
