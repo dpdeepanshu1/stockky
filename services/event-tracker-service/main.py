@@ -1,11 +1,7 @@
 """
-Event Tracker Service v0.4.2
+Event Tracker Service v0.4.3
 -----------------------------
-Improved multi‑source news fetching:
-- Uses multiple keyword variants (company name, ticker, symbol)
-- Google News uses only company name for broader matches
-- Increased cutoff to 30 days
-- Detailed logging of feed entry counts
+Reduced rate‑limit errors by caching yfinance API calls.
 """
 import os
 import json
@@ -14,8 +10,9 @@ import time
 import random
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from urllib.parse import quote
+from functools import wraps
 
 import yfinance as yf
 import feedparser
@@ -28,7 +25,7 @@ from upstash_redis import Redis
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("event-tracker-service")
 
-app = FastAPI(title="Stockky Event Tracker Service", version="0.4.2")
+app = FastAPI(title="Stockky Event Tracker Service", version="0.4.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 EVENT_CACHE_TTL = 4 * 3600
@@ -40,6 +37,32 @@ EVENT_FALLBACK_PREFIX = "stockky:event:fallback:"
 EVENTS_LIST_CACHE_KEY = "stockky:events_list"
 EVENTS_LIST_CACHE_TTL = 3600
 
+# ── In‑memory cache for yfinance calls ──
+_yf_cache: Dict[str, Dict[str, Any]] = {}
+CACHE_TTL_SECONDS = 300  # 5 minutes
+
+def cached_yf(method_name: str):
+    """Decorator to cache results of yfinance methods with TTL."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(symbol: str, *args, **kwargs):
+            cache_key = f"{symbol}:{method_name}"
+            now = time.time()
+            if cache_key in _yf_cache:
+                entry = _yf_cache[cache_key]
+                if now - entry["timestamp"] < CACHE_TTL_SECONDS:
+                    logger.debug(f"Cache hit for {cache_key}")
+                    return entry["value"]
+                else:
+                    del _yf_cache[cache_key]
+            logger.debug(f"Cache miss for {cache_key}, calling yfinance")
+            result = func(symbol, *args, **kwargs)
+            _yf_cache[cache_key] = {"value": result, "timestamp": now}
+            return result
+        return wrapper
+    return decorator
+
+# ── Redis ──────────────────────────────────────────────────────────────────────
 _redis = None
 try:
     _redis = Redis(
@@ -100,17 +123,88 @@ def _safe_float(val):
         return None
 
 
-def _yf_call(fn, label: str, sym: str, max_retries: int = 3, base_delay: float = 2):
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except Exception as e:
-            if attempt == max_retries - 1:
-                logger.warning("%s unavailable for %s after %d attempts: %s", label, sym, max_retries, e)
-                return None
-            wait = random.uniform(0, base_delay * (2 ** attempt))
-            logger.info("%s retry %d/%d for %s after %.1fs: %s", label, attempt + 1, max_retries, sym, wait, e)
-            time.sleep(wait)
+# ── Cached yfinance calls ──
+
+_yf_ticker_cache: Dict[str, yf.Ticker] = {}
+
+def _get_ticker(symbol: str) -> yf.Ticker:
+    if symbol not in _yf_ticker_cache:
+        _yf_ticker_cache[symbol] = yf.Ticker(symbol)
+        # set timezone to IST for consistency
+        _yf_ticker_cache[symbol]._tz = "Asia/Kolkata"
+    return _yf_ticker_cache[symbol]
+
+@cached_yf("get_earnings_dates")
+def _get_earnings_dates(symbol: str, limit: int = 1):
+    ticker = _get_ticker(symbol)
+    try:
+        return ticker.get_earnings_dates(limit=limit)
+    except Exception as e:
+        logger.warning(f"get_earnings_dates failed for {symbol}: {e}")
+        return None
+
+@cached_yf("dividends")
+def _get_dividends(symbol: str):
+    ticker = _get_ticker(symbol)
+    try:
+        return ticker.dividends
+    except Exception as e:
+        logger.warning(f"dividends failed for {symbol}: {e}")
+        return None
+
+@cached_yf("splits")
+def _get_splits(symbol: str):
+    ticker = _get_ticker(symbol)
+    try:
+        return ticker.splits
+    except Exception as e:
+        logger.warning(f"splits failed for {symbol}: {e}")
+        return None
+
+@cached_yf("insider_transactions")
+def _get_insider_transactions(symbol: str):
+    ticker = _get_ticker(symbol)
+    try:
+        return ticker.insider_transactions
+    except Exception as e:
+        logger.warning(f"insider_transactions failed for {symbol}: {e}")
+        return None
+
+@cached_yf("upgrades_downgrades")
+def _get_upgrades_downgrades(symbol: str):
+    ticker = _get_ticker(symbol)
+    try:
+        return ticker.upgrades_downgrades
+    except Exception as e:
+        logger.warning(f"upgrades_downgrades failed for {symbol}: {e}")
+        return None
+
+@cached_yf("institutional_holders")
+def _get_institutional_holders(symbol: str):
+    ticker = _get_ticker(symbol)
+    try:
+        return ticker.institutional_holders
+    except Exception as e:
+        logger.warning(f"institutional_holders failed for {symbol}: {e}")
+        return None
+
+@cached_yf("earnings_history")
+def _get_earnings_history(symbol: str):
+    ticker = _get_ticker(symbol)
+    try:
+        return ticker.earnings_history
+    except Exception as e:
+        logger.warning(f"earnings_history failed for {symbol}: {e}")
+        return None
+
+@cached_yf("news")
+def _get_news(symbol: str):
+    ticker = _get_ticker(symbol)
+    try:
+        return ticker.news
+    except Exception as e:
+        logger.warning(f"news failed for {symbol}: {e}")
+        return None
 
 
 # ── Keyword variants ──
@@ -133,14 +227,12 @@ def _get_keywords(symbol: str) -> List[str]:
         "PWL": "PhysicsWallah",
     }
     company = name_hints.get(base, base)
-    # Return variants: company name, base symbol, and the symbol without suffix
     return [company, base, base.lower(), company.lower()]
 
 
 # ── News sources ──
 
 def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]:
-    """Fetch from Google News RSS using company name (no extra words)."""
     base = symbol.replace(".NS", "").replace(".BO", "").upper()
     name_hints = {
         "TCS": "Tata Consultancy Services",
@@ -159,7 +251,7 @@ def _fetch_google_news(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]
         "PWL": "PhysicsWallah",
     }
     company = name_hints.get(base, base)
-    query = quote(company)  # just the company name
+    query = quote(company)
     feed_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
     try:
         parsed = feedparser.parse(feed_url)
@@ -284,23 +376,18 @@ def _fetch_cnbc_tv18(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
 
 
 def _fetch_yf_news(symbol: str) -> List[Dict[str, Any]]:
-    ticker = yf.Ticker(symbol)
-    try:
-        news = ticker.news
-        if not news:
-            return []
-        items = []
-        for item in news[:5]:
-            items.append({
-                "title": item.get("content", {}).get("title") or item.get("title", ""),
-                "publisher": (item.get("content", {}).get("provider", {}) or {}).get("displayName") or item.get("publisher", ""),
-                "published": item.get("content", {}).get("pubDate") or str(item.get("providerPublishTime", "")),
-                "url": (item.get("content", {}).get("canonicalUrl", {}) or {}).get("url") or item.get("link", ""),
-            })
-        return items
-    except Exception as e:
-        logger.warning("Yahoo Finance news fetch failed for %s: %s", symbol, e)
+    news_data = _get_news(symbol)
+    if not news_data:
         return []
+    items = []
+    for item in news_data[:5]:
+        items.append({
+            "title": item.get("content", {}).get("title") or item.get("title", ""),
+            "publisher": (item.get("content", {}).get("provider", {}) or {}).get("displayName") or item.get("publisher", ""),
+            "published": item.get("content", {}).get("pubDate") or str(item.get("providerPublishTime", "")),
+            "url": (item.get("content", {}).get("canonicalUrl", {}) or {}).get("url") or item.get("link", ""),
+        })
+    return items
 
 
 def _fetch_news_from_multiple_sources(symbol: str, max_total: int = 15) -> List[Dict[str, Any]]:
@@ -366,20 +453,18 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
             logger.info(f"Cache for {sym} has empty news; will fetch fresh")
 
     logger.info(f"=== Fetching fresh events for {sym} ===")
-    ticker = yf.Ticker(sym)
-    ticker._tz = "Asia/Kolkata"
 
-    # Existing yfinance data (unchanged)
+    # Use cached yfinance calls (they have their own internal caching)
+    earnings_dates = _get_earnings_dates(sym, limit=1)
     next_earnings = None
-    earnings_dates = _yf_call(lambda: ticker.get_earnings_dates(limit=1), "Earnings dates", sym)
     if earnings_dates is not None and not earnings_dates.empty:
         try:
             next_earnings = str(earnings_dates.index[0].date())
         except Exception:
             pass
 
+    divs = _get_dividends(sym)
     last_dividend = None
-    divs = _yf_call(lambda: ticker.dividends, "Dividends", sym)
     if divs is not None and not divs.empty:
         try:
             last_dividend = {
@@ -389,19 +474,19 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
+    splits_data = _get_splits(sym)
     last_split = None
-    splits = _yf_call(lambda: ticker.splits, "Splits", sym)
-    if splits is not None and not splits.empty:
+    if splits_data is not None and not splits_data.empty:
         try:
             last_split = {
-                "date": str(splits.index[-1].date()),
-                "ratio": _safe_float(splits.iloc[-1]),
+                "date": str(splits_data.index[-1].date()),
+                "ratio": _safe_float(splits_data.iloc[-1]),
             }
         except Exception:
             pass
 
+    ins = _get_insider_transactions(sym)
     recent_insider = []
-    ins = _yf_call(lambda: ticker.insider_transactions, "Insider transactions", sym)
     if ins is not None and not ins.empty:
         try:
             for _, row in ins.head(3).iterrows():
@@ -415,8 +500,8 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
+    ud = _get_upgrades_downgrades(sym)
     recent_analyst = []
-    ud = _yf_call(lambda: ticker.upgrades_downgrades, "Upgrades/downgrades", sym)
     if ud is not None and not ud.empty:
         try:
             ud_sorted = ud.sort_index(ascending=False)
@@ -431,8 +516,8 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
         except Exception:
             pass
 
+    ih = _get_institutional_holders(sym)
     institutional_holders = []
-    ih = _yf_call(lambda: ticker.institutional_holders, "Institutional holders", sym)
     if ih is not None and not ih.empty:
         try:
             for _, row in ih.head(5).iterrows():
@@ -449,7 +534,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
 
     # Earnings surprise
     earnings_surprise = None
-    earnings_history = _yf_call(lambda: ticker.earnings_history, "Earnings history", sym)
+    earnings_history = _get_earnings_history(sym)
     if earnings_history is not None and not earnings_history.empty:
         try:
             latest = earnings_history.iloc[0]
@@ -516,7 +601,7 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
 def root():
     return {
         "service": "Stockky Event Tracker Service",
-        "version": "0.4.2",
+        "version": "0.4.3",
         "status": "running",
         "endpoints": {
             "/health": "GET",
