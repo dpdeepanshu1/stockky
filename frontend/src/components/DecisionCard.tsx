@@ -40,7 +40,7 @@ function getNewsItems(data: Decision): NewsItem[] {
   return items;
 }
 
-// ── Sentiment scoring based on news titles ──
+// ── Sentiment scoring ──
 function computeNewsSentimentScore(newsItems: NewsItem[]): number {
   if (!newsItems.length) return 50;
 
@@ -120,8 +120,18 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const [trainingScore, setTrainingScore] = useState<TrainingScore | null>(null);
   const [loadingTrainingScore, setLoadingTrainingScore] = useState(false);
 
+  // ── Fetch news and filter to last 7 days ──
   const newsItems = getNewsItems(data);
-  const computedNewsScore = newsItems.length > 0 ? computeNewsSentimentScore(newsItems) : data.news_score ?? 50;
+  const sevenDaysAgo = new Date();
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+  const recentNewsItems = newsItems.filter(item => {
+    if (!item.published) return false;
+    return new Date(item.published) >= sevenDaysAgo;
+  });
+
+  // Use only recent news for score, fallback to all news if none recent
+  const itemsForScoring = recentNewsItems.length > 0 ? recentNewsItems : newsItems;
+  const computedNewsScore = itemsForScoring.length > 0 ? computeNewsSentimentScore(itemsForScoring) : data.news_score ?? 50;
 
   const sentimentLabel = computedNewsScore >= 70 ? 'Positive' :
                          computedNewsScore >= 50 ? 'Neutral' :
@@ -526,7 +536,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* ── EVENT UPDATE (cleaned, no JSON) ── */}
+      {/* ── EVENT UPDATE ── */}
       {data.event_data && Object.keys(data.event_data).length > 0 && (
         <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
           <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">
@@ -536,29 +546,9 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* ── NEWS SECTION with score, fundamentals, and 7-day filter ── */}
+      {/* ── NEWS SECTION (using filtered recentNewsItems) ── */}
       {(() => {
-        const newsItemsList = getNewsItems(data);
-        if (newsItemsList.length === 0) return null;
-
-        // Sort newest first
-        const sorted = [...newsItemsList].sort((a, b) => {
-          const da = a.published ? new Date(a.published).getTime() : 0;
-          const db = b.published ? new Date(b.published).getTime() : 0;
-          return db - da;
-        });
-
-        // ── Only show news from the last 7 days ──
-        const oneWeekAgo = new Date();
-        oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-        
-        const recentNews = sorted.filter(item => {
-          if (!item.published) return false;
-          return new Date(item.published) >= oneWeekAgo;
-        });
-
-        // If no news in the last 7 days, show a friendly message
-        if (recentNews.length === 0) {
+        if (recentNewsItems.length === 0) {
           return (
             <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
               <div className="flex items-center justify-between mb-3">
@@ -574,8 +564,14 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
           );
         }
 
-        const recent = recentNews.slice(0, 1);
-        const previous = recentNews.slice(1);
+        const sortedRecent = [...recentNewsItems].sort((a, b) => {
+          const da = a.published ? new Date(a.published).getTime() : 0;
+          const db = b.published ? new Date(b.published).getTime() : 0;
+          return db - da;
+        });
+
+        const recent = sortedRecent.slice(0, 1);
+        const previous = sortedRecent.slice(1);
 
         return (
           <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
