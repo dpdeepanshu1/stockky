@@ -582,6 +582,15 @@ export default function Training() {
                   <span className="text-mist/60">Elapsed: </span>
                   <span className="font-mono text-paper">{formatTime(elapsedSeconds)}</span>
                 </div>
+                {(() => {
+                  const eta = estimateTrainingRemaining(trainProgress?.stage, elapsedSeconds);
+                  return eta != null && eta > 0 ? (
+                    <div>
+                      <span className="text-mist/60">Est. remaining: </span>
+                      <span className="font-mono text-paper">~{formatTime(eta)}</span>
+                    </div>
+                  ) : null;
+                })()}
               </div>
             </div>
           </div>
@@ -789,43 +798,74 @@ const TRAINING_STAGES: { key: string; label: string }[] = [
 
 function StageTracker({ stage }: { stage?: string }) {
   const currentIdx = TRAINING_STAGES.findIndex((s) => s.key === stage);
+  // No stage data yet (still connecting, or /api/train/progress hasn't
+  // responded on this poll) — previously this silently rendered every dot
+  // as plain "pending" with nothing highlighted at all, which looked
+  // exactly like a static list of labels rather than a live pipeline.
+  // Showing "connecting" and lighting the first dot makes it obvious
+  // something is actually happening rather than looking broken.
+  const connecting = currentIdx === -1 && stage !== "done";
+  const effectiveIdx = connecting ? 0 : currentIdx;
+
   return (
-    <div className="flex items-center">
-      {TRAINING_STAGES.map((s, i) => {
-        const isDone = currentIdx > i || stage === "done";
-        const isCurrent = currentIdx === i && stage !== "done";
-        return (
-          <div key={s.key} className="flex items-center flex-1 last:flex-none">
-            <div className="flex flex-col items-center gap-1">
-              <div
-                className={`w-3 h-3 rounded-full border-2 transition-all duration-300 ${
-                  isDone
-                    ? "bg-signal-buy border-signal-buy"
-                    : isCurrent
-                    ? "bg-signal-prepare border-signal-prepare animate-pulse scale-125"
-                    : "bg-transparent border-slate/50"
-                }`}
-              />
-              <span
-                className={`text-[9px] font-mono uppercase whitespace-nowrap ${
-                  isDone ? "text-signal-buy" : isCurrent ? "text-signal-prepare" : "text-mist/30"
-                }`}
-              >
-                {s.label}
-              </span>
+    <div>
+      {connecting && (
+        <div className="text-[10px] font-mono text-mist/40 uppercase tracking-widest mb-2">
+          Connecting to training progress...
+        </div>
+      )}
+      <div className="flex items-center">
+        {TRAINING_STAGES.map((s, i) => {
+          const isDone = effectiveIdx > i || stage === "done";
+          const isCurrent = effectiveIdx === i && stage !== "done";
+          return (
+            <div key={s.key} className="flex items-center flex-1 last:flex-none">
+              <div className="flex flex-col items-center gap-1">
+                <div
+                  className={`w-3 h-3 rounded-full border-2 transition-all duration-300 ${
+                    isDone
+                      ? "bg-signal-buy border-signal-buy"
+                      : isCurrent
+                      ? "bg-signal-prepare border-signal-prepare animate-pulse scale-125"
+                      : "bg-transparent border-slate/50"
+                  }`}
+                />
+                <span
+                  className={`text-[9px] font-mono uppercase whitespace-nowrap ${
+                    isDone ? "text-signal-buy" : isCurrent ? "text-signal-prepare" : "text-mist/30"
+                  }`}
+                >
+                  {s.label}
+                </span>
+              </div>
+              {i < TRAINING_STAGES.length - 1 && (
+                <div
+                  className={`h-0.5 flex-1 mx-1 transition-all duration-500 ${
+                    isDone ? "bg-signal-buy" : "bg-slate/30"
+                  }`}
+                />
+              )}
             </div>
-            {i < TRAINING_STAGES.length - 1 && (
-              <div
-                className={`h-0.5 flex-1 mx-1 transition-all duration-500 ${
-                  isDone ? "bg-signal-buy" : "bg-slate/30"
-                }`}
-              />
-            )}
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
     </div>
   );
+}
+
+// Rough ETA: same linear-extrapolation approach the scan progress already
+// uses (average time per unit so far, projected across what's left) —
+// here the "unit" is pipeline stages rather than symbols. Training doesn't
+// have a symbol count to extrapolate from, so this is necessarily rougher,
+// labeled clearly as an estimate rather than a precise countdown.
+function estimateTrainingRemaining(stage: string | undefined, elapsedSeconds: number): number | null {
+  const idx = TRAINING_STAGES.findIndex((s) => s.key === stage);
+  if (idx < 0 || stage === "done" || elapsedSeconds <= 0) return null;
+  const stagesElapsed = idx + 1;
+  const stagesRemaining = TRAINING_STAGES.length - stagesElapsed;
+  if (stagesRemaining <= 0) return null;
+  const avgPerStage = elapsedSeconds / stagesElapsed;
+  return Math.round(avgPerStage * stagesRemaining);
 }
 
 function Spinner({ size = "sm" }: { size?: "sm" | "lg" }) {

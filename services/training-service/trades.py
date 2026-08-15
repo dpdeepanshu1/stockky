@@ -17,36 +17,29 @@ closes regardless.
 Mirrors evaluate.py's structure and conventions (own Session() per call,
 yfinance for price data, explicit commit/rollback/close).
 """
-import os
 import logging
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 import models as db_models
 
 logger = logging.getLogger("training-service.trades")
-
-# ---------- Database setup ----------
-DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./training.db')
-engine = create_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(bind=engine)
 
 IST = ZoneInfo("Asia/Kolkata")
 
 def ist_now() -> datetime:
     return datetime.now(IST).replace(tzinfo=None)
 
-DEFAULT_TRADE_CAPITAL = 100000.0
+DEFAULT_TRADE_CAPITAL = 10000.0
 DEFAULT_STARTING_BALANCE = 100000.0
 
 WEEK_DAYS = 7
 MAX_HOLDING_DAYS = 21
-WEEKLY_TAKE_PROFIT_PCT = 3.0
+WEEKLY_TAKE_PROFIT_PCT = 5.0
 
 
 def get_or_create_account(db):
@@ -72,7 +65,7 @@ def _log_transaction(db, account, transaction_type, amount, trade_id=None, note=
 def deposit_funds(amount: float, note: str = None):
     if amount <= 0:
         return None, "Deposit amount must be positive"
-    db = SessionLocal()   # <-- FIXED
+    db = Session()
     try:
         account = get_or_create_account(db)
         account.cash_balance += amount
@@ -91,7 +84,7 @@ def deposit_funds(amount: float, note: str = None):
 
 
 def get_portfolio_summary():
-    db = SessionLocal()   # <-- FIXED
+    db = Session()
     try:
         account = get_or_create_account(db)
         open_trades = db.query(db_models.PaperTrade).filter(db_models.PaperTrade.status == "OPEN").all()
@@ -115,8 +108,28 @@ def get_portfolio_summary():
         db.close()
 
 
+def _dynamic_trade_capital(account) -> float:
+    """AI-adjusted default trade size: scales up gradually as the account
+    becomes profitable — rewards sizing up only after the system has
+    actually proven an edge with real closed trades, not upfront. Never
+    scales below the base amount on a losing stretch; that's what
+    stop-loss and the weekly review are for, not shrinking position size
+    reactively here. Hard-capped as a percent of current balance
+    regardless of how the performance scaling computes, so a long
+    winning streak can't compound into one oversized position."""
+    base = DEFAULT_TRADE_CAPITAL
+    performance_ratio = (account.realized_pnl / account.total_deposited) if account.total_deposited > 0 else 0.0
+    # Scales linearly up to 2x base at +50% cumulative realized return.
+    scale = 1.0 + max(0.0, min(performance_ratio, 0.5)) * 2.0
+    suggested = base * scale
+    max_by_balance = account.cash_balance * 0.15  # never more than 15% of current cash in one trade
+    if max_by_balance <= 0:
+        return base
+    return round(min(suggested, max_by_balance), -2)
+
+
 def open_trade(prediction_id: str, capital: float = None, max_holding_days: int = MAX_HOLDING_DAYS):
-    db = SessionLocal()   # <-- FIXED
+    db = Session()
     try:
         existing = db.query(db_models.PaperTrade).filter(
             db_models.PaperTrade.prediction_id == prediction_id
@@ -133,7 +146,7 @@ def open_trade(prediction_id: str, capital: float = None, max_holding_days: int 
             return None, False, f"Invalid entry price {pred.price}"
 
         account = get_or_create_account(db)
-        requested = capital if capital and capital > 0 else DEFAULT_TRADE_CAPITAL
+        requested = capital if capital and capital > 0 else _dynamic_trade_capital(account)
         available_capital = min(requested, account.cash_balance)
 
         quantity = int(available_capital // pred.price)
@@ -234,7 +247,7 @@ def _close_trade(db, account, trade, price: float, exit_reason: str):
 
 
 def mark_to_market(trade_id: str):
-    db = SessionLocal()   # <-- FIXED
+    db = Session()
     try:
         trade = db.query(db_models.PaperTrade).filter(
             db_models.PaperTrade.trade_id == trade_id,
@@ -285,7 +298,7 @@ def mark_to_market(trade_id: str):
 
 
 def close_trade_manually(trade_id: str):
-    db = SessionLocal()   # <-- FIXED
+    db = Session()
     try:
         trade = db.query(db_models.PaperTrade).filter(
             db_models.PaperTrade.trade_id == trade_id,
@@ -312,7 +325,7 @@ def close_trade_manually(trade_id: str):
 
 
 def mark_all_open_trades():
-    db = SessionLocal()   # <-- FIXED
+    db = Session()
     try:
         open_trade_ids = [
             t.trade_id for t in db.query(db_models.PaperTrade).filter(
@@ -338,7 +351,7 @@ def get_trade_summary():
 
 
 def _build_trade_report(period: str, lookback: int):
-    db = SessionLocal()   # <-- FIXED
+    db = Session()
     try:
         cutoff = ist_now() - (timedelta(days=lookback) if period == "daily" else timedelta(weeks=lookback))
         closes = db.query(db_models.PaperTrade).filter(

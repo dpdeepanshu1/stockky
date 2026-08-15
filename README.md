@@ -283,3 +283,264 @@ modified — your base copies are already correct.
 - Whether `TRAINING_DATABASE_URL` is actually a persistent Postgres in your
   Render deployment, or still the SQLite default — this determines whether
   any of the training-service work here actually survives a restart.
+# Stockky — Changes Manifest
+
+This folder contains every file edited or created across this session, at its
+correct repo path. Files not listed here (the other 7 backend services, the
+rest of the frontend, prediction-service) were read for context but not
+modified — your base copies are already correct.
+
+## services/training-service/
+- **app.py** — CORS added; `from evaluator import` typo fixed (`evaluate`);
+  automatic T+1/T+5 evaluation scheduling on every recorded prediction;
+  `get_training_status()` now reads durable DB state (TrainingRun +
+  ModelRegistry) instead of ephemeral local files; dedup guard on
+  `store_prediction` (same symbol+decision+day = same pick, regardless of
+  caller); six previously-dropped fields wired through
+  (`market_sentiment_adjustment`, `holding_period`, `support`, `resistance`,
+  `sector`, `valuation`, `feature_snapshot`); new endpoints:
+  `/api/metrics/daily`, `/api/metrics/weekly`, `/api/actionable/commit`,
+  `/api/trades*`, `/api/portfolio/*`, `/api/stock/history/{symbol}`,
+  `/api/train/progress`, `/api/lock/clear`.
+- **train.py** — new `train_pick_success_model()`: trains a classifier on
+  the system's own real BUY/PREPARE TO BUY picks and their real outcomes,
+  replacing the old OHLCV regressor (kept, unused, as `--legacy-ohlcv`).
+  Champion/challenger promotion (compares new model's F1 against current
+  production before replacing it). `label_source` toggle (`t1_outcome` /
+  `trade_pnl`). Live stage-by-stage progress tracking for the animated UI.
+  Fixed a real crash-risk: all-NaN feature columns (rsi/volume_ratio are
+  currently always null) were reaching the scaler unguarded.
+- **evaluate.py** — `update_prediction_success()` was defined but never
+  called anywhere — now wired into `evaluate_t1`/`evaluate_t5`. Fixed 0/1/2
+  labeling: real failures were being written identically to "not yet
+  evaluated", silently biasing both the KNN search and the classifier.
+- **scanner.py** — now loads and scores with the trained model (gated by
+  `model_type` so a stale non-classifier artifact can't get used by
+  accident). Fixed the same NaN-propagation bug as train.py, in the KNN
+  distance calculation specifically — was producing meaningless neighbor
+  rankings on every call given today's data gaps.
+- **models.py** — added `PaperTrade`, `PortfolioAccount`,
+  `PortfolioTransaction` tables, with `ensure_schema` migration entries so
+  they actually get added via `ALTER TABLE` on an already-deployed DB.
+- **trades.py** — new file. Paper trading against one shared dummy balance
+  (not a fresh pot per trade). Weekly-cycle exits: target/stop-loss exit
+  immediately, otherwise reviewed every 7 days, closed if already up 3%+,
+  held into next week otherwise, 21-day hard cap.
+
+## services/api-gateway/main.py
+- Value-adjusted top-pick ranking (₹2000 cap + fundamentals-weighted bonus
+  for low-price stocks) at all 3 scan finalization points.
+- Real scan cancellation (`POST /scan/cancel/{task_id}`) — checked
+  periodically inside `run_scan_parallel`, finalizes with whatever was
+  actually scored so far instead of an empty result.
+- Self-pruning scan universe — symbols with 10 consecutive non-actionable
+  scans get excluded from future universe builds (watchlist exempt), so the
+  universe actually evolves instead of a static list reshuffling.
+- Event data passthrough fixed — was discarding everything except
+  `next_earnings_date`; now passes the full raw dict through.
+- Precise holding-period date-range estimates, alongside the existing
+  (often static) `holding_period` string.
+- Working async Gemini summary generator with truncation detection
+  (`finishReason == MAX_TOKENS`) and clean fallback to the existing
+  template — only wired into the async scan path, which has a client
+  available; the two sync paths still use the template only.
+
+## services/scheduler-service/run_once.py
+- Fixed a real bug: daily/Telegram picks were taken in arbitrary batch-
+  completion order, not ranked by score at all. Now uses the same
+  value-adjusted ranking as the gateway.
+
+## services/fundamental-analysis-service/indianapi_fallback.py
+- New file, not yet integrated (that service's `main.py` was read but the
+  call site was never spliced in — needs your confirmation of exactly
+  where the existing Yahoo Finance fetch lives). IndianAPI fallback used
+  only when Yahoo fails, 5-trading-day cache aligned to NSE market open,
+  rate-limited to 1 req/sec via Redis. Uses `upstash_redis.Redis`
+  (confirmed via the actual codebase, not guessed).
+
+## frontend/src/
+- **api.ts** — fixed a systemic path bug: every method I'd added was
+  missing the `/api/` prefix the gateway's catch-all proxy requires.
+  Cross-checked against the gateway's actual routing this time.
+- **App.tsx** — real Stop Scan button wired to the now-real cancel
+  endpoint; Trades tab registered in navigation.
+- **components/ScanPanel.tsx** — "Add All Actionable to Training" button;
+  value-adjusted picks section; "all actionable" list also sorted by
+  value-adjusted score, not raw order.
+- **components/Training.tsx** — animated stage-tracker panel polling
+  `/api/train/progress`; daily/weekly pick-tracking card; manual T+1/T+5
+  evaluation trigger buttons (fallback for when scheduler isn't running).
+- **components/Trades.tsx** — full portfolio-page rewrite: balance header,
+  add-funds modal, expandable position cards with inline charts, daily/
+  weekly trade reports.
+- **components/StockChart.tsx** — new file. 1D/5D/1M/1Y/5Y price chart
+  using `recharts` (already a project dependency).
+- **components/DecisionCard.tsx** — "Trade This" button + confirmation
+  modal; model recommendation panel (training-service's real signal,
+  separate from `combined_score`); event data rendering; holding-period
+  estimate display.
+
+## Known open items (need more files or your decision)
+- `technical-analysis-service` still doesn't populate `rsi`/`macd`/`ema`/
+  `volume_ratio` in the payload to training-service — I have that file now
+  but haven't yet made this specific fix.
+- `market-sentiment-service` is defined as a URL in api-gateway but never
+  actually called anywhere — a real, previously-hidden integration gap.
+- `indianapi_fallback.py` needs wiring into `fundamental-analysis-service`'s
+  actual Yahoo-fetch call site.
+- Whether `TRAINING_DATABASE_URL` is actually a persistent Postgres in your
+  Render deployment, or still the SQLite default — this determines whether
+  any of the training-service work here actually survives a restart.
+
+---
+
+# Round 2 — production-reported bugs + decision logic
+
+## services/api-gateway/main.py
+- **Fixed the real Stop Scan bug** (confirmed via isolated Python test,
+  not guessed): `tasks = [_analyze_one_symbol_ultra(...) for sym in
+  universe]` created bare coroutine objects, but the cancellation code
+  called `.done()`/`.cancel()` on them — coroutines don't have those
+  methods. This raised an unhandled `AttributeError` the instant Stop
+  Scan was clicked, silently killing the entire background scan task
+  before it ever wrote the finalized "done" status. That's exactly why
+  it showed "Stopping — finishing up..." forever with no summary. Fixed
+  by wrapping each coroutine in a real `asyncio.Task` via
+  `asyncio.ensure_future()`.
+- **Fixed a second bug in the same area**: the cancel flag lived in the
+  same Redis dict that periodic progress writes were overwriting wholesale
+  every 5 completions — a cancel request could get silently wiped before
+  the next check noticed it. Now a separate, dedicated Redis key.
+- **Enabled caching for technical-analysis-service** (see below) via
+  `docker-compose.yml` — every symbol analysis in every scan was
+  previously hitting market-data-service and recomputing every indicator
+  fresh, with zero caching benefit, despite a full TTL-aware cache system
+  already being built into that service and just never receiving
+  credentials.
+
+## services/technical-analysis-service/main.py
+- **Fixed a live bug**: `import json` only happened inside
+  `if __name__ == "__main__":`, which never executes under
+  `uvicorn main:app` (the actual `Dockerfile` command). Every call to
+  the cache helpers would have raised `NameError: name 'json' is not
+  defined` the moment Redis credentials were configured for this
+  service — which they weren't (see docker-compose.yml fix below),
+  so the bug was dormant, not absent.
+- Added `volume_ratio` to the output — already computed internally
+  (`vol_now`/`vol_avg20`), just never included in the response. This is
+  the field decision-engine needed and couldn't get.
+
+## services/decision-engine-service/main.py
+- **Softened the rigid all-must-pass BUY NOW gate** (your explicit
+  highest-priority item): previously required
+  `technical>=60 AND fundamental>=50 AND trend_strength AND volume_surge
+  AND resistance_ok AND news_ok AND model_ok` all non-negotiably — one
+  merely-average input (like normal-not-surging volume) could veto an
+  otherwise excellent setup. Replaced with combined-score thresholds
+  (`combined>=72` for BUY NOW, `combined>=60` or strong-fundamentals for
+  PREPARE TO BUY) while keeping resistance/news/model as genuine hard
+  safety gates.
+- **Fixed the long-flagged rsi/volume_ratio gap** (raised at the very
+  start of this whole session): `record_prediction_for_training`'s
+  payload hardcoded these to `None` even though the raw `technical` dict
+  was in scope the whole time — it just was never referenced. Now wired
+  through. Also derives an `ema` alignment label from the three EMA
+  values technical-analysis-service actually provides (no fabricated
+  `macd` value — that service doesn't compute one at all, left `None`
+  honestly rather than inventing something).
+- Replaced the hardcoded `"holding_period": "2-6 weeks"` (always, for
+  every stock) with a computed range based on actual target distance,
+  in both the main response and the training-service payload.
+- **New**: `long_term_hold` flag + `long_term_hold_estimate` (6-18 month
+  date range) — a signal separate from the short-term BUY NOW/PREPARE TO
+  BUY decision, since a stock can be a strong long-term candidate
+  independent of current entry timing.
+
+## docker-compose.yml
+- **Fixed the hardcoded Upstash Redis credentials** flagged at the very
+  start of this session — were sitting in plaintext across 5 services.
+  Now `${UPSTASH_REDIS_REST_URL}`/`${UPSTASH_REDIS_REST_TOKEN}`, matching
+  the `${VAR}` pattern already used elsewhere in this same file for other
+  secrets. Requires a `.env` file (not committed to git) with these two
+  values for `docker compose up` to substitute them.
+- Added Redis credentials to `technical-analysis-service` so its
+  already-built caching actually activates.
+
+## frontend/src/
+- **App.tsx**: scan state now persists across a page refresh
+  (`sessionStorage`) — previously reloading mid-scan lost all state and
+  dropped back to idle even though the backend scan was still running or
+  already sitting done. Stop Scan button now correctly reflects the
+  (now-real) cancellation flow.
+- **Trades.tsx**: `Promise.all` → `Promise.allSettled` for the initial
+  fetch — one failed endpoint was blanking out the entire page instead of
+  showing what did load. Timestamps now show date + time (data always
+  had it, display was dropping it). Default trade capital 10000 (was
+  100000).
+- **Every hardcoded "may not be routed through the gateway yet" error
+  message replaced with the real propagated error** (5 places: deposit,
+  trade open, trade close, mark-to-market, scan cancel) — these were
+  guesses I'd written as fallback text months ago in this session; the
+  actual `request()` helper already surfaces real HTTP status + body, the
+  UI layer was just discarding it.
+- **Training.tsx**: fixed the actual "pipeline not correct" bug — when
+  `/api/train/progress` returns nothing (stale deployment or a real
+  failure), every stage dot rendered as plain "pending" with nothing
+  highlighted, looking like a static list rather than a live pipeline.
+  Now shows "Connecting..." and lights the first stage instead of a
+  flat unlit row. Added a rough ETA (linear extrapolation from stages
+  completed so far, same approach the scan ETA already uses).
+- **ScanPanel.tsx / api.ts / App.tsx**: two new bulk actions — "Add Top
+  Picks to Watchlist" and "Add All Actionable to Watchlist" — reusing
+  api-gateway's existing `/watchlist/add` endpoint, which already dedupes
+  server-side via a Python set.
+- **DecisionCard.tsx**: "Highly Recommend for Long Term Hold" badge with
+  its estimated hold date range, displayed separately from the short-term
+  decision.
+
+## services/training-service/trades.py
+- Default trade capital: 100000 → 10000, with manual override still
+  available (capital param / Add Funds).
+- **New**: dynamic capital sizing — scales the default trade size up as
+  the account actually proves a real edge (realized P&L growing), never
+  scales down reactively on a losing stretch, hard-capped at 15% of
+  current cash balance regardless of how the performance scaling
+  computes, so a winning streak can't compound into one oversized bet.
+- Weekly take-profit threshold: 3% → 5%.
+
+## Genuinely deferred this round — not attempted, not guessed at
+The following were explicitly requested but are each substantial enough
+(multi-file, needs real data-source verification, or carries real risk if
+rushed) that I'm not attempting a shallow pass:
+- Technical scoring overhaul (Supertrend, VWAP, relative strength vs
+  Nifty, volume/delivery profile, multi-timeframe confirmation, pivot-
+  point support/resistance)
+- Fundamental scoring made sector-relative (P/E vs sector median,
+  promoter holding, pledging, ROCE consistency, FCF yield)
+- Prediction model overhaul (expanded universe, risk-adjusted target,
+  new features, monthly retrain cadence, live hit-rate feedback)
+- News sentiment (FinBERT/finance-specific model instead of the current
+  approach) and keyword-filtered headline relevance
+- Event tracker: NSE bulk/block deal feeds, board meetings, credit rating
+  changes; Analysis-page "Previous vs Now/Upcoming" section split
+- Market context granularity (India VIX, FII/DII flow, breadth)
+- Automated outcome validation loop (win rate, R-multiple, drawdown,
+  auto-disable if edge disappears)
+- Momentum/earnings-surprise scanner running every 5-10 min during market
+  hours
+- GitHub Actions workflows for scheduled retraining and T+1/T+5 sweeps
+  (with the wake-service-first pattern), and for the momentum scanner
+- CallMeBot voice-call urgent alerts + `/alert/urgent` endpoint + "Call
+  Me Now" button
+- New data source integration (GNews/Currents, jugaad-data/nse library,
+  Financial Modeling Prep, IndianAPI.in for fundamentals)
+- "Clear all from current backup" + "view backup" buttons
+- Fundamental analysis panel made more concise
+- Service cold-start resilience (parallel wake-up + backfill missing
+  parameters once a sleeping service wakes)
+
+If you want to sequence these, your own priority order from the request
+(soften decision engine → sector-relative fundamentals → expand
+prediction universe/retrain → technical indicators → feedback loop) is
+a reasonable one to follow, and item 1 is now done.
+

@@ -13,7 +13,13 @@ import StockChart from "./StockChart";
 const fmtMoney = (n: number | null | undefined) =>
   n == null ? "—" : `₹${n.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
 const fmtPct = (n: number | null | undefined) => (n == null ? "—" : `${n > 0 ? "+" : ""}${n}%`);
-const fmtDate = (s: string | null) => (s ? new Date(s).toLocaleDateString("en-IN") : "—");
+const fmtDate = (s: string | null) =>
+  s
+    ? new Date(s).toLocaleString("en-IN", {
+        day: "2-digit", month: "short", year: "numeric",
+        hour: "2-digit", minute: "2-digit",
+      })
+    : "—";
 const daysHeld = (entryDate: string) =>
   Math.max(0, Math.floor((Date.now() - new Date(entryDate).getTime()) / 86400000));
 
@@ -42,25 +48,31 @@ export default function Trades() {
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
-    try {
-      const [summaryData, openData, closedData, dailyData, weeklyData] = await Promise.all([
-        api.getPortfolioSummary(),
-        api.getTrades("open"),
-        api.getTrades("closed"),
-        api.getDailyTradeReport(30),
-        api.getWeeklyTradeReport(12),
-      ]);
-      setSummary(summaryData);
-      setOpenTrades(openData || []);
-      setClosedTrades(closedData || []);
-      setDailyReport(dailyData || []);
-      setWeeklyReport(weeklyData || []);
-    } catch (err) {
-      console.error("Failed to fetch trades:", err);
-      showToast("error", "Could not load trades");
-    } finally {
-      setLoading(false);
+    const [summaryR, openR, closedR, dailyR, weeklyR] = await Promise.allSettled([
+      api.getPortfolioSummary(),
+      api.getTrades("open"),
+      api.getTrades("closed"),
+      api.getDailyTradeReport(30),
+      api.getWeeklyTradeReport(12),
+    ]);
+    const failed: string[] = [];
+    if (summaryR.status === "fulfilled") setSummary(summaryR.value);
+    else failed.push("portfolio summary");
+    if (openR.status === "fulfilled") setOpenTrades(openR.value || []);
+    else failed.push("open trades");
+    if (closedR.status === "fulfilled") setClosedTrades(closedR.value || []);
+    else failed.push("closed trades");
+    if (dailyR.status === "fulfilled") setDailyReport(dailyR.value || []);
+    else failed.push("daily report");
+    if (weeklyR.status === "fulfilled") setWeeklyReport(weeklyR.value || []);
+    else failed.push("weekly report");
+    if (failed.length > 0) {
+      [summaryR, openR, closedR, dailyR, weeklyR].forEach((r) => {
+        if (r.status === "rejected") console.error("Trades fetch failed:", r.reason);
+      });
+      showToast("error", `Couldn't load: ${failed.join(", ")} — rest of the page still loaded fine.`);
     }
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -75,7 +87,7 @@ export default function Trades() {
       setTimeout(fetchAll, 4000);
     } catch (err) {
       console.error(err);
-      showToast("error", "Failed to trigger mark-to-market");
+      showToast("error", `Mark-to-market failed: ${(err as Error).message || "unknown error"}`);
     } finally {
       setMarkingToMarket(false);
     }
@@ -92,7 +104,7 @@ export default function Trades() {
       fetchAll();
     } catch (err) {
       console.error(err);
-      showToast("error", "Failed to close trade");
+      showToast("error", `Close trade failed: ${(err as Error).message || "unknown error"}`);
     } finally {
       setClosingId(null);
     }
@@ -113,7 +125,7 @@ export default function Trades() {
       fetchAll();
     } catch (err) {
       console.error(err);
-      showToast("error", "Deposit failed — /api/portfolio/deposit may not be routed through the gateway yet.");
+      showToast("error", `Deposit failed: ${(err as Error).message || "unknown error"}`);
     } finally {
       setDepositing(false);
     }

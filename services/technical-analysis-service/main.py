@@ -10,6 +10,7 @@ All results are cached with TTL that respects market hours:
 - Outside: TTL = 21600 seconds (6 hours)
 """
 import os
+import json
 import logging
 import math
 from datetime import datetime, time as dtime
@@ -350,6 +351,12 @@ def analyze(symbol: str):
         score += 8
         reasons.append("Volume surge")
 
+    # vol_now/vol_avg20 as a ratio, not just the boolean volume_surge flag —
+    # this is what decision-engine needs to forward rsi/volume_ratio through
+    # to training-service as real numbers instead of always-null. Was
+    # computed here already but never included in the response.
+    volume_ratio = round(vol_now / vol_avg20, 3) if vol_avg20 > 0 else None
+
     score = max(0, min(100, round(score)))
 
     result = {
@@ -368,6 +375,7 @@ def analyze(symbol: str):
         "bb_upper": round(bb_up, 2),
         "bb_lower": round(bb_lo, 2),
         "volume_surge": bool(volume_surge),
+        "volume_ratio": volume_ratio,
         "data_insufficient": data_length < 30,
         "reasons": reasons,
     }
@@ -377,6 +385,5 @@ def analyze(symbol: str):
 
 if __name__ == "__main__":
     import uvicorn
-    import json  # added for json.dumps
     port = int(os.getenv("PORT", 8002))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

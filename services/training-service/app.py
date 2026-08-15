@@ -15,7 +15,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 import joblib
 import numpy as np
 from sqlalchemy import create_engine, func
@@ -622,7 +622,7 @@ async def api_metrics_weekly(weeks: int = 12):
 # ----------------------------------------------------------------------
 class ActionableCommitRequest(BaseModel):
     picks: List[PredictionSnapshotCreate]
-    capital_per_trade: float = 100000.0
+    capital_per_trade: float = 10000.0
     open_trades: bool = True
 
 @app.post("/api/actionable/commit")

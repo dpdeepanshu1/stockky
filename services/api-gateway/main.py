@@ -1000,9 +1000,19 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
     sem = asyncio.Semaphore(MAX_PARALLEL_WORKERS)
     limits = httpx.Limits(max_keepalive_connections=200, max_connections=200)
     cancelled = False
+    cancel_key = SCAN_TASK_PREFIX + task_id + ":cancel"
     async with httpx.AsyncClient(timeout=240, limits=limits) as client:
+        # asyncio.ensure_future wraps each coroutine as a real Task —
+        # bare coroutines (what `_analyze_one_symbol_ultra(...)` returns
+        # before being scheduled) don't have .done()/.cancel() at all.
+        # The cancellation code below used to call those on the bare
+        # coroutines directly, which raised an unhandled AttributeError
+        # the instant a cancel was requested — silently killing this
+        # entire background task before it ever reached the code that
+        # writes the finalized "done" status, which is exactly why
+        # Stop Scan appeared to hang forever with no summary.
         tasks = [
-            _analyze_one_symbol_ultra(sym, client, sem)
+            asyncio.ensure_future(_analyze_one_symbol_ultra(sym, client, sem))
             for sym in universe
         ]
 
@@ -1013,17 +1023,20 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
                     errors.append({"symbol": result.get("symbol"), "error": result.get("error", "Unknown error")})
                 else:
                     results.append(result)
+            except asyncio.CancelledError:
+                pass
             except Exception as e:
                 logger.error(f"Task failed: {e}")
             processed += 1
             elapsed = round(time.time() - start_time, 1)
 
-            # Checked every 3rd completion rather than every one, so a
-            # cancel request is picked up quickly without adding a Redis
-            # round-trip to every single symbol's completion.
+            # Separate Redis key from the progress-status one below, so a
+            # cancel request can never be silently overwritten by the
+            # periodic progress write two lines down — that write used to
+            # replace the entire stored dict (including cancel_requested)
+            # with a fresh one that didn't have that key at all.
             if processed % 3 == 0:
-                task_state = _redis_get(SCAN_TASK_PREFIX + task_id)
-                if task_state and task_state.get("cancel_requested"):
+                if _redis_get(cancel_key):
                     cancelled = True
 
             if processed % 5 == 0 or processed == total or cancelled:
@@ -1613,16 +1626,16 @@ def get_scan_status(task_id: str):
 @app.post("/scan/cancel/{task_id}")
 def cancel_scan(task_id: str):
     """Requests cancellation of a running scan. run_scan_parallel checks
-    this flag periodically (every 3rd completion) and, once seen, stops
-    collecting further results and finalizes the task as 'done' with
-    whatever was actually scored so far."""
+    a dedicated cancel key (not the shared progress dict, which gets
+    periodically overwritten and would silently wipe this flag) every
+    3rd completion, and once seen, stops collecting further results and
+    finalizes the task as 'done' with whatever was actually scored so far."""
     data = _redis_get(SCAN_TASK_PREFIX + task_id)
     if not data:
         raise HTTPException(status_code=404, detail="Task not found or expired")
     if data.get("status") != "running":
         return {"status": "already_finished", "task_status": data.get("status")}
-    data["cancel_requested"] = True
-    _redis_set(SCAN_TASK_PREFIX + task_id, data, ttl=3600)
+    _redis_set(SCAN_TASK_PREFIX + task_id + ":cancel", True, ttl=3600)
     return {"status": "cancel_requested", "processed_so_far": data.get("processed", 0), "total": data.get("total", 0)}
 
 # ── Watchlist-only scan ──────────────────────────────────────────────────

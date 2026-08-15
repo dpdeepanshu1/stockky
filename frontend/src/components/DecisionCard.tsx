@@ -18,7 +18,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
 
   // NEW: Trade This
   const [showTradeModal, setShowTradeModal] = useState(false);
-  const [tradeCapital, setTradeCapital] = useState("100000");
+  const [tradeCapital, setTradeCapital] = useState("10000");
   const [tradingInProgress, setTradingInProgress] = useState(false);
   const [tradeResult, setTradeResult] = useState<string | null>(null);
 
@@ -87,7 +87,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
       }
     } catch (err) {
       console.error(err);
-      setTradeResult("Failed to open trade — check the Trades tab / gateway routing.");
+      setTradeResult(`Failed to open trade: ${(err as Error).message || "unknown error"}`);
     } finally {
       setTradingInProgress(false);
     }
@@ -393,6 +393,26 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
             <div className="mt-2 pt-2 border-t border-slate/30 flex justify-between text-mist/70">
               <span className="uppercase tracking-widest text-[10px]">Estimated date range</span>
               <span className="text-paper">{data.holding_period_estimate.label}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Long-term hold — a separate signal from the short-term decision
+          above. A stock can be a strong long-term candidate independent
+          of whether right now is a good entry timing-wise. */}
+      {data.long_term_hold && (
+        <div className="rounded-xl border border-signal-buy/40 bg-signal-buy/5 px-5 py-4">
+          <div className="flex items-center gap-2 font-mono text-xs uppercase tracking-widest text-signal-buy">
+            💎 Highly Recommend for Long Term Hold
+          </div>
+          <p className="text-mist/60 text-xs mt-1">
+            Strong fundamentals independent of current short-term entry timing.
+          </p>
+          {data.long_term_hold_estimate && (
+            <div className="mt-2 pt-2 border-t border-signal-buy/20 flex justify-between text-xs">
+              <span className="text-mist/50 uppercase tracking-widest text-[10px]">Suggested hold</span>
+              <span className="text-paper font-mono">{data.long_term_hold_estimate.label}</span>
             </div>
           )}
         </div>

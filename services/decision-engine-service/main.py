@@ -8,7 +8,7 @@ Changes:
 import os
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -298,25 +298,72 @@ def _decide(
     model_ok = prediction_score is None or prediction_score >= 50
     resistance_ok = dist_to_resistance_pct is None or dist_to_resistance_pct > 1
 
-    strong_buy = (
-        technical_score >= 60 and
-        fundamental_score >= 50 and
-        trend_strength in ("strong", "moderate") and
-        volume_surge and
-        resistance_ok and
-        news_ok and
-        model_ok
-    )
-    if strong_buy:
-        return Decision.PREPARE_TO_BUY if event_risk else Decision.BUY_NOW
-
-    if fundamental_score >= 45 and 50 <= technical_score < 60:
-        return Decision.PREPARE_TO_BUY
+    # Previously required volume_surge (current volume > 1.5x the 20-day
+    # average — a fairly high bar) AND trend_strength in (strong,
+    # moderate) AND technical>=60 AND fundamental>=50, all ANDed together
+    # non-negotiably. A stock with an excellent combined_score (which
+    # already blends technical + fundamental + news + prediction +
+    # market + training signals with their own weights) could still get
+    # rejected purely because volume happened to be merely normal that
+    # day, not surging — one weak input vetoing an otherwise strong
+    # setup. Replaced with thresholds on combined_score plus individual
+    # floors, so no single average-but-not-bad input can veto on its own.
+    #
+    # resistance_ok / news_ok / model_ok stay as genuine hard safety
+    # gates regardless of score — these guard against buying right into
+    # a resistance wall, strongly negative news, or the trained model
+    # actively disagreeing, not against merely-average technicals.
+    if resistance_ok and news_ok and model_ok:
+        if combined >= 72 and technical_score >= 55 and fundamental_score >= 45:
+            return Decision.PREPARE_TO_BUY if event_risk else Decision.BUY_NOW
+        if combined >= 60 or (fundamental_score >= 60 and technical_score >= 45):
+            return Decision.PREPARE_TO_BUY
 
     if already_owned and combined >= 60:
         return Decision.HOLD
 
     return Decision.DO_NOT_BUY
+
+
+def _is_long_term_hold_candidate(
+    fundamental_score: int,
+    technical_score: int,
+    event_risk: bool,
+    data_insufficient: bool,
+) -> bool:
+    """Separate from the short-term entry-timing decision above —a stock
+    can be a strong long-term hold candidate even when short-term
+    technicals don't currently justify BUY NOW/PREPARE TO BUY (price
+    just temporarily weak on an otherwise sound company), and vice versa
+    (a short-term breakout on a fundamentally mediocre company isn't a
+    long-term hold candidate). Kept as an additive flag rather than a
+    new Decision value so nothing that filters on
+    decision in (BUY_NOW, PREPARE_TO_BUY) — training-service, scanner.py,
+    the frontend's actionable-picks list — needs to change to recognize it.
+    """
+    if data_insufficient:
+        return False
+    return fundamental_score >= 70 and technical_score >= 40 and not event_risk
+
+
+def _long_term_hold_estimate(fundamental_score: int) -> dict:
+    """6-18 month horizon, loosely scaled by fundamental conviction —
+    this is a soft heuristic label, not a model prediction, same
+    honesty caveat as the short-term holding_period_estimate api-gateway
+    computes for BUY NOW/PREPARE TO BUY."""
+    min_months = 6
+    max_months = 6 + round((fundamental_score - 70) / 30 * 12)  # up to +12 months at fundamental_score=100
+    max_months = max(min_months + 3, min(max_months, 18))
+    start = datetime.now(timezone.utc).date()
+    end_min = start + timedelta(days=min_months * 30)
+    end_max = start + timedelta(days=max_months * 30)
+    return {
+        "min_months": min_months,
+        "max_months": max_months,
+        "expected_by_earliest": end_min.isoformat(),
+        "expected_by_latest": end_max.isoformat(),
+        "label": f"{min_months}-{max_months} months (review by {end_min.strftime('%b %Y')}\u2013{end_max.strftime('%b %Y')})",
+    }
 
 
 # ── Record prediction to Training Service ────────────────────────────
@@ -333,6 +380,14 @@ async def record_prediction_for_training(
     event_data: dict | None = None,
     fundamental_metrics: dict | None = None,
 ):
+    move_pct = abs(target - price) / price * 100 if target and price else None
+    if move_pct is not None:
+        min_weeks = max(2, round(move_pct / 5))
+        max_weeks = max(min_weeks + 1, round(move_pct / 2.5))
+        holding_period_str = f"{min(min_weeks, 8)}-{min(max_weeks, 12)} weeks"
+    else:
+        holding_period_str = "N/A"
+
     payload = {
         "symbol": symbol,
         "decision": decision,
@@ -351,7 +406,7 @@ async def record_prediction_for_training(
         "entry_range_high": entry_range.get("high") if entry_range else None,
         "target": target,
         "stop_loss": stop_loss,
-        "holding_period": "2-6 weeks",
+        "holding_period": holding_period_str,
         "support": features.get("support"),
         "resistance": features.get("resistance"),
         "sector": None,
@@ -359,10 +414,10 @@ async def record_prediction_for_training(
         "market_mood": market_sentiment.get("classification", "NEUTRAL"),
         "nifty_change_pct": market_sentiment.get("nifty_change_pct"),
         "sensex_change_pct": market_sentiment.get("sensex_change_pct"),
-        "rsi": None,
-        "macd": None,
-        "ema": None,
-        "volume_ratio": None,
+        "rsi": features.get("rsi"),
+        "macd": features.get("macd"),
+        "ema": features.get("ema"),
+        "volume_ratio": features.get("volume_ratio"),
         "debt_to_equity": fundamental_metrics.get("debt_to_equity") if fundamental_metrics else None,
         "roe": fundamental_metrics.get("roe") if fundamental_metrics else None,
         "roce": fundamental_metrics.get("roce") if fundamental_metrics else None,
@@ -527,6 +582,23 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
         reasons["market"] = [market_adjustment_reason]
         reasons["training"] = [f"Training intelligence score: {training_score}/100"]
 
+        long_term_hold = _is_long_term_hold_candidate(
+            fundamental_score, technical_score, event_risk, data_insufficient
+        )
+
+        # Was a hardcoded "2-6 weeks" regardless of the actual setup —
+        # scales the estimate to how far the target actually is from
+        # entry instead, same reasoning api-gateway's
+        # holding_period_estimate already uses for the calendar-date
+        # version of this.
+        if decision in (Decision.BUY_NOW, Decision.PREPARE_TO_BUY) and target and close:
+            move_pct = abs(target - close) / close * 100
+            min_weeks = max(2, round(move_pct / 5))
+            max_weeks = max(min_weeks + 1, round(move_pct / 2.5))
+            holding_period = f"{min(min_weeks, 8)}-{min(max_weeks, 12)} weeks"
+        else:
+            holding_period = "N/A"
+
         response = {
             "symbol": symbol.upper(),
             "decision": decision.value,
@@ -544,7 +616,9 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             "entry_range": {"low": entry_low, "high": entry_high} if entry_low else None,
             "target": target,
             "stop_loss": stop_loss,
-            "holding_period": "2-6 weeks" if decision in [Decision.BUY_NOW, Decision.PREPARE_TO_BUY] else "N/A",
+            "holding_period": holding_period,
+            "long_term_hold": long_term_hold,
+            "long_term_hold_estimate": _long_term_hold_estimate(fundamental_score) if long_term_hold else None,
             "close": close,
             "support": support,
             "resistance": resistance,
@@ -567,6 +641,20 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             response["fundamental_metrics"] = fundamental["metrics"]
 
         if decision in (Decision.BUY_NOW, Decision.PREPARE_TO_BUY) and close:
+            # ema alignment as a descriptive label — technical-analysis-service
+            # exposes ema20/ema50/ema200 as three separate numbers, not a
+            # single "ema" value, so this derives the closest honest
+            # equivalent rather than picking one of the three arbitrarily.
+            ema20, ema50, ema200 = technical.get("ema20"), technical.get("ema50"), technical.get("ema200")
+            ema_label = None
+            if ema20 is not None and ema50 is not None and ema200 is not None:
+                if ema20 > ema50 > ema200:
+                    ema_label = "bullish alignment"
+                elif ema20 < ema50 < ema200:
+                    ema_label = "bearish alignment"
+                else:
+                    ema_label = "mixed"
+
             background_tasks.add_task(
                 record_prediction_for_training,
                 symbol=symbol.upper(),
@@ -591,6 +679,19 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
                     "resistance": resistance,
                     "volume_surge": volume_surge,
                     "trend_strength": trend_strength,
+                    # Previously never included — rsi/volume_ratio reached
+                    # training-service as always-None, which silently
+                    # disabled two of the classifier's ten features and
+                    # left scanner.py's KNN similarity search comparing
+                    # every historical setup on a permanently-missing axis.
+                    "rsi": technical.get("rsi"),
+                    "volume_ratio": technical.get("volume_ratio"),
+                    # macd: technical-analysis-service doesn't compute or
+                    # expose a raw MACD value at all (only uses it
+                    # internally for scoring) — left None rather than
+                    # fabricating a label with nothing real behind it.
+                    "macd": None,
+                    "ema": ema_label,
                 },
                 event_data=events,
                 fundamental_metrics=fundamental.get("metrics")

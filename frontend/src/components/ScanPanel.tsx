@@ -7,6 +7,7 @@ interface Props {
   onSelect: (symbol: string) => void;
   onBack: () => void;
   onAddToWatchlist: (symbol: string) => void;
+  onAddManyToWatchlist: (symbols: string[], label: string) => void;
   onSendTopPicks: () => Promise<void>;      
   onSendAllActionable: () => Promise<void>; 
 }
@@ -66,7 +67,7 @@ export function toActionablePick(d: Decision): ActionablePick {
   };
 }
 
-export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, onSendTopPicks, onSendAllActionable }: Props) {
+export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, onAddManyToWatchlist, onSendTopPicks, onSendAllActionable }: Props) {
   const allSorted = [...result.all_results].sort((a, b) => b.combined_score - a.combined_score);
 
   const valueAdjustedTopPicks = useMemo(() => {
@@ -137,7 +138,7 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, 
       );
     } catch (err) {
       console.error(err);
-      setCommitMessage("Failed — /api/actionable/commit may not be routed through the gateway yet.");
+      setCommitMessage(`Failed: ${(err as Error).message || "unknown error"}`);
     } finally {
       setCommittingTraining(false);
       setTimeout(() => setCommitMessage(null), 6000);
@@ -206,6 +207,22 @@ export default function ScanPanel({ result, onSelect, onBack, onAddToWatchlist, 
           ) : (
             `🎓 Add All Actionable to Training (${allActionable.length})`
           )}
+        </button>
+        <button
+          onClick={() =>
+            onAddManyToWatchlist(result.recommendations.map((r) => r.symbol), "Top Picks")
+          }
+          disabled={result.recommendations.length === 0}
+          className="font-mono text-xs bg-signal-prepare/15 border border-signal-prepare/40 text-signal-prepare rounded-lg px-4 py-2 transition hover:bg-signal-prepare/25 disabled:opacity-40"
+        >
+          ⭐ Add Top Picks to Watchlist ({result.recommendations.length})
+        </button>
+        <button
+          onClick={() => onAddManyToWatchlist(allActionable.map((d) => d.symbol), "All Actionable")}
+          disabled={allActionable.length === 0}
+          className="font-mono text-xs bg-signal-prepare/15 border border-signal-prepare/40 text-signal-prepare rounded-lg px-4 py-2 transition hover:bg-signal-prepare/25 disabled:opacity-40"
+        >
+          ⭐ Add All Actionable to Watchlist ({allActionable.length})
         </button>
       </div>
       {commitMessage && (

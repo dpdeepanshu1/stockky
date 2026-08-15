@@ -6,8 +6,8 @@ services:
     ports:
       - "8001:8001"
     environment:
-      UPSTASH_REDIS_REST_URL: "https://adapted-lion-167573.upstash.io"
-      UPSTASH_REDIS_REST_TOKEN: "gQAAAAAAAo6VAAIgcDEzN2UwNWRkYmYwMWU0OWE4YjYxYjY1ZDQ5NWM2ZDgxMw"
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
 
   technical-analysis-service:
     build: ./services/technical-analysis-service
@@ -15,6 +15,13 @@ services:
       - "8002:8002"
     environment:
       MARKET_DATA_URL: https://stockky-market-data.onrender.com
+      # Caching (5min during market hours, 6hr outside) is fully
+      # implemented in this service's own code but was never actually
+      # receiving credentials — every /analyze/{symbol} call was hitting
+      # market-data-service and recomputing every indicator from scratch,
+      # every single time, for every symbol in every scan.
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
     depends_on:
       - market-data-service
 
@@ -37,8 +44,8 @@ services:
     ports:
       - "8006:8006"
     environment:
-      UPSTASH_REDIS_REST_URL: "https://adapted-lion-167573.upstash.io"
-      UPSTASH_REDIS_REST_TOKEN: "gQAAAAAAAo6VAAIgcDEzN2UwNWRkYmYwMWU0OWE4YjYxYjY1ZDQ5NWM2ZDgxMw"
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
 
   prediction-service:
     build: ./services/prediction-service
@@ -60,8 +67,8 @@ services:
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-      UPSTASH_REDIS_REST_URL: "https://adapted-lion-167573.upstash.io"
-      UPSTASH_REDIS_REST_TOKEN: "gQAAAAAAAo6VAAIgcDEzN2UwNWRkYmYwMWU0OWE4YjYxYjY1ZDQ5NWM2ZDgxMw"
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
 
   decision-engine-service:
     build: ./services/decision-engine-service
@@ -87,8 +94,8 @@ services:
     environment:
       DECISION_URL: https://decision-engine-service-0hg6.onrender.com
       NOTIFICATION_URL: https://notification-service-36py.onrender.com
-      UPSTASH_REDIS_REST_URL: "https://adapted-lion-167573.upstash.io"
-      UPSTASH_REDIS_REST_TOKEN: "gQAAAAAAAo6VAAIgcDEzN2UwNWRkYmYwMWU0OWE4YjYxYjY1ZDQ5NWM2ZDgxMw"
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
     depends_on:
       - decision-engine-service
       - notification-service

@@ -50,6 +50,46 @@ export default function App() {
     checkBackend();
   }, []);
 
+  // Resumes a scan across a page refresh — without this, reloading mid-scan
+  // (or right after it finished, before the tab had a chance to show the
+  // result) just loses all state and drops back to idle, even though the
+  // backend scan is either still running or already sitting there done.
+  useEffect(() => {
+    const savedTaskId = sessionStorage.getItem("stockky_scan_task_id");
+    if (!savedTaskId) return;
+    (async () => {
+      try {
+        const status = await api.scanStatus(savedTaskId);
+        if (status.status === "done") {
+          sessionStorage.removeItem("stockky_scan_task_id");
+          setView({ mode: "scan", data: status.result! });
+        } else if (status.status === "error") {
+          sessionStorage.removeItem("stockky_scan_task_id");
+        } else if (status.status === "running") {
+          setScanTaskId(savedTaskId);
+          setView({
+            mode: "loading",
+            label: `Running market scan... (${status.processed}/${status.total})`,
+            progress: {
+              processed: status.processed,
+              total: status.total,
+              elapsed: status.elapsed,
+              estimatedRemaining: status.estimated_remaining ?? undefined,
+            },
+          });
+          const interval = window.setInterval(() => pollScanStatus(savedTaskId), 1000);
+          setPollInterval(interval);
+        }
+      } catch {
+        // Task not found (Redis TTL expired, ~1hr) or gateway unreachable
+        // right now — either way, nothing to resume, so just drop it
+        // rather than keep retrying against a task that's gone.
+        sessionStorage.removeItem("stockky_scan_task_id");
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Cleanup polling on unmount
   useEffect(() => {
     return () => {
@@ -108,6 +148,7 @@ export default function App() {
     try {
       const { task_id } = await api.scanStart();
       setScanTaskId(task_id);
+      sessionStorage.setItem("stockky_scan_task_id", task_id);
       const interval = window.setInterval(() => pollScanStatus(task_id), 1000);
       setPollInterval(interval);
       await pollScanStatus(task_id);
@@ -153,11 +194,13 @@ export default function App() {
         if (pollInterval) clearInterval(pollInterval);
         setPollInterval(null);
         setScanTaskId(null);
+        sessionStorage.removeItem("stockky_scan_task_id");
         setView({ mode: "scan", data: status.result! });
       } else if (status.status === "error") {
         if (pollInterval) clearInterval(pollInterval);
         setPollInterval(null);
         setScanTaskId(null);
+        sessionStorage.removeItem("stockky_scan_task_id");
         setView({ mode: "error", message: status.error || "Scan failed" });
       }
     } catch (e) {
@@ -185,7 +228,7 @@ export default function App() {
       );
     } catch (e) {
       console.warn("Cancel request failed", e);
-      setStatusMessage("Could not reach the scan service to stop it — it may finish on its own.");
+      setStatusMessage(`Could not stop the scan: ${(e as Error).message || "unknown error"} — it may finish on its own.`);
       setCancelRequested(false);
     } finally {
       setStoppingScan(false);
@@ -237,6 +280,31 @@ export default function App() {
     } catch (e) {
       console.error("Failed to add to watchlist", e);
       setStatusMessage(`❌ Failed to add ${symbol} to watchlist`);
+      setTimeout(() => setStatusMessage(null), 3000);
+    }
+  }
+
+  async function handleAddManyToWatchlist(symbols: string[], label: string) {
+    if (symbols.length === 0) {
+      setStatusMessage("Nothing to add");
+      setTimeout(() => setStatusMessage(null), 3000);
+      return;
+    }
+    try {
+      const before = new Set(watchlist);
+      const newCount = symbols.filter((s) => !before.has(s.toUpperCase())).length;
+      await api.addManyToWatchlist(symbols);
+      const wl = await api.getWatchlist();
+      setWatchlist(wl.symbols);
+      setStatusMessage(
+        newCount > 0
+          ? `✅ Added ${newCount} new symbol(s) from ${label} (${symbols.length - newCount} already on watchlist)`
+          : `All ${symbols.length} symbol(s) from ${label} were already on the watchlist`
+      );
+      setTimeout(() => setStatusMessage(null), 4000);
+    } catch (e) {
+      console.error(`Failed to add ${label} to watchlist`, e);
+      setStatusMessage(`❌ Failed to add ${label} to watchlist`);
       setTimeout(() => setStatusMessage(null), 3000);
     }
   }
@@ -572,6 +640,7 @@ export default function App() {
                   onSelect={handleSearch}
                   onBack={() => setView({ mode: "idle" })}
                   onAddToWatchlist={handleAddToWatchlist}
+                  onAddManyToWatchlist={handleAddManyToWatchlist}
                   onSendTopPicks={handleSendTopPicks}
                   onSendAllActionable={handleSendAllActionable}
                 />

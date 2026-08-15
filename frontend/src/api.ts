@@ -79,6 +79,16 @@ export interface Decision {
     expected_by_latest: string;
     label: string;
   } | null;
+  // NEW: separate signal from the short-term decision — a stock can be a
+  // strong long-term hold candidate independent of current entry timing.
+  long_term_hold?: boolean;
+  long_term_hold_estimate?: {
+    min_months: number;
+    max_months: number;
+    expected_by_earliest: string;
+    expected_by_latest: string;
+    label: string;
+  } | null;
 }
 
 export interface ScanResult {
@@ -524,6 +534,21 @@ export const api = {
       30000
     ),
 
+  /** Same endpoint as addToWatchlist, just sending more than one symbol —
+   * api-gateway already dedupes via a Python set server-side, so adding a
+   * symbol that's already on the watchlist is a safe no-op either way. */
+  addManyToWatchlist: (symbols: string[]) =>
+    request<{ symbols: string[] }>(
+      "/watchlist/add",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbols }),
+      },
+      2,
+      30000
+    ),
+
   marketTopGainers: () => request<MarketResponse>("/market/top-gainers", undefined, 2, 30000),
   marketTopLosers: () => request<MarketResponse>("/market/top-losers", undefined, 2, 30000),
   marketMostActive: () => request<MarketResponse>("/market/most-active", undefined, 2, 30000),
@@ -639,7 +664,7 @@ export const api = {
     request<{ status: string }>(`/training/api/evaluate/${period}`, { method: "POST" }, 1, 30000),
 
   /** The "Add all actionable stocks to training" / "Trade This" button. */
-  commitActionablePicks: (picks: ActionablePick[], capitalPerTrade = 100000, openTrades = true) =>
+  commitActionablePicks: (picks: ActionablePick[], capitalPerTrade = 10000, openTrades = true) =>
     request<{ results: ActionableCommitResult[] }>(
       "/training/api/actionable/commit",
       {
