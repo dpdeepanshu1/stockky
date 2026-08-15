@@ -14,10 +14,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from upstash_redis import Redis
+from fastapi import FastAPI, BackgroundTasks
 
+# --------------------- FastAPI app ---------------------
+app = FastAPI(title="Stockky Scheduler")
+
+# --------------------- Logging ---------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scheduler-once")
 
+# --------------------- Environment & constants ---------------------
 API_GATEWAY_URL = os.environ["API_GATEWAY_URL"]
 EVENT_TRACKER_URL = os.environ["EVENT_TRACKER_URL"]
 NOTIFICATION_URL = os.environ["NOTIFICATION_URL"]
@@ -467,6 +473,25 @@ def main():
         logger.info("Skipping scan – outside window.")
 
     logger.info("Scheduler tick completed.")
+
+
+# --------------------- FastAPI endpoints ---------------------
+@app.get("/health")
+async def health():
+    """Health check for Render."""
+    return {"status": "ok"}
+
+
+@app.post("/run")
+async def run_scheduler(background_tasks: BackgroundTasks):
+    """
+    Trigger the scheduler run.
+    For GitHub Actions cron: send a POST request to this endpoint.
+    """
+    # Run the main() in the background to avoid blocking the response.
+    # If you want to wait for completion, call main() directly (but it may time out).
+    background_tasks.add_task(main)
+    return {"message": "Scheduler started in background"}
 
 
 if __name__ == "__main__":
