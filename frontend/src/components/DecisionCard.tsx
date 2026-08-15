@@ -40,11 +40,10 @@ function getNewsItems(data: Decision): NewsItem[] {
   return items;
 }
 
-// ── REVISED: Sentiment scoring with higher sensitivity ──
+// ── Sentiment scoring based on news titles ──
 function computeNewsSentimentScore(newsItems: NewsItem[]): number {
   if (!newsItems.length) return 50;
 
-  // Expanded keyword sets (positive/negative)
   const positiveWords = new Set([
     'beat', 'surpass', 'growth', 'strong', 'record', 'outperform', 'positive',
     'upbeat', 'rally', 'surge', 'jump', 'gain', 'profit', 'upgrade', 'buy',
@@ -58,7 +57,6 @@ function computeNewsSentimentScore(newsItems: NewsItem[]): number {
     'deficit', 'deteriorate'
   ]);
 
-  // Bonus phrases that strongly indicate positive news
   const positivePhrases = [
     'earnings call', 'strong revenue', 'revenue growth', 'profit beat',
     'outperform', 'record high', 'positive outlook'
@@ -76,14 +74,12 @@ function computeNewsSentimentScore(newsItems: NewsItem[]): number {
     const words = title.split(/\s+/);
     let pos = 0, neg = 0;
 
-    // Count positive/negative words
     for (const w of words) {
       const clean = w.replace(/[^a-z]/g, '');
       if (positiveWords.has(clean)) pos++;
       if (negativeWords.has(clean)) neg++;
     }
 
-    // Check for strong phrases
     let phraseBonus = 0;
     for (const phrase of positivePhrases) {
       if (title.includes(phrase)) phraseBonus += 3;
@@ -92,17 +88,13 @@ function computeNewsSentimentScore(newsItems: NewsItem[]): number {
       if (title.includes(phrase)) phraseBonus -= 3;
     }
 
-    // Weight based on title length (longer = more informative)
-    const weight = Math.min(1, words.length / 4); // was /10, now more weight
-    // Impact: each positive word contributes ~4 points, each negative ~-4
+    const weight = Math.min(1, words.length / 4);
     const impact = (pos - neg) * 4 + phraseBonus;
     score += impact * weight;
     totalWeight += weight;
   }
 
-  // Normalize to a per-news average impact
   const avgImpact = totalWeight > 0 ? (score - 50) / totalWeight : 0;
-  // Clamp average impact to ±30 to avoid extreme swings
   const clampedAvg = Math.min(30, Math.max(-30, avgImpact));
   const finalScore = 50 + clampedAvg;
   return Math.min(100, Math.max(0, Math.round(finalScore)));
@@ -128,11 +120,9 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const [trainingScore, setTrainingScore] = useState<TrainingScore | null>(null);
   const [loadingTrainingScore, setLoadingTrainingScore] = useState(false);
 
-  // ── Compute news sentiment from actual news items ──
   const newsItems = getNewsItems(data);
   const computedNewsScore = newsItems.length > 0 ? computeNewsSentimentScore(newsItems) : data.news_score ?? 50;
 
-  // Determine sentiment label
   const sentimentLabel = computedNewsScore >= 70 ? 'Positive' :
                          computedNewsScore >= 50 ? 'Neutral' :
                          'Negative';
@@ -155,7 +145,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const scores = [
     { label: "Technical", value: data.technical_score },
     { label: "Fundamental", value: data.fundamental_score },
-    // Use computed news score instead of data.news_score
     { label: "News", value: computedNewsScore },
     ...(data.prediction_score !== null && data.prediction_score !== undefined ? [{ label: "AI Model", value: data.prediction_score }] : []),
     { label: "Market Sentiment", value: data.market_score ?? 50 },
@@ -166,19 +155,16 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const hasMetrics = metrics && Object.values(metrics).some(v => v != null);
   const hasPrice = data.close != null;
 
-  // Hide plain news reason list if structured news exists
   const hasNews = data.reasons.news && data.reasons.news.length > 0 &&
     !(data.event_data && (data.event_data.news || data.event_data.recent_news));
 
   const hasEvent = data.reasons.event && data.reasons.event.length > 0;
   const hasMarket = data.reasons.market && data.reasons.market.length > 0;
 
-  // Filter out fallback message from fundamental reasons
   const fundamentalReasons = data.reasons.fundamental.filter(
     item => !item.startsWith("Live data was temporarily unavailable")
   );
 
-  // ── State for expanding news fundamentals ──
   const [expandedNewsIndex, setExpandedNewsIndex] = useState<number | null>(null);
 
   const handleAddToWatchlist = async () => {
@@ -222,7 +208,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
     return adj > 0 ? `+${adj}` : `${adj}`;
   };
 
-  // ── Helper to determine impact from news ──
   function getNewsImpact(title: string): 'positive' | 'negative' | 'neutral' {
     const lower = title.toLowerCase();
     if (/(beat|surpass|growth|strong|record|outperform|positive|upbeat|rally|surge|jump|gain|profit|upgrade|buy|bullish|recovery|exceed|rose|higher|earnings)/i.test(lower))
@@ -551,24 +536,46 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* ── NEWS SECTION with score and fundamentals mapping ── */}
+      {/* ── NEWS SECTION with score, fundamentals, and 7-day filter ── */}
       {(() => {
         const newsItemsList = getNewsItems(data);
         if (newsItemsList.length === 0) return null;
 
+        // Sort newest first
         const sorted = [...newsItemsList].sort((a, b) => {
           const da = a.published ? new Date(a.published).getTime() : 0;
           const db = b.published ? new Date(b.published).getTime() : 0;
           return db - da;
         });
 
-        const recent = sorted.slice(0, 1);
-        const sixMonthsAgo = new Date();
-        sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-        const previous = sorted.slice(1).filter(item => {
+        // ── Only show news from the last 7 days ──
+        const oneWeekAgo = new Date();
+        oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+        
+        const recentNews = sorted.filter(item => {
           if (!item.published) return false;
-          return new Date(item.published) >= sixMonthsAgo;
+          return new Date(item.published) >= oneWeekAgo;
         });
+
+        // If no news in the last 7 days, show a friendly message
+        if (recentNews.length === 0) {
+          return (
+            <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="font-mono text-xs text-mist uppercase tracking-widest">
+                  📰 News
+                </h4>
+                <span className="text-xs text-mist/40">No recent news (last 7 days)</span>
+              </div>
+              <p className="text-sm text-mist/60 italic">
+                No news articles found for the last 7 days.
+              </p>
+            </div>
+          );
+        }
+
+        const recent = recentNews.slice(0, 1);
+        const previous = recentNews.slice(1);
 
         return (
           <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
@@ -607,7 +614,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
             {previous.length > 0 && (
               <div>
                 <h5 className="text-sm font-medium text-blue-600 dark:text-blue-400 mb-1.5">
-                  📄 Previous News (last 6 months)
+                  📄 Previous News (last 7 days)
                 </h5>
                 {previous.map((item, idx) => (
                   <NewsItemWithFundamentals
@@ -643,7 +650,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
 
 // ── Helper Components ──
 
-// ── News item with fundamentals mapping and impact badge ──
 function NewsItemWithFundamentals({
   item,
   isExpanded,
@@ -787,45 +793,7 @@ function NewsItemWithFundamentals({
   );
 }
 
-// ── Simple news item (fallback) ──
-function NewsItemComponent({ item }: { item: NewsItem }) {
-  const date = item.published ? new Date(item.published) : null;
-  const formattedDate = date
-    ? date.toLocaleDateString('en-IN', {
-        day: '2-digit',
-        month: 'short',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        timeZone: 'UTC',
-      }) + ' UTC'
-    : 'Date not available';
-
-  return (
-    <div className="border-b border-gray-200 dark:border-gray-700 py-2 last:border-0">
-      {item.url ? (
-        <a
-          href={item.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-blue-600 dark:text-blue-400 hover:underline font-medium"
-        >
-          {item.title}
-        </a>
-      ) : (
-        <span className="font-medium text-gray-800 dark:text-gray-200">{item.title}</span>
-      )}
-      <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-        {item.publisher && <span className="mr-2">{item.publisher}</span>}
-        <span>{formattedDate}</span>
-      </div>
-    </div>
-  );
-}
-
-// ── Improved EventDataView – no raw JSON ──
 function EventDataView({ data }: { data: Record<string, unknown> }) {
-  // Skip keys that are handled elsewhere or are redundant
   const skipKeys = new Set(['news', 'recent_news', 'symbol']);
   const entries = Object.entries(data).filter(([key]) => !skipKeys.has(key));
 
@@ -839,7 +807,6 @@ function EventDataView({ data }: { data: Record<string, unknown> }) {
         const label = key.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
         if (value == null) return null;
 
-        // ── Array of strings ──
         if (Array.isArray(value)) {
           if (value.length === 0) return null;
           if (value.every(item => typeof item === 'string')) {
@@ -857,8 +824,6 @@ function EventDataView({ data }: { data: Record<string, unknown> }) {
               </div>
             );
           }
-
-          // ── Array of objects ──
           if (value.every(item => typeof item === 'object' && item !== null)) {
             return (
               <div key={key}>
@@ -866,9 +831,7 @@ function EventDataView({ data }: { data: Record<string, unknown> }) {
                 <div className="space-y-2">
                   {value.map((item, idx) => {
                     const obj = item as Record<string, any>;
-                    // Try to extract a meaningful title
                     const title = obj.title || obj.name || obj.description || obj.event || 'Item';
-                    // Collect extra details
                     const details = Object.entries(obj)
                       .filter(([k]) => !['title', 'name', 'description', 'event'].includes(k))
                       .map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v}`)
@@ -886,8 +849,6 @@ function EventDataView({ data }: { data: Record<string, unknown> }) {
               </div>
             );
           }
-
-          // ── Fallback: show as bullet list (no JSON) ──
           return (
             <div key={key}>
               <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
@@ -903,7 +864,6 @@ function EventDataView({ data }: { data: Record<string, unknown> }) {
           );
         }
 
-        // ── Object (non-array) ──
         if (typeof value === 'object' && value !== null) {
           const obj = value as Record<string, unknown>;
           return (
@@ -921,7 +881,6 @@ function EventDataView({ data }: { data: Record<string, unknown> }) {
           );
         }
 
-        // ── Primitive values ──
         let displayValue = String(value);
         if (typeof value === 'boolean') displayValue = value ? 'Yes' : 'No';
         return (
