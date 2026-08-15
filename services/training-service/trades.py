@@ -416,3 +416,41 @@ def get_daily_trade_report(days: int = 30):
 
 def get_weekly_trade_report(weeks: int = 12):
     return _build_trade_report("weekly", weeks)
+
+# ── Clear All + Backup (paper trades / tracking) ──────────────────────────
+import json, os
+from datetime import datetime, timezone
+
+BACKUP_DIR = os.getenv("TRADE_BACKUP_DIR", "/app/data/trade_backups")
+
+def clear_all_with_backup(db_session, account_id=None):
+    """Reset current paper tracking after writing a JSON backup. Returns backup meta."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(BACKUP_DIR, f"backup_{ts}.json")
+    payload = {"created_at": ts, "trades": [], "note": "Stockky clear-all backup"}
+    try:
+        # Best-effort dump of open/closed trades if models available
+        try:
+            from models import PaperTrade
+            rows = db_session.query(PaperTrade).all() if db_session is not None else []
+            payload["trades"] = [
+                {c.name: getattr(r, c.name, None) for c in r.__table__.columns}
+                for r in rows
+            ]
+            for r in rows:
+                db_session.delete(r)
+            if db_session is not None:
+                db_session.commit()
+        except Exception as inner:
+            payload["dump_error"] = str(inner)
+        with open(path, "w") as f:
+            json.dump(payload, f, default=str)
+        return {"ok": True, "backup_path": path, "count": len(payload.get("trades") or [])}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def list_trade_backups():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    files = sorted([p for p in os.listdir(BACKUP_DIR) if p.endswith(".json")], reverse=True)
+    return {"backups": files}

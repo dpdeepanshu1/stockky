@@ -3,8 +3,8 @@
 import { useState, useEffect, useRef } from "react";
 import { api, getApiUrl, setApiUrl, Decision, ScanResult, wakeService } from "./api";
 import Pipeline from "./components/Pipeline";
-import DecisionCard from "./components/DecisionCard";
-import ScanPanel from "./components/ScanPanel";
+import DecisionCard, { HorizonStrip } from "./components/DecisionCard";
+import ScanPanel, { MultiHorizonScanLists } from "./components/ScanPanel";
 import WatchlistManager from "./components/WatchlistManager";
 import NotificationsPanel from "./components/NotificationsPanel";
 import SystemCheck from "./components/SystemCheck";
@@ -48,6 +48,19 @@ export default function App() {
 
   useEffect(() => {
     checkBackend();
+    try {
+      const raw = localStorage.getItem("stockky_last_analysis");
+      if (raw && view.mode === "idle") {
+        // restore last analysis on refresh without wiping scan resume logic
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.symbol) {
+          // only restore if no scan task in flight
+          if (!sessionStorage.getItem("stockky_scan_task_id")) {
+            setView({ mode: "stock", data: parsed });
+          }
+        }
+      }
+    } catch {}
   }, []);
 
   // Resumes a scan across a page refresh — without this, reloading mid-scan
@@ -132,6 +145,7 @@ export default function App() {
     setScanTaskId(null);
     try {
       const data = await api.getStock(symbol.trim());
+      try { localStorage.setItem("stockky_last_analysis", JSON.stringify(data)); } catch {}
       setView({ mode: "stock", data });
       setQuery("");
     } catch (e) {
@@ -626,24 +640,34 @@ export default function App() {
               )}
 
               {view.mode === "stock" && (
-                <DecisionCard
-                  data={view.data}
-                  onBack={() => setView({ mode: "idle" })}
-                  onSearchRelated={handleSearch}
-                  onAddToWatchlist={handleAddToWatchlist}
-                />
+                <>
+                  <div className="mb-3 flex items-center gap-3">
+                    <button type="button" onClick={() => setView({ mode: "idle" })} className="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-200 text-sm border border-slate-600 hover:bg-slate-700">← Back</button>
+                    <span className="text-slate-400 text-sm">Analysis</span>
+                  </div>
+                  <HorizonStrip data={(view as any).data} />
+                  <DecisionCard
+                    data={view.data}
+                    onBack={() => setView({ mode: "idle" })}
+                    onSearchRelated={handleSearch}
+                    onAddToWatchlist={handleAddToWatchlist}
+                  />
+                </>
               )}
 
               {view.mode === "scan" && (
-                <ScanPanel
-                  result={view.data}
-                  onSelect={handleSearch}
-                  onBack={() => setView({ mode: "idle" })}
-                  onAddToWatchlist={handleAddToWatchlist}
-                  onAddManyToWatchlist={handleAddManyToWatchlist}
-                  onSendTopPicks={handleSendTopPicks}
-                  onSendAllActionable={handleSendAllActionable}
-                />
+                <>
+                  <MultiHorizonScanLists data={(view as any).data} />
+                  <ScanPanel
+                    result={view.data}
+                    onSelect={handleSearch}
+                    onBack={() => setView({ mode: "idle" })}
+                    onAddToWatchlist={handleAddToWatchlist}
+                    onAddManyToWatchlist={handleAddManyToWatchlist}
+                    onSendTopPicks={handleSendTopPicks}
+                    onSendAllActionable={handleSendAllActionable}
+                  />
+                </>
               )}
             </section>
           </>

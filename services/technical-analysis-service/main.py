@@ -32,6 +32,26 @@ MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onre
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
+
+def _rs_vs_nifty(close_series, nifty_close_series=None):
+    """Relative strength vs Nifty over ~20 sessions (0-100). Free yfinance data only."""
+    try:
+        import numpy as np
+        if close_series is None or len(close_series) < 21:
+            return 50.0, False
+        ret = float(close_series.iloc[-1] / close_series.iloc[-21] - 1.0)
+        nret = 0.0
+        if nifty_close_series is not None and len(nifty_close_series) >= 21:
+            nret = float(nifty_close_series.iloc[-1] / nifty_close_series.iloc[-21] - 1.0)
+        # map excess return to 0-100 (excess -10%..+10% → 0..100)
+        excess = (ret - nret) * 100.0
+        score = max(0.0, min(100.0, 50.0 + excess * 5.0))
+        extended = ret > 0.18  # >18% in ~1m treated as extended
+        return round(score, 1), extended
+    except Exception:
+        return 50.0, False
+
+
 app = FastAPI(title="Stockky Technical Analysis Service", version="0.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 

@@ -107,6 +107,7 @@ interface Props {
   onAddToWatchlist: (symbol: string) => void;
 }
 
+/** Parent can also render <HorizonStrip data={decision} /> */
 export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWatchlist }: Props) {
   const style = decisionStyle[data.decision] ?? decisionStyle["DO NOT BUY"];
   const isBullish = data.decision === "BUY NOW" || data.decision === "PREPARE TO BUY";
@@ -248,7 +249,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         <div className="flex items-start justify-between gap-6 flex-wrap">
           <div>
             <div className="font-mono text-xs text-mist tracking-widest uppercase mb-3 flex items-center gap-2">
-              <span>{data.symbol}</span>
+              <span>{data.symbol}</span><HorizonStrip data={data} /><span className="hidden"></span>
               {data.sector && <><span className="text-slate">·</span><span>{data.sector}</span></>}
               {data.valuation && <><span className="text-slate">·</span><span className="text-mist/60">{data.valuation}</span></>}
             </div>
@@ -957,6 +958,37 @@ function MetricItem({ label, value }: { label: string; value: string }) {
     <div className="bg-ink/40 border border-slate/40 rounded-lg px-3 py-2">
       <div className="font-mono text-[9px] text-mist/50 uppercase tracking-wider">{label}</div>
       <div className="font-mono text-sm text-paper mt-0.5">{value}</div>
+    </div>
+  );
+}
+
+/** Multi-horizon strip (Short / Mid / Long) — short is primary focus */
+export function HorizonStrip({ data }: { data: any }) {
+  const hz = data?.horizons || {};
+  const order = ["short", "mid", "long"] as const;
+  const fv = data?.final_verdict;
+  return (
+    <div className="mt-4 space-y-3">
+      {fv && (
+        <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+          <div className="font-semibold text-amber-300">Final Verdict (Short preferred)</div>
+          <div className="text-slate-200 mt-1">{fv.summary || fv.headline}</div>
+        </div>
+      )}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {order.map((k) => {
+          const h = hz[k];
+          if (!h) return null;
+          return (
+            <div key={k} className="rounded-xl border border-slate-700 bg-slate-900/60 p-3">
+              <div className="text-xs uppercase tracking-wide text-slate-400">{h.label || k}</div>
+              <div className="text-lg font-bold text-white mt-1">{h.decision}</div>
+              <div className="text-sm text-emerald-400">Score {h.score}</div>
+              <div className="text-xs text-slate-400 mt-1">{h.holding_period}</div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

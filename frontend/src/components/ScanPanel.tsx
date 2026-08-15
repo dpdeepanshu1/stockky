@@ -496,3 +496,57 @@ function CandidateCard({
     </div>
   );
 }
+
+/** Renders Short / Mid / Long Top lists when present on ScanResult */
+export function MultiHorizonScanLists({ data, onSendTelegram, onAddTraining }: {
+  data: any;
+  onSendTelegram?: (list: any[], label: string) => void;
+  onAddTraining?: (list: any[], label: string) => void;
+}) {
+  const blocks = [
+    { key: "recommendations_short", title: "Top 5 · Short-term (3–21d)" },
+    { key: "recommendations_mid", title: "Top 5 · Mid-term (1–6m)" },
+    { key: "recommendations_long", title: "Top 5 · Long-term (6–24m)" },
+  ];
+  return (
+    <div className="space-y-6">
+      {data?.final_verdict && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
+          <div className="font-semibold text-amber-300">Final Verdict</div>
+          <p className="text-sm text-slate-200 mt-1">{data.final_verdict.headline || data.final_verdict.summary}</p>
+        </div>
+      )}
+      {blocks.map((b) => {
+        const list = data?.[b.key] || [];
+        return (
+          <div key={b.key} className="rounded-xl border border-slate-700 p-4">
+            <div className="flex items-center justify-between gap-2 mb-3">
+              <h3 className="font-semibold text-white">{b.title}</h3>
+              <div className="flex gap-2">
+                {onSendTelegram && (
+                  <button className="text-xs px-2 py-1 rounded bg-sky-600 text-white" onClick={() => onSendTelegram(list, b.title)}>Send to Telegram</button>
+                )}
+                {onAddTraining && (
+                  <button className="text-xs px-2 py-1 rounded bg-violet-600 text-white" onClick={() => onAddTraining(list, b.title)}>Add to Training</button>
+                )}
+              </div>
+            </div>
+            {list.length === 0 ? (
+              <p className="text-sm text-slate-400">No picks in this horizon.</p>
+            ) : (
+              <ul className="space-y-2">
+                {list.map((r: any, i: number) => (
+                  <li key={r.symbol || i} className="flex justify-between text-sm border-b border-slate-800 py-2">
+                    <span className="font-medium text-white">{r.symbol}</span>
+                    <span className="text-emerald-400">{r.decision || r.horizons?.short?.decision}</span>
+                    <span className="text-slate-300">{r.combined_score ?? r._hz_score}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}

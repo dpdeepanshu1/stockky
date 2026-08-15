@@ -17,6 +17,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from horizons import multi_horizon_decide
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("decision-engine-service")
@@ -583,7 +584,35 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
 
         logger.info(f"Market sentiment for {symbol}: {market_score}")
 
+        
         market_adjustment, market_adjustment_reason = _market_sentiment_adjustment(market_score)
+
+        # ── Multi-horizon scoring (Short / Mid / Long) — short is primary ──
+        extras = {
+            "rs_vs_nifty": technical.get("rs_score") or technical.get("rs_vs_nifty"),
+            "delivery_pct": technical.get("delivery_pct"),
+            "quality_score": fundamental.get("quality_score") or fundamental.get("fundamental_score"),
+            "peer_relative_score": fundamental.get("peer_relative_score"),
+        }
+        flags = {
+            "already_owned": already_owned,
+            "event_risk": bool((events or {}).get("event_risk") or (events or {}).get("next_earnings_date")),
+            "extended": bool(technical.get("extended") or technical.get("overextended")),
+            "thin_history": bool(technical.get("data_insufficient") or technical.get("thin_history")),
+            "low_liquidity": bool(technical.get("low_liquidity")),
+            "live_win_rate": (training or {}).get("live_win_rate") or (training or {}).get("win_rate"),
+        }
+        mh = multi_horizon_decide(
+            technical=technical if isinstance(technical, dict) else {},
+            fundamental=fundamental if isinstance(fundamental, dict) else {},
+            news=news if isinstance(news, dict) else None,
+            events=events if isinstance(events, dict) else None,
+            prediction=prediction if isinstance(prediction, dict) else None,
+            market={"market_score": market_score, "classification": sentiment.get("classification"), "trend": sentiment.get("trend")},
+            extras=extras,
+            flags=flags,
+        )
+
 
         event_signals = _extract_event_signals(events)
         event_delta = event_signals["event_score_delta"]
@@ -768,6 +797,20 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
                 event_data=events,
                 fundamental_metrics=fundamental.get("metrics")
             )
+
+        # Attach multi-horizon blocks when available
+        try:
+            if "mh" in dir() or "mh" in locals():
+                response["horizons"] = mh.get("horizons")
+                response["final_verdict"] = mh.get("final_verdict")
+                # Prefer short-term as primary decision (project focus)
+                if mh.get("decision"):
+                    response["decision"] = mh["decision"]
+                    response["combined_score"] = mh.get("combined_score", response.get("combined_score"))
+                    response["confidence"] = mh.get("confidence", response.get("confidence"))
+                    response["holding_period"] = mh.get("holding_period", response.get("holding_period"))
+        except Exception as _mh_err:
+            logger.warning("multi-horizon attach failed: %s", _mh_err)
 
         # Cache successful decide payload for free-tier scan speed
         try:

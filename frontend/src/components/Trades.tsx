@@ -40,10 +40,39 @@ export default function Trades() {
   const [showDeposit, setShowDeposit] = useState(false);
   const [depositAmount, setDepositAmount] = useState("10000");
   const [depositing, setDepositing] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [backups, setBackups] = useState<string[]>([]);
+  const [showBackups, setShowBackups] = useState(false);
 
   const showToast = (type: Toast["type"], message: string) => {
     setToast({ type, message });
     setTimeout(() => setToast(null), 4000);
+  };
+
+  const runClearWithBackup = async () => {
+    if (!confirm("Clear all paper trades? A backup will be saved first.")) return;
+    setClearing(true);
+    try {
+      const res = await (api as any).clearTradesBackup?.() ?? await fetch("/api/trades/clear-backup", { method: "POST" }).then(r => r.json());
+      showToast("success", res?.ok ? `Cleared. Backup: ${res.backup_path || "saved"}` : `Clear failed: ${res?.error || "unknown"}`);
+      fetchAll();
+      const list = await (api as any).listTradeBackups?.();
+      if (list?.backups) setBackups(list.backups);
+    } catch (err) {
+      showToast("error", `Clear+backup failed: ${(err as Error).message || "unknown"}`);
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const loadBackups = async () => {
+    try {
+      const list = await (api as any).listTradeBackups?.();
+      setBackups(list?.backups || []);
+      setShowBackups(true);
+    } catch (err) {
+      showToast("error", "Could not load backups");
+    }
   };
 
   const fetchAll = useCallback(async () => {
@@ -147,9 +176,12 @@ export default function Trades() {
         </div>
       )}
 
-      <div className="flex items-center justify-between">
-        <h2 className="font-mono text-sm text-paper uppercase tracking-widest">Portfolio</h2>
-        <div className="flex gap-2">
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h2 className="font-mono text-sm text-paper uppercase tracking-widest">Paper Trading</h2>
+          <p className="text-[11px] text-mist/50 mt-0.5">Groww-style simulator · virtual cash · AI decisions</p>
+        </div>
+        <div className="flex gap-2 flex-wrap">
           <button
             onClick={() => setShowDeposit(true)}
             className="text-xs font-mono uppercase tracking-wider bg-emerald-500/15 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/25 rounded-lg px-3 py-2 transition"
@@ -164,8 +196,39 @@ export default function Trades() {
             {markingToMarket && <Spinner />}
             {markingToMarket ? "Marking..." : "Mark to Market"}
           </button>
+          <button
+            onClick={loadBackups}
+            className="text-xs font-mono uppercase tracking-wider bg-slate/40 hover:bg-slate/60 text-mist rounded-lg px-3 py-2 transition"
+          >
+            Backups
+          </button>
+          <button
+            onClick={runClearWithBackup}
+            disabled={clearing}
+            className="text-xs font-mono uppercase tracking-wider bg-red-500/10 border border-red-500/40 text-red-400 hover:bg-red-500/20 rounded-lg px-3 py-2 disabled:opacity-40 transition"
+          >
+            {clearing ? "Clearing..." : "Clear All + Backup"}
+          </button>
         </div>
       </div>
+
+      {showBackups && (
+        <div className="bg-graphite border border-slate/60 rounded-xl p-4">
+          <div className="flex justify-between items-center mb-2">
+            <h3 className="font-mono text-xs text-mist uppercase tracking-widest">Backup history</h3>
+            <button onClick={() => setShowBackups(false)} className="text-xs text-mist hover:text-paper">Close</button>
+          </div>
+          {backups.length === 0 ? (
+            <p className="text-sm text-mist/60">No backups yet.</p>
+          ) : (
+            <ul className="space-y-1 max-h-40 overflow-auto">
+              {backups.map((b) => (
+                <li key={b} className="font-mono text-xs text-slate-300 border-b border-slate/30 py-1">{b}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       {showDeposit && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/70 backdrop-blur-sm p-4">
@@ -227,7 +290,7 @@ export default function Trades() {
           <div className="font-display text-4xl text-paper mb-4 tabular-nums">
             {fmtMoney(summary.total_equity)}
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
             <StatCard label="Cash Balance" value={fmtMoney(summary.cash_balance)} />
             <StatCard label="In Positions" value={fmtMoney(summary.open_positions_value)} />
             <StatCard
@@ -236,6 +299,31 @@ export default function Trades() {
               highlight={summary.open_positions_pnl >= 0 ? "up" : "down"}
             />
             <StatCard label="Win Rate" value={summary.win_rate == null ? "—" : `${summary.win_rate}%`} />
+            <StatCard
+              label="Avg R"
+              value={
+                (summary as any).avg_r_multiple != null
+                  ? `${Number((summary as any).avg_r_multiple).toFixed(2)}R`
+                  : (summary as any).avg_pnl_pct != null
+                  ? fmtPct((summary as any).avg_pnl_pct)
+                  : "—"
+              }
+            />
+            <StatCard
+              label="Max DD"
+              value={
+                (summary as any).max_drawdown_pct != null
+                  ? `${Number((summary as any).max_drawdown_pct).toFixed(1)}%`
+                  : "—"
+              }
+              highlight="down"
+            />
+          </div>
+          <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] font-mono text-mist/70">
+            <div>Open: <span className="text-paper">{openTrades.length}</span></div>
+            <div>Closed: <span className="text-paper">{closedTrades.length}</span></div>
+            <div>Realized: <span className={summary.realized_pnl >= 0 ? "text-emerald-400" : "text-red-400"}>{fmtMoney(summary.realized_pnl)}</span></div>
+            <div>Equity: <span className="text-paper tabular-nums">{fmtMoney(summary.total_equity)}</span></div>
           </div>
         </div>
       )}

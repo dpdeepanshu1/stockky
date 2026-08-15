@@ -711,6 +711,10 @@ export const api = {
   markTradesToMarket: () =>
     request<{ status: string }>("/training/api/trades/mark-to-market", { method: "POST" }, 1, 30000),
 
+  clearTradesBackup: () =>
+    request<any>("/api/trades/clear-backup", { method: "POST" }),
+  listTradeBackups: () =>
+    request<any>("/api/trades/backups", {}),
   closeTrade: (tradeId: string) =>
     request<{ status: string; trade_id: string; exit_price: number; pnl_pct: number }>(
       `/training/api/trades/${tradeId}/close`, { method: "POST" }, 1, 30000

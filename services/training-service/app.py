@@ -874,3 +874,20 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get('PORT', 5001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+@app.post("/api/trades/clear-backup")
+def api_clear_trades_backup():
+    try:
+        from trades import clear_all_with_backup
+        # db session optional
+        return clear_all_with_backup(None)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.get("/api/trades/backups")
+def api_list_trade_backups():
+    try:
+        from trades import list_trade_backups
+        return list_trade_backups()
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)

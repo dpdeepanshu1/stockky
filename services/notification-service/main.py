@@ -374,3 +374,42 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8008))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
+# ── CallMeBot free Telegram voice call ─────────────────────────────────────
+# Docs: https://www.callmebot.com/blog/free-api-telegram-bot/
+# Env: CALLMEBOT_PHONE=+91xxxxxxxxxx  CALLMEBOT_APIKEY=xxxxx
+# Multi-user: CALLMEBOT_USERS=phone1:apikey1,phone2:apikey2
+import urllib.parse
+
+def _callmebot_users():
+    users = []
+    single_phone = os.getenv("CALLMEBOT_PHONE")
+    single_key = os.getenv("CALLMEBOT_APIKEY")
+    if single_phone and single_key:
+        users.append((single_phone, single_key))
+    raw = os.getenv("CALLMEBOT_USERS", "")
+    for part in raw.split(","):
+        part = part.strip()
+        if ":" in part:
+            ph, key = part.split(":", 1)
+            users.append((ph.strip(), key.strip()))
+    return users
+
+@app.post("/call/me")
+@app.get("/call/me")
+def call_me_now(message: str = "Stockky alert: action required on your picks"):
+    """Manual Call Me Now — free CallMeBot Telegram call/text."""
+    users = _callmebot_users()
+    if not users:
+        return {"ok": False, "error": "Configure CALLMEBOT_PHONE + CALLMEBOT_APIKEY (or CALLMEBOT_USERS)"}
+    results = []
+    for phone, apikey in users:
+        try:
+            text = urllib.parse.quote(message)
+            url = f"https://api.callmebot.com/start.php?source=auth&user={urllib.parse.quote(phone)}&text={text}&apikey={apikey}"
+            # voice-ish path also supported by some CallMeBot endpoints
+            r = httpx.get(url, timeout=20)
+            results.append({"phone": phone, "status": r.status_code, "body": r.text[:200]})
+        except Exception as e:
+            results.append({"phone": phone, "error": str(e)})
+    return {"ok": True, "results": results}

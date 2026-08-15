@@ -738,3 +738,45 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8001))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
+
+# ── Official NSE Bhavcopy + quote delivery % (free) ─────────────────────────
+@app.get("/delivery/{symbol}")
+def get_delivery_pct(symbol: str):
+    """
+    Accurate delivery % for NSE symbols (free tier).
+    Order: Redis cache → NSE quote-equity → official bhavcopy archives → neutral fallback.
+    Never fails the request; always returns a structured payload with `source`.
+    """
+    from bhavcopy import get_delivery
+
+    sym = normalize_symbol(symbol).replace(".NS", "").replace(".BO", "")
+    cache_key = f"delivery:{sym}"
+    cached = _cache_get(cache_key)
+    if cached and isinstance(cached, dict) and cached.get("delivery_pct") is not None:
+        cached = dict(cached)
+        cached["from_cache"] = True
+        return cached
+
+    result = get_delivery(sym)
+    result["from_cache"] = False
+    # Cache real sources longer outside market hours via existing TTL helper
+    ttl = get_cache_ttl()
+    if result.get("source") == "fallback_neutral":
+        ttl = min(ttl, 900)  # retry sooner when we only had a placeholder
+    _cache_set(cache_key, result, ttl=ttl)
+    return result
+
+
+@app.get("/delivery/{symbol}/refresh")
+def refresh_delivery_pct(symbol: str):
+    """Force-refresh delivery (bypass cache) — useful after market close."""
+    from bhavcopy import get_delivery
+
+    sym = normalize_symbol(symbol).replace(".NS", "").replace(".BO", "")
+    cache_key = f"delivery:{sym}"
+    result = get_delivery(sym)
+    result["from_cache"] = False
+    _cache_set(cache_key, result, ttl=get_cache_ttl())
+    return result
+

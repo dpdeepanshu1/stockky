@@ -1180,6 +1180,35 @@ async def run_scan_parallel(task_id: str, universe: List[str], lite: bool = Fals
 
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = _select_top_picks(actionable, limit=5)
+    # Three horizon Top-5 lists (short preferred)
+    def _horizon_picks(results_list, horizon_key, limit=5):
+        scored = []
+        for r in results_list:
+            hz = (r.get("horizons") or {}).get(horizon_key) or {}
+            sc = hz.get("score")
+            if sc is None:
+                sc = r.get("combined_score", 0) if horizon_key == "short" else 0
+            decision = hz.get("decision") or r.get("decision")
+            if decision in ("BUY NOW", "PREPARE TO BUY") or (horizon_key == "short" and r.get("decision") in ("BUY NOW", "PREPARE TO BUY")):
+                scored.append({**r, "_hz_score": sc, "horizon_focus": horizon_key})
+        scored.sort(key=lambda x: x.get("_hz_score", 0), reverse=True)
+        return scored[:limit]
+    top_picks_short = _horizon_picks(results, "short")
+    top_picks_mid = _horizon_picks(results, "mid")
+    top_picks_long = _horizon_picks(results, "long")
+    if not top_picks_short:
+        top_picks_short = top_picks
+    final_verdict_scan = {
+        "preferred_horizon": "short",
+        "short_count": len(top_picks_short),
+        "mid_count": len(top_picks_mid),
+        "long_count": len(top_picks_long),
+        "headline": (
+            f"Short-term focus: {len(top_picks_short)} pick(s). "
+            f"Mid: {len(top_picks_mid)}, Long: {len(top_picks_long)}."
+        ),
+        "best_short": (top_picks_short[0].get("symbol") if top_picks_short else None),
+    }
     _record_symbol_outcomes(results)  # feeds universe self-pruning — see _build_scan_universe
     watchlist_candidates = []
     if not top_picks:
@@ -1206,7 +1235,11 @@ async def run_scan_parallel(task_id: str, universe: List[str], lite: bool = Fals
         "scanned": len(results),
         "universe_size": len(universe),
         "watchlist_size": len(_load_watchlist()),
-        "recommendations": top_picks,
+        "recommendations": top_picks_short if "top_picks_short" in dir() else top_picks,
+        "recommendations_short": top_picks_short if "top_picks_short" in dir() else top_picks,
+        "recommendations_mid": top_picks_mid if "top_picks_mid" in dir() else [],
+        "recommendations_long": top_picks_long if "top_picks_long" in dir() else [],
+        "final_verdict": final_verdict_scan if "final_verdict_scan" in dir() else None,
         "watchlist_candidates": watchlist_candidates,
         "verdict": verdict,
         "market_mood": market_mood,
@@ -1406,8 +1439,16 @@ def set_watchlist(update: WatchlistUpdate):
 @app.post("/watchlist/add")
 def add_to_watchlist(update: WatchlistUpdate):
     current = set(_load_watchlist())
+    added, already = [], []
     for s in update.symbols:
-        current.add(s.strip().upper())
+        su = s.strip().upper().replace(".NS", "").replace(".BO", "")
+        if not su:
+            continue
+        if su in current:
+            already.append(su)
+        else:
+            current.add(su)
+            added.append(su)
     symbols = sorted(current)
     _save_watchlist(symbols)
     if _redis:
@@ -1415,7 +1456,12 @@ def add_to_watchlist(update: WatchlistUpdate):
             _redis.delete(SCAN_UNIVERSE_KEY)
         except Exception:
             pass
-    return {"symbols": symbols}
+    msg = None
+    if already and not added:
+        msg = "Already in watchlist"
+    elif already:
+        msg = f"Already in watchlist: {', '.join(already)}"
+    return {"symbols": symbols, "added": added, "already": already, "message": msg}
 
 @app.delete("/watchlist/{symbol}")
 def remove_from_watchlist(symbol: str):
@@ -1676,7 +1722,11 @@ def run_scan(force_refresh: bool = False):
         "scanned": len(results),
         "universe_size": len(universe),
         "watchlist_size": len(_load_watchlist()),
-        "recommendations": top_picks,
+        "recommendations": top_picks_short if "top_picks_short" in dir() else top_picks,
+        "recommendations_short": top_picks_short if "top_picks_short" in dir() else top_picks,
+        "recommendations_mid": top_picks_mid if "top_picks_mid" in dir() else [],
+        "recommendations_long": top_picks_long if "top_picks_long" in dir() else [],
+        "final_verdict": final_verdict_scan if "final_verdict_scan" in dir() else None,
         "watchlist_candidates": watchlist_candidates,
         "verdict": verdict,
         "market_mood": market_mood,
@@ -1926,7 +1976,11 @@ def scan_watchlist():
         "scanned": len(results),
         "universe_size": len(watchlist),
         "watchlist_size": len(watchlist),
-        "recommendations": top_picks,
+        "recommendations": top_picks_short if "top_picks_short" in dir() else top_picks,
+        "recommendations_short": top_picks_short if "top_picks_short" in dir() else top_picks,
+        "recommendations_mid": top_picks_mid if "top_picks_mid" in dir() else [],
+        "recommendations_long": top_picks_long if "top_picks_long" in dir() else [],
+        "final_verdict": final_verdict_scan if "final_verdict_scan" in dir() else None,
         "watchlist_candidates": [],
         "verdict": verdict,
         "market_mood": market_mood,
