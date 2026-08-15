@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Decision, api, TrainingScore } from "../api";
+import { Decision, api, TrainingScore, FundamentalMetrics } from "../api";
 import { decisionStyle } from "../decisionStyle";
 import StockChart from "./StockChart";
 import { toActionablePick } from "./ScanPanel";
