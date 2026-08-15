@@ -5,6 +5,9 @@ on:
     # Run at minute 50 past every hour from 02:50 to 09:50 UTC
     # This translates to 08:20, 09:20, ... 15:20 IST – giving a 10‑minute buffer before each hour.
     - cron: "50 2-9 * * 1-5"
+    # Extra keep-warm pings during market hours so Render free-tier services
+    # rarely sleep (every ~12 min, Mon–Fri 03:00–10:00 UTC ≈ 08:30–15:30 IST).
+    - cron: "0,12,24,36,48 3-9 * * 1-5"
 
   # Manual trigger with a checkbox to force scan outside market hours
   workflow_dispatch:

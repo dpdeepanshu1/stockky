@@ -73,11 +73,33 @@ def _compute_growth(current, previous):
         return None
     return ((current - previous) / previous) * 100
 
+# Global yfinance concurrency guard (free-tier / Yahoo rate-limit safe).
+# Caps concurrent Yahoo calls across quote + history + fundamentals so a
+# parallel market scan does not stampede Yahoo and get empty responses.
+import threading
+_YFINANCE_MAX_CONCURRENT = int(os.getenv("YFINANCE_MAX_CONCURRENT", "6"))
+_yf_semaphore = threading.Semaphore(_YFINANCE_MAX_CONCURRENT)
+_YF_MIN_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL_SEC", "0.08"))
+_yf_last_call = 0.0
+_yf_lock = threading.Lock()
+
+def _yf_rate_limited(func):
+    """Run func under the yfinance semaphore + small spacing between calls."""
+    global _yf_last_call
+    with _yf_semaphore:
+        with _yf_lock:
+            now = time.time()
+            gap = _YF_MIN_INTERVAL - (now - _yf_last_call)
+            if gap > 0:
+                time.sleep(gap)
+            _yf_last_call = time.time()
+        return func()
+
 def _with_retry(func, max_retries=2, base_delay=0.5):
     """Retry with exponential backoff – reduced retries for speed."""
     for attempt in range(max_retries):
         try:
-            return func()
+            return _yf_rate_limited(func)
         except Exception as e:
             if attempt == max_retries - 1:
                 raise

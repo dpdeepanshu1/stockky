@@ -544,3 +544,59 @@ If you want to sequence these, your own priority order from the request
 prediction universe/retrain → technical indicators → feedback loop) is
 a reasonable one to follow, and item 1 is now done.
 
+# Stockky scan speed fixes — apply instructions
+
+These files keep the **same relative paths** as the Stockky repo root.
+
+## Apply into your existing clone
+
+```bash
+cd /path/to/your/stockky   # your local git clone
+
+# Backup first (optional)
+cp services/api-gateway/main.py services/api-gateway/main.py.bak
+cp services/decision-engine-service/main.py services/decision-engine-service/main.py.bak
+cp services/market-data-service/main.py services/market-data-service/main.py.bak
+
+# Copy patched files on top (from this zip extract folder)
+cp -r /path/to/stockky_speed_fix/services ./
+cp /path/to/stockky_speed_fix/docker-compose.yml ./
+cp /path/to/stockky_speed_fix/.env.example ./
+cp /path/to/stockky_speed_fix/.github/workflows/scheduler.yml ./.github/workflows/
+```
+
+Or from the zip extract directory itself:
+
+```bash
+cd stockky_speed_fix
+cp -r services docker-compose.yml .env.example /path/to/your/stockky/
+cp .github/workflows/scheduler.yml /path/to/your/stockky/.github/workflows/
+```
+
+## Env (add to your .env)
+
+```
+MAX_PARALLEL_SCAN_WORKERS=18
+WAKE_BEFORE_SCAN=true
+WAKE_WAIT_SECONDS=8
+LAST_FULL_SCAN_TTL=900
+DECIDE_CACHE_TTL_OPEN=300
+DECIDE_CACHE_TTL_CLOSED=21600
+SCAN_LITE_DEFAULT=false
+YFINANCE_MAX_CONCURRENT=6
+YFINANCE_MIN_INTERVAL_SEC=0.08
+DECIDE_BATCH_MAX=25
+DECIDE_BATCH_CONCURRENCY=8
+```
+
+## Restart
+
+```bash
+docker compose up -d --build api-gateway decision-engine-service market-data-service
+```
+
+## Scan API
+
+- Normal: POST /scan/start
+- Force new: POST /scan/start?force_refresh=true
+- Fast free-tier: POST /scan/start?lite=true

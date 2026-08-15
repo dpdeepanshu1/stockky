@@ -8,6 +8,8 @@ services:
     environment:
       UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
       UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
+      YFINANCE_MAX_CONCURRENT: ${YFINANCE_MAX_CONCURRENT:-6}
+      YFINANCE_MIN_INTERVAL_SEC: ${YFINANCE_MIN_INTERVAL_SEC:-0.08}
 
   technical-analysis-service:
     build: ./services/technical-analysis-service
@@ -80,6 +82,12 @@ services:
       NEWS_URL: https://news-intelligence-service.onrender.com
       EVENT_URL: https://event-tracker-service-m1lw.onrender.com
       PREDICTION_URL: https://prediction-service-wowb.onrender.com
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
+      DECIDE_CACHE_TTL_OPEN: ${DECIDE_CACHE_TTL_OPEN:-300}
+      DECIDE_CACHE_TTL_CLOSED: ${DECIDE_CACHE_TTL_CLOSED:-21600}
+      DECIDE_BATCH_MAX: ${DECIDE_BATCH_MAX:-25}
+      DECIDE_BATCH_CONCURRENCY: ${DECIDE_BATCH_CONCURRENCY:-8}
     depends_on:
       - technical-analysis-service
       - fundamental-analysis-service
@@ -96,6 +104,13 @@ services:
       NOTIFICATION_URL: https://notification-service-36py.onrender.com
       UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
       UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
+      MAX_PARALLEL_SCAN_WORKERS: ${MAX_PARALLEL_SCAN_WORKERS:-18}
+      WAKE_BEFORE_SCAN: ${WAKE_BEFORE_SCAN:-true}
+      WAKE_WAIT_SECONDS: ${WAKE_WAIT_SECONDS:-8}
+      LAST_FULL_SCAN_TTL: ${LAST_FULL_SCAN_TTL:-900}
+      DECIDE_CACHE_TTL_OPEN: ${DECIDE_CACHE_TTL_OPEN:-300}
+      DECIDE_CACHE_TTL_CLOSED: ${DECIDE_CACHE_TTL_CLOSED:-21600}
+      SCAN_LITE_DEFAULT: ${SCAN_LITE_DEFAULT:-false}
     depends_on:
       - decision-engine-service
       - notification-service

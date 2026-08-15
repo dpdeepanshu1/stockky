@@ -4,14 +4,17 @@ Changes:
 - Fetches market sentiment from API Gateway's /market/indices endpoint (fast and reliable)
 - Always includes the live market_score in the response
 - Added retry and logging
+- Speed: in-process + Redis decide cache, bulk /decide/batch endpoint (free-tier friendly)
 """
 import os
+import json
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from enum import Enum
+from zoneinfo import ZoneInfo
 import httpx
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -30,7 +33,68 @@ TRAINING_SERVICE_URL = os.getenv("TRAINING_SERVICE_URL", "https://training-servi
 EARNINGS_RISK_DAYS = 3
 EARNINGS_BOOST_DAYS = 7
 
-app = FastAPI(title="Stockky Decision Engine", version="0.7.3")
+# ── Decide cache (avoids re-running full fan-out for same symbol within TTL) ──
+IST = ZoneInfo("Asia/Kolkata")
+DECIDE_CACHE_TTL_OPEN = int(os.getenv("DECIDE_CACHE_TTL_OPEN", "300"))
+DECIDE_CACHE_TTL_CLOSED = int(os.getenv("DECIDE_CACHE_TTL_CLOSED", "21600"))
+BATCH_MAX_SYMBOLS = int(os.getenv("DECIDE_BATCH_MAX", "25"))
+BATCH_CONCURRENCY = int(os.getenv("DECIDE_BATCH_CONCURRENCY", "8"))
+
+_decide_mem_cache: dict = {}  # symbol -> (expires_ts, payload)
+_redis = None
+try:
+    from upstash_redis import Redis
+    _url = os.getenv("UPSTASH_REDIS_REST_URL")
+    _tok = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+    if _url and _tok:
+        _redis = Redis(url=_url, token=_tok)
+        _redis.ping()
+        logger.info("Decision-engine connected to Upstash Redis for decide cache")
+except Exception as e:
+    logger.warning("Decision-engine Redis cache unavailable: %s", e)
+
+def _is_market_open() -> bool:
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return (t.hour > 9 or (t.hour == 9 and t.minute >= 15)) and (t.hour < 15 or (t.hour == 15 and t.minute <= 30))
+
+def _cache_ttl() -> int:
+    return DECIDE_CACHE_TTL_OPEN if _is_market_open() else DECIDE_CACHE_TTL_CLOSED
+
+def _cache_get_decide(symbol: str):
+    sym = symbol.upper().replace(".NS", "").replace(".BO", "")
+    now = time_module_time()
+    entry = _decide_mem_cache.get(sym)
+    if entry and entry[0] > now:
+        return entry[1]
+    if _redis:
+        try:
+            raw = _redis.get(f"decide:{sym}")
+            if raw:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                _decide_mem_cache[sym] = (now + _cache_ttl(), data)
+                return data
+        except Exception:
+            pass
+    return None
+
+def _cache_set_decide(symbol: str, payload: dict):
+    sym = symbol.upper().replace(".NS", "").replace(".BO", "")
+    ttl = _cache_ttl()
+    _decide_mem_cache[sym] = (time_module_time() + ttl, payload)
+    if _redis:
+        try:
+            _redis.setex(f"decide:{sym}", ttl, json.dumps(payload, default=str))
+        except Exception:
+            pass
+
+def time_module_time():
+    import time as _t
+    return _t.time()
+
+app = FastAPI(title="Stockky Decision Engine", version="0.7.4")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -55,7 +119,8 @@ class Decision(str, Enum):
 
 @app.get("/")
 def root():
-    return {"service": "Stockky Decision Engine", "version": "0.7.3", "status": "running"}
+    return {"service": "Stockky Decision Engine", "version": "0.7.4", "status": "running",
+            "features": ["decide_cache", "decide_batch"]}
 
 
 @app.get("/health")
@@ -441,7 +506,14 @@ async def record_prediction_for_training(
 
 # ── Main route ────────────────────────────────────────────────────
 @app.get("/decide/{symbol}")
-async def decide(symbol: str, already_owned: bool = False, background_tasks: BackgroundTasks = None):
+async def decide(symbol: str, already_owned: bool = False, background_tasks: BackgroundTasks = None, force: bool = False):
+    # Speed: serve from decide cache unless force=true
+    if not force:
+        cached = _cache_get_decide(symbol)
+        if cached and isinstance(cached, dict) and cached.get("decision"):
+            cached = dict(cached)
+            cached["from_cache"] = True
+            return cached
     try:
         async with httpx.AsyncClient(timeout=70) as client:
             technical_task = asyncio.create_task(_fetch_optional(client, f"{TECHNICAL_URL}/analyze/{symbol}", "Technical"))
@@ -697,6 +769,13 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
                 fundamental_metrics=fundamental.get("metrics")
             )
 
+        # Cache successful decide payload for free-tier scan speed
+        try:
+            _cache_set_decide(symbol, response)
+        except Exception as ce:
+            logger.warning("decide cache set failed: %s", ce)
+        if isinstance(response, dict):
+            response["from_cache"] = False
         return response
 
     except Exception as e:
@@ -732,3 +811,34 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             "data_insufficient": True,
             "fundamental_fallback": True,
         }
+
+# ── Bulk decide (optional speed path for scan / GitHub Actions) ─────────────
+@app.post("/decide/batch")
+async def decide_batch(request: Request):
+    """
+    Analyse up to BATCH_MAX_SYMBOLS symbols with bounded concurrency.
+    Uses the same /decide logic (and its cache). Does not change scoring.
+    """
+    body = await request.json()
+    symbols = body.get("symbols") or []
+    force = bool(body.get("force", False))
+    if not isinstance(symbols, list) or not symbols:
+        raise HTTPException(status_code=400, detail="symbols list required")
+    if len(symbols) > BATCH_MAX_SYMBOLS:
+        raise HTTPException(status_code=400, detail=f"Maximum {BATCH_MAX_SYMBOLS} symbols per batch")
+
+    sem = asyncio.Semaphore(BATCH_CONCURRENCY)
+
+    async def one(sym: str):
+        async with sem:
+            return await decide(sym, force=force)
+
+    results = await asyncio.gather(*(one(s) for s in symbols), return_exceptions=True)
+    out = []
+    for sym, res in zip(symbols, results):
+        if isinstance(res, Exception):
+            out.append({"symbol": str(sym).upper(), "decision": "DO NOT BUY", "error": str(res), "combined_score": 0})
+        else:
+            out.append(res)
+    return {"results": out, "count": len(out)}
+

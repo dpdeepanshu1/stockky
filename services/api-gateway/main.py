@@ -114,6 +114,14 @@ INDICES_LAST_KNOWN  = "stockky:indices_last_known"
 
 FUNDAMENTAL_CACHE_PREFIX = "stockky:fundamental:"
 EVENT_CACHE_PREFIX = "stockky:event:"
+LAST_FULL_SCAN_KEY = "stockky:last_full_scan"
+LAST_FULL_SCAN_TTL = int(os.getenv("LAST_FULL_SCAN_TTL", "900"))  # 15 min default
+DECIDE_CACHE_PREFIX = "stockky:decide_cache:"
+DECIDE_CACHE_TTL_OPEN = int(os.getenv("DECIDE_CACHE_TTL_OPEN", "300"))   # 5 min market open
+DECIDE_CACHE_TTL_CLOSED = int(os.getenv("DECIDE_CACHE_TTL_CLOSED", "21600"))  # 6 h closed
+SCAN_LITE_DEFAULT = os.getenv("SCAN_LITE_DEFAULT", "false").lower() in ("1", "true", "yes")
+WAKE_BEFORE_SCAN = os.getenv("WAKE_BEFORE_SCAN", "true").lower() in ("1", "true", "yes")
+WAKE_WAIT_SECONDS = float(os.getenv("WAKE_WAIT_SECONDS", "8"))
 
 # ── Symbol Aliases ──────────────────────────────────────────────────────────
 SYMBOL_ALIASES: Dict[str, Union[str, List[str]]] = {
@@ -872,26 +880,91 @@ def _wake_notification_service() -> bool:
 # ⚡ PARALLEL SCAN with reduced workers and retries
 # ============================================================================
 
-MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "10"))
+# Free-tier friendly default: 18 workers (was 10). Override via env.
+# Pair with market-data yfinance semaphore to avoid Yahoo rate limits.
+MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_SCAN_WORKERS", "18"))
 MAX_RETRIES = 1
 RETRY_BACKOFF = 1.0
+
+def _is_market_open_ist() -> bool:
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return (t.hour > 9 or (t.hour == 9 and t.minute >= 15)) and (t.hour < 15 or (t.hour == 15 and t.minute <= 30))
+
+def _decide_cache_ttl() -> int:
+    return DECIDE_CACHE_TTL_OPEN if _is_market_open_ist() else DECIDE_CACHE_TTL_CLOSED
+
+def _prioritize_universe(universe: List[str]) -> List[str]:
+    """Watchlist + recently searched first so useful results appear early; rest of universe unchanged."""
+    watch = _load_watchlist()
+    searched = _load_searched()
+    priority = []
+    seen = set()
+    for s in watch + searched:
+        su = s.upper().replace(".NS", "").replace(".BO", "")
+        if su and su not in seen and su in set(u.upper().replace(".NS", "").replace(".BO", "") for u in universe):
+            priority.append(su)
+            seen.add(su)
+    rest = []
+    for s in universe:
+        su = s.upper().replace(".NS", "").replace(".BO", "")
+        if su and su not in seen:
+            rest.append(su)
+            seen.add(su)
+    return priority + rest
+
+async def _wake_required_services(client: httpx.AsyncClient = None) -> dict:
+    """Ping /health on all SYSTEM_SERVICES so Render free-tier cold starts finish before scan work."""
+    own_client = client is None
+    if own_client:
+        client = httpx.AsyncClient(timeout=8)
+    results = {}
+    try:
+        async def ping(name: str, url: str):
+            if not url:
+                return name, {"ok": False, "error": "no url"}
+            try:
+                r = await client.get(f"{url.rstrip('/')}/health")
+                return name, {"ok": r.status_code == 200, "status": r.status_code}
+            except Exception as e:
+                return name, {"ok": False, "error": str(e)[:120]}
+        pairs = await asyncio.gather(*(ping(n, cfg["url"]) for n, cfg in SYSTEM_SERVICES.items()))
+        results = dict(pairs)
+    finally:
+        if own_client:
+            await client.aclose()
+    return results
 
 async def _analyze_one_symbol_ultra(
     symbol: str,
     client: httpx.AsyncClient,
-    sem: asyncio.Semaphore
+    sem: asyncio.Semaphore,
+    lite: bool = False,
 ) -> dict:
     """
     Analyse one symbol with parallel internal calls and caching.
     Timeouts: decision 90s, others 60s.
+    Speed fixes:
+    - Prefer data already returned by Decision Engine (avoid duplicate fund/news/event/pred fetches).
+    - Optional decide-level Redis cache.
+    - lite=True skips Gemini summary + optional enrichment when Decision already filled fields.
     """
     async with sem:
         for attempt in range(MAX_RETRIES + 1):
             try:
-                decision_resp = await client.get(f"{DECISION_URL}/decide/{symbol}", timeout=90)
-                decision_resp.raise_for_status()
-                raw = decision_resp.json()
-                normalized = _normalize_decision_response(raw, symbol)
+                # ── Decide-level cache (same symbol within TTL → instant) ──
+                cache_key = f"{DECIDE_CACHE_PREFIX}{symbol.upper()}"
+                cached_decide = _redis_get(cache_key)
+                if cached_decide and isinstance(cached_decide, dict) and cached_decide.get("decision"):
+                    normalized = _normalize_decision_response(cached_decide, symbol)
+                else:
+                    decision_resp = await client.get(f"{DECISION_URL}/decide/{symbol}", timeout=90)
+                    decision_resp.raise_for_status()
+                    raw = decision_resp.json()
+                    normalized = _normalize_decision_response(raw, symbol)
+                    _redis_set(cache_key, normalized, ttl=_decide_cache_ttl())
 
                 if normalized.get("close") is None:
                     price = _fetch_price_from_quote(symbol)
@@ -902,45 +975,71 @@ async def _analyze_one_symbol_ultra(
                         if normalized.get("resistance") is None:
                             normalized["resistance"] = round(price * 1.05, 2)
 
-                fund_task = _fetch_fundamental_cached(symbol, client)
-                event_task = _fetch_events_cached(symbol, client)
-                news_task = _fetch_news_cached(symbol, client)
-                pred_task = _fetch_prediction_cached(symbol, client)
+                # Only fetch extras when Decision Engine did not already supply them
+                need_fund = not normalized.get("fundamental_metrics")
+                need_event = not normalized.get("event_data") and not normalized.get("event_risk")
+                need_news = normalized.get("news_score") is None
+                need_pred = normalized.get("prediction_score") is None
 
-                fund_metrics, fund_fallback = await fund_task
-                event_data = await event_task
-                news_data = await news_task
-                pred_score, pred_note = await pred_task
+                if not lite:
+                    tasks = {}
+                    if need_fund:
+                        tasks["fund"] = asyncio.create_task(_fetch_fundamental_cached(symbol, client))
+                    if need_event:
+                        tasks["event"] = asyncio.create_task(_fetch_events_cached(symbol, client))
+                    if need_news:
+                        tasks["news"] = asyncio.create_task(_fetch_news_cached(symbol, client))
+                    if need_pred:
+                        tasks["pred"] = asyncio.create_task(_fetch_prediction_cached(symbol, client))
 
-                if fund_metrics:
-                    normalized["fundamental_metrics"] = fund_metrics
-                    normalized["fundamental_fallback"] = fund_fallback
+                    if tasks:
+                        await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-                if event_data:
-                    # Previously only next_earnings_date survived here —
-                    # whatever else event-tracker-service returns (bulk
-                    # deals, insider trades, mutual fund holding changes,
-                    # etc.) was silently discarded. Passing the raw dict
-                    # through lets the frontend show it; this gateway
-                    # doesn't know that service's exact schema to pick
-                    # specific fields out of it without guessing.
-                    normalized["event_data"] = event_data
-                    if event_data.get("next_earnings_date"):
-                        normalized["event_risk"] = True
-                        reasons = normalized.get("reasons", {})
-                        reasons["event"] = [f"Earnings due: {event_data['next_earnings_date']}"]
-                        normalized["reasons"] = reasons
+                    if "fund" in tasks:
+                        fund_res = tasks["fund"].result() if not tasks["fund"].exception() else ({}, True)
+                        if isinstance(fund_res, tuple):
+                            fund_metrics, fund_fallback = fund_res
+                        else:
+                            fund_metrics, fund_fallback = {}, True
+                        if fund_metrics:
+                            normalized["fundamental_metrics"] = fund_metrics
+                            normalized["fundamental_fallback"] = fund_fallback
 
-                if news_data:
-                    normalized["news_score"] = news_data.get("news_score")
-                    reasons = normalized.get("reasons", {})
-                    if news_data.get("reasons"):
-                        reasons["news"] = news_data["reasons"]
-                        normalized["reasons"] = reasons
+                    if "event" in tasks:
+                        event_data = tasks["event"].result() if not tasks["event"].exception() else None
+                        if event_data:
+                            # Previously only next_earnings_date survived here —
+                            # whatever else event-tracker-service returns (bulk
+                            # deals, insider trades, mutual fund holding changes,
+                            # etc.) was silently discarded. Passing the raw dict
+                            # through lets the frontend show it; this gateway
+                            # doesn't know that service's exact schema to pick
+                            # specific fields out of it without guessing.
+                            normalized["event_data"] = event_data
+                            if event_data.get("next_earnings_date"):
+                                normalized["event_risk"] = True
+                                reasons = normalized.get("reasons", {})
+                                reasons["event"] = [f"Earnings due: {event_data['next_earnings_date']}"]
+                                normalized["reasons"] = reasons
 
-                if pred_score is not None:
-                    normalized["prediction_score"] = pred_score
-                    normalized["prediction_note"] = pred_note
+                    if "news" in tasks:
+                        news_data = tasks["news"].result() if not tasks["news"].exception() else None
+                        if news_data:
+                            normalized["news_score"] = news_data.get("news_score")
+                            reasons = normalized.get("reasons", {})
+                            if news_data.get("reasons"):
+                                reasons["news"] = news_data["reasons"]
+                                normalized["reasons"] = reasons
+
+                    if "pred" in tasks:
+                        pred_res = tasks["pred"].result() if not tasks["pred"].exception() else (None, None)
+                        if isinstance(pred_res, tuple):
+                            pred_score, pred_note = pred_res
+                        else:
+                            pred_score, pred_note = None, None
+                        if pred_score is not None:
+                            normalized["prediction_score"] = pred_score
+                            normalized["prediction_note"] = pred_note
 
                 # Adds a concrete calendar-date holding period estimate
                 # alongside whatever decision-engine's own holding_period
@@ -952,7 +1051,16 @@ async def _analyze_one_symbol_ultra(
                 normalized["holding_period_estimate"] = _estimate_holding_period(
                     entry_price, normalized.get("target"), normalized.get("decision")
                 )
-                normalized["natural_language_summary"] = await _generate_ai_summary(normalized, client)
+                # Gemini only when not lite (full enrichment); top-picks can request it later
+                if not lite:
+                    normalized["natural_language_summary"] = await _generate_ai_summary(normalized, client)
+                else:
+                    normalized["natural_language_summary"] = _generate_summary(normalized) if "_generate_summary" in dir() else None
+                    if normalized.get("natural_language_summary") is None:
+                        try:
+                            normalized["natural_language_summary"] = _generate_summary(normalized)
+                        except Exception:
+                            normalized["natural_language_summary"] = None
                 return normalized
 
             except httpx.HTTPError as e:
@@ -981,8 +1089,10 @@ async def _analyze_one_symbol_ultra(
                 }
         return {"symbol": symbol, "decision": "ERROR", "error": "Max retries exceeded"}
 
-async def run_scan_parallel(task_id: str, universe: List[str]):
+async def run_scan_parallel(task_id: str, universe: List[str], lite: bool = False):
     start_time = time.time()
+    # Prioritize watchlist / searched so useful picks surface early without shrinking universe
+    universe = _prioritize_universe(universe)
     total = len(universe)
     processed = 0
     results = []
@@ -995,6 +1105,7 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
         "elapsed": 0,
         "result": None,
         "error": None,
+        "lite": lite,
     }, ttl=3600)
 
     sem = asyncio.Semaphore(MAX_PARALLEL_WORKERS)
@@ -1002,6 +1113,15 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
     cancelled = False
     cancel_key = SCAN_TASK_PREFIX + task_id + ":cancel"
     async with httpx.AsyncClient(timeout=240, limits=limits) as client:
+        # Wake services first on free-tier so cold starts don't serialize into every symbol
+        if WAKE_BEFORE_SCAN:
+            try:
+                wake_results = await _wake_required_services(client)
+                logger.info("Pre-scan wake: %s", {k: v.get("ok") for k, v in wake_results.items()})
+                await asyncio.sleep(min(WAKE_WAIT_SECONDS, 15.0))
+            except Exception as e:
+                logger.warning("Pre-scan wake failed (continuing): %s", e)
+
         # asyncio.ensure_future wraps each coroutine as a real Task —
         # bare coroutines (what `_analyze_one_symbol_ultra(...)` returns
         # before being scheduled) don't have .done()/.cancel() at all.
@@ -1012,7 +1132,7 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
         # writes the finalized "done" status, which is exactly why
         # Stop Scan appeared to hang forever with no summary.
         tasks = [
-            asyncio.ensure_future(_analyze_one_symbol_ultra(sym, client, sem))
+            asyncio.ensure_future(_analyze_one_symbol_ultra(sym, client, sem, lite=lite))
             for sym in universe
         ]
 
@@ -1101,14 +1221,28 @@ async def run_scan_parallel(task_id: str, universe: List[str]):
         "errors": errors,
     }
 
+    elapsed_final = round(time.time() - start_time, 1)
+    final_result["elapsed_seconds"] = elapsed_final
+    final_result["lite"] = lite
+    final_result["scanned_at"] = datetime.now(IST).isoformat()
+
     _redis_set(SCAN_TASK_PREFIX + task_id, {
         "status": "done",
         "total": total,
         "processed": processed,
-        "elapsed": round(time.time() - start_time, 1),
+        "elapsed": elapsed_final,
         "result": final_result,
         "error": None,
     }, ttl=3600)
+
+    # Cache full scan result so repeated "Run market scan" within TTL is instant
+    if not cancelled and results:
+        _redis_set(LAST_FULL_SCAN_KEY, {
+            "task_id": task_id,
+            "result": final_result,
+            "scanned_at": final_result["scanned_at"],
+            "universe_size": final_result["universe_size"],
+        }, ttl=LAST_FULL_SCAN_TTL)
 
     _send_scan_notification(final_result.get("recommendations", []), final_result["verdict"], final_result["scanned"], final_result["universe_size"])
 
@@ -1589,18 +1723,54 @@ async def scan_batch(request: Request):
 
 # ── Async scan endpoints ──────────────────────────────────────────────────
 @app.post("/scan/start")
-def start_scan(force_refresh: bool = False, background_tasks: BackgroundTasks = None):
+def start_scan(
+    force_refresh: bool = False,
+    lite: bool = None,
+    background_tasks: BackgroundTasks = None,
+):
+    """
+    Start async parallel market scan.
+    - force_refresh: rebuild universe + ignore last-scan cache
+    - lite: skip Gemini + redundant enrichment when Decision already has data (faster on free tier)
+    If a recent full scan exists (LAST_FULL_SCAN_TTL) and force_refresh is false, returns cached task.
+    """
     try:
+        use_lite = SCAN_LITE_DEFAULT if lite is None else bool(lite)
+
         if force_refresh and _redis:
             try:
                 _redis.delete(SCAN_UNIVERSE_KEY)
+                _redis.delete(LAST_FULL_SCAN_KEY)
             except Exception:
                 pass
 
+        # Serve recent scan from cache unless force_refresh
+        if not force_refresh:
+            cached = _redis_get(LAST_FULL_SCAN_KEY)
+            if cached and isinstance(cached, dict) and cached.get("result"):
+                task_id = cached.get("task_id") or str(uuid.uuid4())
+                # Re-publish as a finished task so /scan/status works the same
+                _redis_set(SCAN_TASK_PREFIX + task_id, {
+                    "status": "done",
+                    "total": cached["result"].get("universe_size", 0),
+                    "processed": cached["result"].get("scanned", 0),
+                    "elapsed": cached["result"].get("elapsed_seconds", 0),
+                    "result": cached["result"],
+                    "error": None,
+                    "from_cache": True,
+                    "scanned_at": cached.get("scanned_at"),
+                }, ttl=3600)
+                return {
+                    "task_id": task_id,
+                    "from_cache": True,
+                    "scanned_at": cached.get("scanned_at"),
+                    "message": "Returning recent scan result (within cache TTL). Use force_refresh=true for a new run.",
+                }
+
         universe = _build_scan_universe()
         task_id = str(uuid.uuid4())
-        background_tasks.add_task(run_scan_parallel, task_id, universe)
-        return {"task_id": task_id}
+        background_tasks.add_task(run_scan_parallel, task_id, universe, use_lite)
+        return {"task_id": task_id, "from_cache": False, "lite": use_lite, "universe_size": len(universe)}
     except Exception as e:
         logger.error(f"Scan start failed: {e}")
         raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
