@@ -66,12 +66,7 @@ export interface Decision {
   data_insufficient?: boolean;
   fundamental_fallback?: boolean;
   event_score_delta?: number;
-  // NEW: raw pass-through from event-tracker-service — shape isn't fixed
-  // on the gateway side (it just forwards whatever that service returns),
-  // so treat as unknown and render defensively.
   event_data?: Record<string, unknown> | null;
-  // NEW: concrete calendar-date estimate alongside the (often static)
-  // holding_period string.
   holding_period_estimate?: {
     min_days: number;
     max_days: number;
@@ -79,8 +74,6 @@ export interface Decision {
     expected_by_latest: string;
     label: string;
   } | null;
-  // NEW: separate signal from the short-term decision — a stock can be a
-  // strong long-term hold candidate independent of current entry timing.
   long_term_hold?: boolean;
   long_term_hold_estimate?: {
     min_months: number;
@@ -167,14 +160,13 @@ export interface SystemHealth {
 // Training Service types – updated to match actual responses
 // ───────────────────────────────────────────────
 
-/** The status response from the training service (matches /api/status) */
 export interface TrainingStatusResponse {
   service_url: string;
   production_model_exists: boolean;
   last_training: string | null;
   dataset_size: number;
   num_symbols: number;
-  metrics: Record<string, number>;          // walk-forward metrics
+  metrics: Record<string, number>;
   fold_details: Array<{
     fold: number;
     train_start: string;
@@ -185,16 +177,14 @@ export interface TrainingStatusResponse {
     val_samples: number;
   }>;
   model_version: string | null;
-  training_in_progress: boolean;   // <-- ADDED THIS
+  training_in_progress: boolean;
 }
 
-/** Response from triggering training */
 export interface TriggerTrainingResponse {
   status: string;
   service_url?: string;
 }
 
-// Keep the old type for backward compatibility (if still used elsewhere)
 export interface TrainingModelStatus {
   production_model: {
     version: string;
@@ -250,19 +240,13 @@ export interface TrainingScore {
   }>;
 }
 
-// ── NEW: prediction history / rollups / trades / actionable-commit ──
-// These call NEW api-gateway routes (see the spec at the end of this file's
-// companion chat message) that don't exist yet — added here so the
-// frontend and training-service contract is defined and ready, but each
-// will 404 until api-gateway adds a matching route.
-
 export interface PredictionHistoryItem {
   prediction_id: string;
   symbol: string;
   timestamp: string;
   decision: string;
   price: number;
-  t1_success: number; // 0 pending, 1 success, 2 failed
+  t1_success: number;
   t5_success: number;
   outcomes: Array<{ period: string; return_pct: number | null; success: number }>;
 }
@@ -303,9 +287,6 @@ export interface PaperTrade {
   last_marked_at: string | null;
 }
 
-// Replaces the old fixed-pot-per-trade TradeSummary shape — trades now
-// share one portfolio balance (see trades.py), so the summary reports
-// cash_balance/total_equity instead of a simple capital_deployed total.
 export interface PortfolioSummary {
   cash_balance: number;
   total_deposited: number;
@@ -397,7 +378,7 @@ export interface ActionableCommitResult {
 }
 
 // ───────────────────────────────────────────────
-// Market Indices types (updated with fetched_at & stale)
+// Market Indices types
 // ───────────────────────────────────────────────
 
 export interface IndexData {
@@ -411,8 +392,33 @@ export interface MarketIndicesResponse {
   sensex: IndexData;
   market_mood: "BULLISH" | "BEARISH" | "NEUTRAL";
   market_score: number;
-  fetched_at?: string;   // ISO timestamp when data was fetched
-  stale?: boolean;       // true if data is from cache/stale
+  fetched_at?: string;
+  stale?: boolean;
+}
+
+// ───────────────────────────────────────────────
+// Event types (from first file)
+// ───────────────────────────────────────────────
+
+export interface EventItem {
+  type: string;
+  date: string | null;
+  description: string;
+}
+
+export interface InstitutionalHolder {
+  holder: string;
+  shares: number | null;
+  pct_held: number | null;
+}
+
+export interface CategorizedEvents {
+  symbol: string;
+  upcoming: EventItem[];
+  recent: EventItem[];
+  recent_changes: string[];
+  institutional_holders: InstitutionalHolder[];
+  checked_at: string | null;
 }
 
 // ───────────────────────────────────────────────
@@ -496,10 +502,6 @@ export const api = {
   scanStatus: (taskId: string) =>
     request<ScanStatus>(`/scan/status/${taskId}`, undefined, 2, 10000),
 
-  /** Cancels a running scan. api-gateway checks this periodically inside
-   * run_scan_parallel (every 3rd completed symbol) and finalizes the task
-   * as "done" with whatever was actually scored so far, instead of an
-   * empty or error result. */
   scanCancel: (taskId: string) =>
     request<{ status: string; processed_so_far?: number; total?: number }>(
       `/scan/cancel/${taskId}`, { method: "POST" }, 1, 10000
@@ -534,9 +536,6 @@ export const api = {
       30000
     ),
 
-  /** Same endpoint as addToWatchlist, just sending more than one symbol —
-   * api-gateway already dedupes via a Python set server-side, so adding a
-   * symbol that's already on the watchlist is a safe no-op either way. */
   addManyToWatchlist: (symbols: string[]) =>
     request<{ symbols: string[] }>(
       "/watchlist/add",
@@ -554,7 +553,6 @@ export const api = {
   marketMostActive: () => request<MarketResponse>("/market/most-active", undefined, 2, 30000),
   marketTrending: () => request<MarketResponse>("/market/trending", undefined, 2, 30000),
 
-  // ── Market Indices (accepts forceRefresh) ──
   marketIndices: (forceRefresh = false) =>
     request<MarketIndicesResponse>(
       `/market/indices?force_refresh=${forceRefresh}`,
@@ -607,25 +605,10 @@ export const api = {
     ),
 
   // ─── Training Service endpoints ───
-  //
-  // api-gateway has 3 specific /training/* routes (status, train, score)
-  // that hit training-service's bare aliases (/model-status, /train,
-  // /training-score/{symbol}) with no query-param passthrough — plus a
-  // catch-all `@app.api_route("/training/{path:path}")` that forwards
-  // everything else to training-service verbatim, including query
-  // params. Every method below except getTrainingStatus/getTrainingScore
-  // goes through that catch-all, so the path here must exactly match the
-  // real training-service route including its /api/ prefix — no new
-  // gateway routes are needed for any of these, they already work.
 
-  /** Get the current training status (matches TrainingStatusResponse).
-   * Hits the specific gateway route -> training-service's bare /model-status. */
   getTrainingStatus: () =>
     request<TrainingStatusResponse>("/training/status", undefined, 2, 30000),
 
-  /** Trigger a new training run. Goes through the catch-all (not the
-   * specific /training/train route, which doesn't forward query params)
-   * so label_source actually reaches training-service's /api/train. */
   triggerTraining: (labelSource: "t1_outcome" | "trade_pnl" = "t1_outcome") =>
     request<TriggerTrainingResponse>(
       `/training/api/train?label_source=${labelSource}`,
@@ -634,36 +617,26 @@ export const api = {
       60000
     ),
 
-  /** Get training score for a specific symbol. Hits the specific gateway
-   * route -> training-service's bare /training-score/{symbol}. */
   getTrainingScore: (symbol: string) =>
     request<TrainingScore>(`/training/score/${symbol}`, undefined, 2, 30000),
 
-  /** Stop a running training job — actually interrupts the fit in
-   * progress (abort_event / XGBoost callback), not just unblocks a new
-   * run. Goes through the catch-all to training-service's bare DELETE /lock. */
   clearTrainingLock: () =>
     request<{ status: string }>("/training/lock", { method: "DELETE" }, 1, 15000),
 
-  /** Recent predictions with T+1/T+5 outcomes. */
   getPredictionHistory: (limit = 20) =>
     request<{ predictions: PredictionHistoryItem[]; total: number }>(
       `/training/api/predictions/history?limit=${limit}`, undefined, 2, 30000
     ),
 
-  /** Day-by-day pick tracking. */
   getDailyRollup: (days = 30) =>
     request<PeriodRollupItem[]>(`/training/api/metrics/daily?days=${days}`, undefined, 2, 30000),
 
-  /** Week-by-week pick tracking. */
   getWeeklyRollup: (weeks = 12) =>
     request<PeriodRollupItem[]>(`/training/api/metrics/weekly?weeks=${weeks}`, undefined, 2, 30000),
 
-  /** Manual evaluation sweep. */
   triggerEvaluation: (period: "t1" | "t5") =>
     request<{ status: string }>(`/training/api/evaluate/${period}`, { method: "POST" }, 1, 30000),
 
-  /** The "Add all actionable stocks to training" / "Trade This" button. */
   commitActionablePicks: (picks: ActionablePick[], capitalPerTrade = 10000, openTrades = true) =>
     request<{ results: ActionableCommitResult[] }>(
       "/training/api/actionable/commit",
@@ -679,11 +652,9 @@ export const api = {
   getTrades: (status: "open" | "closed" | "all" = "all") =>
     request<PaperTrade[]>(`/training/api/trades?status=${status}`, undefined, 2, 30000),
 
-  /** Returns PortfolioSummary — trades share one balance, see trades.py. */
   getTradesSummary: () =>
     request<PortfolioSummary>("/training/api/trades/summary", undefined, 2, 30000),
 
-  /** Same data, clearer name. */
   getPortfolioSummary: () =>
     request<PortfolioSummary>("/training/api/portfolio/summary", undefined, 2, 30000),
 
@@ -701,9 +672,12 @@ export const api = {
   getWeeklyTradeReport: (weeks = 12) =>
     request<TradeReportBucket[]>(`/training/api/trades/report/weekly?weeks=${weeks}`, undefined, 2, 30000),
 
-  /** period: "1d" | "5d" | "1mo" | "1y" | "5y" */
   getStockHistory: (symbol: string, period: "1d" | "5d" | "1mo" | "1y" | "5y" = "1mo") =>
     request<StockHistory>(`/training/api/stock/history/${symbol}?period=${period}`, undefined, 2, 30000),
+
+  // ─── Event endpoint (from first file) ───
+  getSymbolEvents: (symbol: string) =>
+    request<CategorizedEvents>(`/events/${symbol}`, undefined, 2, 30000),
 
   getTrainingProgress: () =>
     request<TrainingProgress>("/training/api/train/progress", undefined, 1, 10000),
@@ -711,16 +685,20 @@ export const api = {
   markTradesToMarket: () =>
     request<{ status: string }>("/training/api/trades/mark-to-market", { method: "POST" }, 1, 30000),
 
+  // ─── New endpoints from second file ───
   clearTradesBackup: () =>
     request<any>("/training/api/trades/clear-backup", { method: "POST" }, 1, 30000),
+
   listTradeBackups: () =>
     request<any>("/training/api/trades/backups", undefined, 1, 15000),
+
   addToTrade: (tradeId: string, qty: number, price?: number) =>
     request<any>(`/training/api/trades/${tradeId}/add`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ quantity: qty, price }),
     }, 1, 30000),
+
   closeTrade: (tradeId: string) =>
     request<{ status: string; trade_id: string; exit_price: number; pnl_pct: number }>(
       `/training/api/trades/${tradeId}/close`, { method: "POST" }, 1, 30000

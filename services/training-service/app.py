@@ -11,11 +11,11 @@ import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request  # <-- added Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any   # <-- FIX: added Dict, Any
+from typing import Optional, List, Dict, Any   # <-- fixed: added Dict, Any
 import joblib
 import numpy as np
 from sqlalchemy import create_engine, func
@@ -875,6 +875,9 @@ if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5001))
     uvicorn.run(app, host="0.0.0.0", port=port)
 
+# ----------------------------------------------------------------------
+# NEW: Additional trade management endpoints (clear-backup, backups, add)
+# ----------------------------------------------------------------------
 @app.post("/api/trades/clear-backup")
 def api_clear_trades_backup():
     try:
@@ -891,7 +894,6 @@ def api_list_trade_backups():
         return list_trade_backups()
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
 
 @app.post("/api/trades/{trade_id}/add")
 async def api_add_to_trade(trade_id: str, request: Request):

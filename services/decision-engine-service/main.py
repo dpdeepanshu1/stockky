@@ -1,10 +1,11 @@
 """
-Decision Engine Service v0.7.3
+Decision Engine Service v0.7.4
 Changes:
 - Fetches market sentiment from API Gateway's /market/indices endpoint (fast and reliable)
 - Always includes the live market_score in the response
 - Added retry and logging
 - Speed: in-process + Redis decide cache, bulk /decide/batch endpoint (free-tier friendly)
+- Multi-horizon scoring (short/mid/long) via horizons.py
 """
 import os
 import json
@@ -97,7 +98,6 @@ def time_module_time():
 
 app = FastAPI(title="Stockky Decision Engine", version="0.7.4")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
@@ -582,7 +582,6 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
 
         logger.info(f"Market sentiment for {symbol}: {market_score}")
 
-        
         market_adjustment, market_adjustment_reason = _market_sentiment_adjustment(market_score)
 
         # ── Multi-horizon scoring (Short / Mid / Long) — short is primary ──
@@ -610,7 +609,6 @@ async def decide(symbol: str, already_owned: bool = False, background_tasks: Bac
             extras=extras,
             flags=flags,
         )
-
 
         event_signals = _extract_event_signals(events)
         event_delta = event_signals["event_score_delta"]
@@ -882,4 +880,3 @@ async def decide_batch(request: Request):
         else:
             out.append(res)
     return {"results": out, "count": len(out)}
-

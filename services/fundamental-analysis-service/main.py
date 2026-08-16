@@ -18,6 +18,51 @@ logger = logging.getLogger("fundamental-analysis-service")
 # MUST point to your market-data-service
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "https://stockky-market-data.onrender.com")
 
+# ── Sector-relative valuation (from first version) ───────────────────
+# A P/E of 35 is expensive for a bank, ordinary for FMCG, and cheap for a
+# high-growth software company. Scoring P/E against one fixed threshold
+# for every stock (the previous behavior) systematically over-penalizes
+# expensive-by-nature sectors and under-penalizes cheap-by-nature ones.
+#
+# These are typical/approximate historical NSE sector P/E ranges, not a
+# live-computed median across actual current sector constituents — that
+# would need a proper sector-constituent price feed this service doesn't
+# have. Treat this as a reasonable prior that replaces one-size-fits-all
+# thresholds, not a precise live benchmark. yfinance's `sector` field
+# values are the dict keys.
+SECTOR_TYPICAL_PE = {
+    "Technology": 26,
+    "Financial Services": 17,
+    "Healthcare": 30,
+    "Consumer Defensive": 45,
+    "Consumer Cyclical": 28,
+    "Industrials": 24,
+    "Basic Materials": 12,
+    "Energy": 11,
+    "Utilities": 16,
+    "Real Estate": 22,
+    "Communication Services": 20,
+}
+DEFAULT_TYPICAL_PE = 22  # broad-market fallback when sector is unknown or not in the table
+
+def _sector_relative_pe_score(pe_ratio, sector: str | None):
+    """Returns (score_delta, reason). Compares P/E to the sector's typical
+    range instead of one fixed threshold for every stock."""
+    if pe_ratio is None or pe_ratio <= 0:
+        return 0, None
+    typical = SECTOR_TYPICAL_PE.get(sector, DEFAULT_TYPICAL_PE)
+    ratio = pe_ratio / typical
+    sector_label = sector or "broad market"
+    if ratio < 0.7:
+        return 8, f"P/E at {pe_ratio:.1f} is well below the {sector_label} typical range (~{typical}) — attractive for the sector"
+    elif ratio < 0.9:
+        return 4, f"P/E at {pe_ratio:.1f} is below the {sector_label} typical range (~{typical})"
+    elif ratio <= 1.15:
+        return 0, f"P/E at {pe_ratio:.1f} is in line with the {sector_label} typical range (~{typical})"
+    elif ratio <= 1.5:
+        return -4, f"P/E at {pe_ratio:.1f} is above the {sector_label} typical range (~{typical})"
+    else:
+        return -8, f"P/E at {pe_ratio:.1f} is well above the {sector_label} typical range (~{typical}) — priced for a lot of growth"
 
 def _multi_quarter_consistency(earnings_list):
     """Return (score 0-100, ok_flag) if 2-3 consecutive quarters show positive growth."""
@@ -41,31 +86,6 @@ def _multi_quarter_consistency(earnings_list):
     if pos == 1:
         return 45.0, False
     return 30.0, False
-
-def _peer_relative_score(symbol_metrics: dict, peer_avg: dict | None):
-    """Self-calculated peer-relative P/E, ROE, growth vs sector peers (0-100)."""
-    if not peer_avg:
-        return 50.0
-    score = 50.0
-    try:
-        pe = symbol_metrics.get("pe") or symbol_metrics.get("pe_ratio")
-        peer_pe = peer_avg.get("pe")
-        if pe and peer_pe and peer_pe > 0:
-            # cheaper than peers is better
-            rel = peer_pe / max(pe, 0.1)
-            score += max(-15, min(15, (rel - 1.0) * 20))
-        roe = symbol_metrics.get("roe")
-        peer_roe = peer_avg.get("roe")
-        if roe is not None and peer_roe is not None:
-            score += max(-15, min(15, (float(roe) - float(peer_roe)) * 0.8))
-        g = symbol_metrics.get("revenue_growth") or symbol_metrics.get("earnings_growth")
-        pg = peer_avg.get("revenue_growth") or peer_avg.get("earnings_growth")
-        if g is not None and pg is not None:
-            score += max(-10, min(10, (float(g) - float(pg)) * 0.3))
-    except Exception:
-        pass
-    return max(0.0, min(100.0, score))
-
 
 app = FastAPI(title="Stockky Fundamental Analysis Service", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -138,6 +158,8 @@ def analyze(symbol: str):
     promoter_pledging = f.get("promoter_pledging")
     sector = f.get("sector")
     market_cap = f.get("market_cap")
+    # Additional for multi-quarter
+    quarterly_earnings = f.get("quarterly_earnings") or f.get("earnings_quarters")
 
     metrics = {
         "pe_ratio": pe_ratio,
@@ -173,23 +195,24 @@ def analyze(symbol: str):
     reasons = []
     valuation_note = "fair"
 
-    # --- Valuation Multiples ---
+    # --- Valuation Multiples (using sector-relative PE from first version) ---
     if pe_ratio is not None:
         if pe_ratio < 0:
             score -= 10
             valuation_note = "unprofitable (negative P/E)"
             reasons.append("Negative P/E — company currently unprofitable")
-        elif pe_ratio > 60:
-            score -= 8
-            valuation_note = "expensive"
-            reasons.append(f"P/E at {pe_ratio:.1f} — richly valued, needs strong growth to justify")
-        elif pe_ratio < 15:
-            score += 6
-            valuation_note = "attractive"
-            reasons.append(f"P/E at {pe_ratio:.1f} — attractively valued vs typical large-cap range")
         else:
-            valuation_note = "fair"
-            reasons.append(f"P/E at {pe_ratio:.1f} — fair valuation")
+            pe_delta, pe_reason = _sector_relative_pe_score(pe_ratio, sector)
+            score += pe_delta
+            if pe_reason:
+                reasons.append(pe_reason)
+            # Determine valuation_note based on pe_delta
+            if pe_delta > 4:
+                valuation_note = "attractive"
+            elif pe_delta < -4:
+                valuation_note = "expensive"
+            else:
+                valuation_note = "fair"
 
         if forward_pe and pe_ratio and forward_pe < pe_ratio:
             score += 4
@@ -312,14 +335,39 @@ def analyze(symbol: str):
             score -= 8
             reasons.append(f"Interest coverage at {interest_coverage:.1f} — risky debt servicing")
 
-    # --- Cash Flow ---
+    # --- Cash Flow (with FCF yield from first version) ---
     if free_cashflow is not None:
-        if free_cashflow > 0:
+        if market_cap and market_cap > 0:
+            fcf_yield = free_cashflow / market_cap * 100
+            metrics["fcf_yield"] = round(fcf_yield, 2)
+            if fcf_yield > 5:
+                score += 10
+                reasons.append(f"FCF yield at {fcf_yield:.1f}% — strong cash generation relative to valuation")
+            elif fcf_yield > 0:
+                score += 5
+                reasons.append(f"FCF yield at {fcf_yield:.1f}% — positive but modest cash generation")
+            else:
+                score -= 10
+                reasons.append(f"FCF yield at {fcf_yield:.1f}% — burning cash relative to its size")
+        elif free_cashflow > 0:
             score += 8
             reasons.append("Positive free cash flow — self-funding operations and growth")
         else:
             score -= 10
             reasons.append("Negative free cash flow — relies on external financing")
+
+    # Earnings yield (1/PE) as a complementary signal
+    if pe_ratio is not None and pe_ratio > 0:
+        earnings_yield = 1 / pe_ratio * 100
+        metrics["earnings_yield"] = round(earnings_yield, 2)
+        is_moderate_growth = revenue_growth is not None and 0 <= revenue_growth <= 15
+        if is_moderate_growth:
+            if earnings_yield > 6:
+                score += 6
+                reasons.append(f"Earnings yield at {earnings_yield:.1f}% — attractive for a moderate-growth company")
+            elif earnings_yield < 3:
+                score -= 4
+                reasons.append(f"Earnings yield at {earnings_yield:.1f}% — low for a moderate-growth company")
 
     # --- Institutional / Promoter Holding ---
     if held_percent_institutions is not None and held_percent_institutions > 40:
@@ -342,21 +390,11 @@ def analyze(symbol: str):
             score -= 5
             reasons.append(f"Promoter pledging at {promoter_pledging:.1f}% — moderate risk")
 
-    if fallback_used:
-        reasons.append("Live data temporarily unavailable — score is based on last known or default values")
-
-    if not reasons:
-        reasons.append("Fundamental data partially available; score is based on available metrics")
-
-    if f.get("stale"):
-        reasons.append("Live data was temporarily unavailable (Yahoo Finance rate limit) — showing the last known values instead")
-
-    # ── Multi-quarter consistency (2–3 consecutive positive growth) ──
+    # --- Multi-quarter consistency (from second version) ---
     multi_q_score, multi_q_ok = 50.0, False
     try:
-        qlist = f.get("quarterly_earnings") or f.get("earnings_quarters")
-        if isinstance(qlist, list) and len(qlist) >= 2:
-            multi_q_score, multi_q_ok = _multi_quarter_consistency(qlist)
+        if isinstance(quarterly_earnings, list) and len(quarterly_earnings) >= 2:
+            multi_q_score, multi_q_ok = _multi_quarter_consistency(quarterly_earnings)
         elif earnings_growth is not None and revenue_growth is not None:
             if earnings_growth > 0 and revenue_growth > 0:
                 multi_q_score, multi_q_ok = 70.0, True
@@ -368,9 +406,9 @@ def analyze(symbol: str):
     except Exception as _mq:
         logger.warning("multi-quarter check failed: %s", _mq)
 
-    # ── Peer-relative metrics (self-calculated vs sector peers) ──
-    sector_norm = normalize_sector(sector, symbol)
-    peer_list = peers_for(symbol, sector_norm)
+    # ── Peer-relative metrics (from second version) ──
+    sector_norm = normalize_sector(sector, symbol) if 'normalize_sector' in globals() else sector
+    peer_list = peers_for(symbol, sector_norm) if 'peers_for' in globals() else []
     peer_rel = {"score": 50.0, "components": {}, "note": "peers_not_fetched"}
     try:
         peer_rows = []
@@ -382,8 +420,8 @@ def analyze(symbol: str):
             except Exception:
                 continue
         if peer_rows:
-            peer_avg = average_metrics(peer_rows)
-            peer_rel = peer_relative_score(metrics, peer_avg)
+            peer_avg = average_metrics(peer_rows) if 'average_metrics' in globals() else {}
+            peer_rel = peer_relative_score(metrics, peer_avg) if 'peer_relative_score' in globals() else {"score": 50.0}
             adj = (float(peer_rel.get("score", 50)) - 50.0) * 0.12
             score += adj
             reasons.append(
@@ -395,7 +433,19 @@ def analyze(symbol: str):
     except Exception as _pe:
         logger.warning("peer relative failed: %s", _pe)
 
+    # --- Final adjustments ---
+    if fallback_used:
+        reasons.append("Live data temporarily unavailable — score is based on last known or default values")
+
+    if not reasons:
+        reasons.append("Fundamental data partially available; score is based on available metrics")
+
+    if f.get("stale"):
+        reasons.append("Live data was temporarily unavailable (Yahoo Finance rate limit) — showing the last known values instead")
+
+    # Clamp final score
     score = max(0, min(100, round(score)))
+    # Quality score = average of score and multi-quarter score (if available)
     quality_score = max(0, min(100, round((score + multi_q_score) / 2)))
 
     return {

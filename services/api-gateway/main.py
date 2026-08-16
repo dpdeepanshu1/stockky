@@ -1482,6 +1482,22 @@ def remove_from_watchlist(symbol: str):
     _save_watchlist(updated)
     return {"symbols": updated}
 
+# ── Added from first version: /events/{symbol} endpoint ─────────────────
+@app.get("/events/{symbol}")
+def get_symbol_events(symbol: str):
+    """Frontend-facing proxy for the Analysis page's event section —
+    previously the only event data reaching the frontend was whatever
+    decision-engine happened to pass through on the Decision object
+    (next_earnings_date only); this exposes event-tracker-service's
+    full categorized (upcoming/recent/recent_changes) view directly."""
+    try:
+        resp = httpx.get(f"{EVENT_URL}/events/{symbol.upper()}/categorized", timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.warning(f"Failed to fetch categorized events for {symbol}: {e}")
+        raise HTTPException(status_code=502, detail=f"event-tracker-service unreachable: {e}")
+
 # ── Searched symbols ────────────────────────────────────────────────────────
 @app.get("/searched")
 def get_searched_symbols():
@@ -1710,6 +1726,42 @@ def run_scan(force_refresh: bool = False):
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = _select_top_picks(actionable, limit=5)
+    # horizon picks for sync scan as well (though sync is legacy)
+    def _horizon_picks_sync(results_list, horizon_key, limit=5):
+        scored = []
+        for r in results_list:
+            if r.get("decision") == "ERROR":
+                continue
+            hz = (r.get("horizons") or {}).get(horizon_key) or {}
+            sc = hz.get("score")
+            if sc is None:
+                sc = r.get("combined_score", 0) or 0
+                if horizon_key == "mid":
+                    sc = sc * 0.95
+                elif horizon_key == "long":
+                    sc = (r.get("fundamental_score") or sc) * 0.9 + (r.get("combined_score") or 0) * 0.1
+            decision = hz.get("decision") or r.get("decision")
+            min_sc = {"short": 54, "mid": 56, "long": 58}.get(horizon_key, 54)
+            if decision in ("BUY NOW", "PREPARE TO BUY") or (sc or 0) >= min_sc:
+                row = {**r, "_hz_score": sc, "horizon_focus": horizon_key}
+                if decision == "DO NOT BUY" and (sc or 0) >= min_sc:
+                    row = {**row, "decision": "PREPARE TO BUY", "promoted_from_score": True}
+                scored.append(row)
+        scored.sort(key=lambda x: x.get("_hz_score", 0), reverse=True)
+        return scored[:limit]
+    top_picks_short = _horizon_picks_sync(results, "short")
+    top_picks_mid = _horizon_picks_sync(results, "mid")
+    top_picks_long = _horizon_picks_sync(results, "long")
+    if not top_picks_short:
+        top_picks_short = top_picks
+    final_verdict_scan = {
+        "preferred_horizon": "short",
+        "short_count": len(top_picks_short),
+        "mid_count": len(top_picks_mid),
+        "long_count": len(top_picks_long),
+        "headline": f"Short: {len(top_picks_short)} pick(s). Mid: {len(top_picks_mid)}, Long: {len(top_picks_long)}.",
+        "best_short": top_picks_short[0].get("symbol") if top_picks_short else None,
+    }
     _record_symbol_outcomes(results)  # feeds universe self-pruning — see _build_scan_universe
     watchlist_candidates = []
     if not top_picks:
@@ -1734,11 +1786,11 @@ def run_scan(force_refresh: bool = False):
         "scanned": len(results),
         "universe_size": len(universe),
         "watchlist_size": len(_load_watchlist()),
-        "recommendations": top_picks_short if "top_picks_short" in dir() else top_picks,
-        "recommendations_short": top_picks_short if "top_picks_short" in dir() else top_picks,
-        "recommendations_mid": top_picks_mid if "top_picks_mid" in dir() else [],
-        "recommendations_long": top_picks_long if "top_picks_long" in dir() else [],
-        "final_verdict": final_verdict_scan if "final_verdict_scan" in dir() else None,
+        "recommendations": top_picks_short,
+        "recommendations_short": top_picks_short,
+        "recommendations_mid": top_picks_mid,
+        "recommendations_long": top_picks_long,
+        "final_verdict": final_verdict_scan,
         "watchlist_candidates": watchlist_candidates,
         "verdict": verdict,
         "market_mood": market_mood,
@@ -1967,6 +2019,42 @@ def scan_watchlist():
     results.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
     actionable = [r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")]
     top_picks = _select_top_picks(actionable, limit=5)
+    # horizon picks for watchlist scan
+    def _horizon_picks_wl(results_list, horizon_key, limit=5):
+        scored = []
+        for r in results_list:
+            if r.get("decision") == "ERROR":
+                continue
+            hz = (r.get("horizons") or {}).get(horizon_key) or {}
+            sc = hz.get("score")
+            if sc is None:
+                sc = r.get("combined_score", 0) or 0
+                if horizon_key == "mid":
+                    sc = sc * 0.95
+                elif horizon_key == "long":
+                    sc = (r.get("fundamental_score") or sc) * 0.9 + (r.get("combined_score") or 0) * 0.1
+            decision = hz.get("decision") or r.get("decision")
+            min_sc = {"short": 54, "mid": 56, "long": 58}.get(horizon_key, 54)
+            if decision in ("BUY NOW", "PREPARE TO BUY") or (sc or 0) >= min_sc:
+                row = {**r, "_hz_score": sc, "horizon_focus": horizon_key}
+                if decision == "DO NOT BUY" and (sc or 0) >= min_sc:
+                    row = {**row, "decision": "PREPARE TO BUY", "promoted_from_score": True}
+                scored.append(row)
+        scored.sort(key=lambda x: x.get("_hz_score", 0), reverse=True)
+        return scored[:limit]
+    top_picks_short = _horizon_picks_wl(results, "short")
+    top_picks_mid = _horizon_picks_wl(results, "mid")
+    top_picks_long = _horizon_picks_wl(results, "long")
+    if not top_picks_short:
+        top_picks_short = top_picks
+    final_verdict_scan = {
+        "preferred_horizon": "short",
+        "short_count": len(top_picks_short),
+        "mid_count": len(top_picks_mid),
+        "long_count": len(top_picks_long),
+        "headline": f"Short: {len(top_picks_short)} pick(s). Mid: {len(top_picks_mid)}, Long: {len(top_picks_long)}.",
+        "best_short": top_picks_short[0].get("symbol") if top_picks_short else None,
+    }
     _record_symbol_outcomes(results)  # feeds universe self-pruning — see _build_scan_universe
 
     buy_count = len([r for r in results if r.get("decision") in ("BUY NOW", "PREPARE TO BUY")])
@@ -1988,11 +2076,11 @@ def scan_watchlist():
         "scanned": len(results),
         "universe_size": len(watchlist),
         "watchlist_size": len(watchlist),
-        "recommendations": top_picks_short if "top_picks_short" in dir() else top_picks,
-        "recommendations_short": top_picks_short if "top_picks_short" in dir() else top_picks,
-        "recommendations_mid": top_picks_mid if "top_picks_mid" in dir() else [],
-        "recommendations_long": top_picks_long if "top_picks_long" in dir() else [],
-        "final_verdict": final_verdict_scan if "final_verdict_scan" in dir() else None,
+        "recommendations": top_picks_short,
+        "recommendations_short": top_picks_short,
+        "recommendations_mid": top_picks_mid,
+        "recommendations_long": top_picks_long,
+        "final_verdict": final_verdict_scan,
         "watchlist_candidates": [],
         "verdict": verdict,
         "market_mood": market_mood,

@@ -3,6 +3,10 @@ Event Tracker Service v0.4.4
 -----------------------------
 Dynamically fetches company name from yfinance for any symbol.
 Works for ALL stocks, not just those in NAME_HINTS.
+
+Merged with v0.3.1 features:
+- /events/{symbol}/categorized endpoint with upcoming/recent events
+- Shared _diff_events logic for /check and /events/{symbol}/categorized
 """
 import os
 import json
@@ -588,6 +592,81 @@ def _fetch_events(symbol: str, force: bool = False) -> dict:
     return result
 
 
+# ── Shared diff logic (from v0.3.1) ──────────────────────────────────────────
+def _diff_events(previous: dict, current: dict) -> list[str]:
+    """Compares two event snapshots for one symbol and returns a list of
+    human-readable change descriptions. Shared by /check and /events/{symbol}/categorized
+    so both surface the same real detected changes.
+    """
+    diff_reasons = []
+
+    if previous.get("next_earnings_date") != current.get("next_earnings_date"):
+        diff_reasons.append(
+            f"Earnings date: {previous.get('next_earnings_date')} → {current.get('next_earnings_date')}"
+        )
+
+    prev_div = previous.get("last_dividend") or {}
+    cur_div = current.get("last_dividend") or {}
+    if prev_div.get("date") != cur_div.get("date") and cur_div.get("date"):
+        diff_reasons.append(f"New dividend declared: ₹{cur_div.get('amount')} on {cur_div.get('date')}")
+
+    prev_split = previous.get("last_split") or {}
+    cur_split = current.get("last_split") or {}
+    if prev_split.get("date") != cur_split.get("date") and cur_split.get("date"):
+        diff_reasons.append(f"Stock split: {cur_split.get('ratio')}:1 on {cur_split.get('date')}")
+
+    prev_keys = {
+        (a.get("date", "") + a.get("firm", ""))
+        for a in (previous.get("recent_analyst_actions") or [])
+    }
+    for action in (current.get("recent_analyst_actions") or []):
+        key = action.get("date", "") + action.get("firm", "")
+        if key not in prev_keys:
+            diff_reasons.append(
+                f"Analyst: {action.get('firm')} {action.get('action')} → {action.get('to_grade')}"
+            )
+
+    prev_insider_keys = {
+        (a.get("date", "") + a.get("insider", ""))
+        for a in (previous.get("recent_insider_transactions") or [])
+    }
+    for txn in (current.get("recent_insider_transactions") or []):
+        key = txn.get("date", "") + txn.get("insider", "")
+        if key not in prev_insider_keys:
+            diff_reasons.append(
+                f"Insider {txn.get('transaction')}: {txn.get('insider')} — {txn.get('shares')} shares"
+            )
+
+    prev_surprise = previous.get("earnings_surprise") or {}
+    cur_surprise = current.get("earnings_surprise") or {}
+    if prev_surprise.get("surprise_pct") != cur_surprise.get("surprise_pct"):
+        diff_reasons.append(f"Earnings surprise: {cur_surprise.get('surprise_pct')}%")
+
+    prev_bulk = previous.get("bulk_deals") or []
+    cur_bulk = current.get("bulk_deals") or []
+    if len(cur_bulk) != len(prev_bulk):
+        diff_reasons.append("Bulk/Block deal detected")
+
+    # Institutional / mutual fund holding changes
+    prev_holders = {h.get("holder"): h for h in (previous.get("institutional_holders") or []) if h.get("holder")}
+    cur_holders = {h.get("holder"): h for h in (current.get("institutional_holders") or []) if h.get("holder")}
+    for name, cur_h in cur_holders.items():
+        prev_h = prev_holders.get(name)
+        cur_shares = cur_h.get("shares")
+        if prev_h is None and cur_shares:
+            diff_reasons.append(f"New institutional holder: {name} — {cur_shares:,} shares")
+        elif prev_h is not None and cur_shares and prev_h.get("shares"):
+            prev_shares = prev_h.get("shares")
+            if cur_shares > prev_shares * 1.05:
+                pct_increase = round((cur_shares - prev_shares) / prev_shares * 100, 1)
+                diff_reasons.append(
+                    f"{name} increased holding by {pct_increase}% "
+                    f"({prev_shares:,} → {cur_shares:,} shares)"
+                )
+
+    return diff_reasons
+
+
 # ── Routes ──
 @app.get("/")
 def root():
@@ -598,6 +677,7 @@ def root():
         "endpoints": {
             "/health": "GET",
             "/events/{symbol}": "GET full snapshot",
+            "/events/{symbol}/categorized": "GET upcoming/recent events + changes",
             "/events/{symbol}?force=true": "GET bypass cache",
             "/subscribe": "POST",
             "/subscriptions": "GET",
@@ -615,6 +695,82 @@ def health():
 @app.get("/events/{symbol}")
 def get_events(symbol: str, force: bool = False):
     return _fetch_events(symbol, force=force)
+
+
+@app.get("/events/{symbol}/categorized")
+def get_events_categorized(symbol: str, force: bool = False):
+    """Same underlying data as /events/{symbol}, split into 'upcoming'
+    (things that haven't happened yet — next earnings date, if in the
+    future) and 'recent' (things that already happened — last dividend,
+    last split, recent insider/analyst activity, earnings surprise),
+    plus 'recent_changes': real detected changes since the last time
+    this symbol was checked, using the same diff logic /check uses.
+    """
+    symbol = _normalize(symbol)
+    current = _fetch_events(symbol, force=force)
+
+    state = _load_state()
+    previous = state["last_known"].get(symbol, {})
+    recent_changes = _diff_events(previous, current) if previous else []
+
+    upcoming = []
+    recent = []
+
+    next_earnings = current.get("next_earnings_date")
+    if next_earnings:
+        try:
+            is_future = datetime.fromisoformat(next_earnings.replace("Z", "")) >= datetime.utcnow()
+        except (ValueError, TypeError):
+            is_future = True  # unparseable date — don't silently drop it, default to showing it
+        (upcoming if is_future else recent).append({
+            "type": "earnings_date", "date": next_earnings,
+            "description": f"Next earnings: {next_earnings}",
+        })
+
+    last_dividend = current.get("last_dividend")
+    if last_dividend and last_dividend.get("date"):
+        recent.append({
+            "type": "dividend", "date": last_dividend.get("date"),
+            "description": f"Dividend of ₹{last_dividend.get('amount')} declared",
+        })
+
+    last_split = current.get("last_split")
+    if last_split and last_split.get("date"):
+        recent.append({
+            "type": "split", "date": last_split.get("date"),
+            "description": f"{last_split.get('ratio')}:1 stock split",
+        })
+
+    for action in (current.get("recent_analyst_actions") or []):
+        recent.append({
+            "type": "analyst", "date": action.get("date"),
+            "description": f"{action.get('firm')}: {action.get('action')} → {action.get('to_grade')}",
+        })
+
+    for txn in (current.get("recent_insider_transactions") or []):
+        recent.append({
+            "type": "insider", "date": txn.get("date"),
+            "description": f"Insider {txn.get('transaction')}: {txn.get('insider')} — {txn.get('shares')} shares",
+        })
+
+    earnings_surprise = current.get("earnings_surprise")
+    if earnings_surprise and earnings_surprise.get("date"):
+        recent.append({
+            "type": "earnings_surprise", "date": earnings_surprise.get("date"),
+            "description": f"Earnings surprise: {earnings_surprise.get('surprise_pct')}% vs estimate",
+        })
+
+    # Sort each section newest-first where a date is available
+    recent.sort(key=lambda x: x.get("date") or "", reverse=True)
+
+    return {
+        "symbol": symbol,
+        "upcoming": upcoming,
+        "recent": recent,
+        "recent_changes": recent_changes,
+        "institutional_holders": current.get("institutional_holders") or [],
+        "checked_at": current.get("checked_at"),
+    }
 
 
 @app.post("/subscribe")
@@ -635,68 +791,60 @@ def list_subscriptions():
 
 @app.get("/check")
 def check_for_changes():
+    """Diff each subscribed symbol against last known snapshot.
+    Staggered with 1s delay between symbols to avoid Yahoo rate limits.
+    Uses the shared _diff_events function.
+    """
     state = _load_state()
     changes = []
+
     for i, symbol in enumerate(state["subscriptions"]):
         if i > 0:
             time.sleep(1)
+
         current = _fetch_events(symbol)
         previous = state["last_known"].get(symbol, {})
-        diff_reasons = []
+        diff_reasons = _diff_events(previous, current)
 
-        if previous.get("next_earnings_date") != current.get("next_earnings_date"):
-            diff_reasons.append(f"Earnings date: {previous.get('next_earnings_date')} → {current.get('next_earnings_date')}")
-        prev_div = previous.get("last_dividend") or {}
-        cur_div = current.get("last_dividend") or {}
-        if prev_div.get("date") != cur_div.get("date") and cur_div.get("date"):
-            diff_reasons.append(f"New dividend: ₹{cur_div.get('amount')} on {cur_div.get('date')}")
-        prev_split = previous.get("last_split") or {}
-        cur_split = current.get("last_split") or {}
-        if prev_split.get("date") != cur_split.get("date") and cur_split.get("date"):
-            diff_reasons.append(f"Stock split: {cur_split.get('ratio')}:1 on {cur_split.get('date')}")
-        prev_keys = {(a.get("date","")+a.get("firm","")) for a in (previous.get("recent_analyst_actions") or [])}
-        for action in (current.get("recent_analyst_actions") or []):
-            key = action.get("date","") + action.get("firm","")
-            if key not in prev_keys:
-                diff_reasons.append(f"Analyst: {action.get('firm')} {action.get('action')} → {action.get('to_grade')}")
-        prev_insider_keys = {(a.get("date","")+a.get("insider","")) for a in (previous.get("recent_insider_transactions") or [])}
-        for txn in (current.get("recent_insider_transactions") or []):
-            key = txn.get("date","") + txn.get("insider","")
-            if key not in prev_insider_keys:
-                diff_reasons.append(f"Insider {txn.get('transaction')}: {txn.get('insider')} — {txn.get('shares')} shares")
-        prev_surprise = previous.get("earnings_surprise") or {}
-        cur_surprise = current.get("earnings_surprise") or {}
-        if prev_surprise.get("surprise_pct") != cur_surprise.get("surprise_pct"):
-            diff_reasons.append(f"Earnings surprise: {cur_surprise.get('surprise_pct')}%")
-        prev_bulk = previous.get("bulk_deals") or []
-        cur_bulk = current.get("bulk_deals") or []
-        if len(cur_bulk) != len(prev_bulk):
-            diff_reasons.append("Bulk/Block deal detected")
         if diff_reasons:
             changes.append({"symbol": symbol, "changes": diff_reasons, "current": current})
+
         state["last_known"][symbol] = current
+
     _save_state(state)
-    return {"checked": len(state["subscriptions"]), "changes": changes, "checked_at": datetime.utcnow().isoformat()}
+    return {
+        "checked": len(state["subscriptions"]),
+        "changes": changes,
+        "checked_at": datetime.utcnow().isoformat(),
+    }
 
 
 @app.get("/symbols_with_events")
 def symbols_with_events(days_ahead: int = 7):
+    """Return a list of subscribed symbols that have an upcoming event
+    (earnings, dividend, split) within the next `days_ahead` days.
+    The list is cached in Redis for 1 hour.
+    """
     cached = _redis_get(EVENTS_LIST_CACHE_KEY)
     if cached and isinstance(cached, list):
         return {"symbols": cached}
+
     state = _load_state()
     subscriptions = state.get("subscriptions", [])
     if not subscriptions:
         _redis_set(EVENTS_LIST_CACHE_KEY, [], ttl=EVENTS_LIST_CACHE_TTL)
         return {"symbols": []}
+
     now = datetime.utcnow()
     cutoff = now + timedelta(days=days_ahead)
     result_symbols = []
+
     for symbol in subscriptions:
         cache_key = f"{EVENT_CACHE_PREFIX}{symbol}"
         cached_events = _redis_get(cache_key)
         if not cached_events:
             continue
+
         next_earnings = cached_events.get("next_earnings_date")
         if next_earnings:
             try:
@@ -706,6 +854,7 @@ def symbols_with_events(days_ahead: int = 7):
                     continue
             except (ValueError, TypeError):
                 pass
+
         last_div = cached_events.get("last_dividend")
         if last_div and last_div.get("date"):
             try:
@@ -715,6 +864,7 @@ def symbols_with_events(days_ahead: int = 7):
                     continue
             except (ValueError, TypeError):
                 pass
+
         last_split = cached_events.get("last_split")
         if last_split and last_split.get("date"):
             try:
@@ -724,6 +874,7 @@ def symbols_with_events(days_ahead: int = 7):
                     continue
             except (ValueError, TypeError):
                 pass
+
     result_symbols = sorted(set(result_symbols))
     _redis_set(EVENTS_LIST_CACHE_KEY, result_symbols, ttl=EVENTS_LIST_CACHE_TTL)
     return {"symbols": result_symbols}

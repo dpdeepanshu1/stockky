@@ -4,7 +4,7 @@ import { decisionStyle } from "../decisionStyle";
 import StockChart from "./StockChart";
 import { toActionablePick } from "./ScanPanel";
 
-// ── Types & helper for structured news ──
+// ── Types & helper for structured news (from v2) ──
 interface NewsItem {
   title: string;
   publisher: string;
@@ -40,7 +40,7 @@ function getNewsItems(data: Decision): NewsItem[] {
   return items;
 }
 
-// ── Sentiment scoring ──
+// ── Sentiment scoring (from v2) ──
 function computeNewsSentimentScore(newsItems: NewsItem[]): number {
   if (!newsItems.length) return 50;
 
@@ -107,7 +107,6 @@ interface Props {
   onAddToWatchlist: (symbol: string) => void;
 }
 
-/** Parent can also render <HorizonStrip data={decision} /> */
 export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWatchlist }: Props) {
   const style = decisionStyle[data.decision] ?? decisionStyle["DO NOT BUY"];
   const isBullish = data.decision === "BUY NOW" || data.decision === "PREPARE TO BUY";
@@ -121,7 +120,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   const [trainingScore, setTrainingScore] = useState<TrainingScore | null>(null);
   const [loadingTrainingScore, setLoadingTrainingScore] = useState(false);
 
-  // ── Fetch news and filter to last 7 days ──
+  // ── News items and scoring (from v2) ──
   const newsItems = getNewsItems(data);
   const sevenDaysAgo = new Date();
   sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
@@ -130,7 +129,6 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
     return new Date(item.published) >= sevenDaysAgo;
   });
 
-  // Use only recent news for score, fallback to all news if none recent
   const itemsForScoring = recentNewsItems.length > 0 ? recentNewsItems : newsItems;
   const computedNewsScore = itemsForScoring.length > 0 ? computeNewsSentimentScore(itemsForScoring) : data.news_score ?? 50;
 
@@ -141,6 +139,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
                          computedNewsScore >= 50 ? 'text-yellow-500' :
                          'text-red-500';
 
+  // ── Fetch training score ──
   useEffect(() => {
     let cancelled = false;
     setTrainingScore(null);
@@ -148,11 +147,12 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
     api
       .getTrainingScore(data.symbol)
       .then((r) => { if (!cancelled) setTrainingScore(r); })
-      .catch(() => {})
+      .catch(() => { /* no history */ })
       .finally(() => { if (!cancelled) setLoadingTrainingScore(false); });
     return () => { cancelled = true; };
   }, [data.symbol]);
 
+  // ── Scores breakdown (use computed news score) ──
   const scores = [
     { label: "Technical", value: data.technical_score },
     { label: "Fundamental", value: data.fundamental_score },
@@ -168,10 +168,10 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
 
   const hasNews = data.reasons.news && data.reasons.news.length > 0 &&
     !(data.event_data && (data.event_data.news || data.event_data.recent_news));
-
   const hasEvent = data.reasons.event && data.reasons.event.length > 0;
   const hasMarket = data.reasons.market && data.reasons.market.length > 0;
 
+  // Filter out fallback message from fundamental reasons (v2)
   const fundamentalReasons = data.reasons.fundamental.filter(
     item => !item.startsWith("Live data was temporarily unavailable")
   );
@@ -219,6 +219,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
     return adj > 0 ? `+${adj}` : `${adj}`;
   };
 
+  // ── News impact helpers (v2) ──
   function getNewsImpact(title: string): 'positive' | 'negative' | 'neutral' {
     const lower = title.toLowerCase();
     if (/(beat|surpass|growth|strong|record|outperform|positive|upbeat|rally|surge|jump|gain|profit|upgrade|buy|bullish|recovery|exceed|rose|higher|earnings)/i.test(lower))
@@ -248,8 +249,9 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
       <div className={`rounded-2xl border ${style.border} ${style.bg} p-8`}>
         <div className="flex items-start justify-between gap-6 flex-wrap">
           <div>
-            <div className="font-mono text-xs text-mist tracking-widest uppercase mb-3 flex items-center gap-2">
-              <span>{data.symbol}</span><HorizonStrip data={data} /><span className="hidden"></span>
+            <div className="font-mono text-xs text-mist tracking-widest uppercase mb-3 flex items-center gap-2 flex-wrap">
+              <span>{data.symbol}</span>
+              <HorizonStrip data={data} />
               {data.sector && <><span className="text-slate">·</span><span>{data.sector}</span></>}
               {data.valuation && <><span className="text-slate">·</span><span className="text-mist/60">{data.valuation}</span></>}
             </div>
@@ -314,7 +316,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
             </div>
           </div>
         )}
-        
+
         <div className="mt-4 flex justify-end gap-2">
           {isBullish && (
             <button
@@ -345,6 +347,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       </div>
 
+      {/* Trade modal */}
       {showTradeModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/70 backdrop-blur-sm p-4">
           <div className="bg-graphite border border-slate/60 rounded-2xl p-6 w-full max-w-sm">
@@ -394,6 +397,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
 
       <StockChart symbol={data.symbol} />
 
+      {/* Training score */}
       {loadingTrainingScore ? (
         <div className="rounded-xl border border-slate/40 bg-graphite/30 p-4 text-xs text-mist/40 font-mono flex items-center gap-2">
           <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-mist/40 animate-spin" />
@@ -421,6 +425,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       ) : null}
 
+      {/* Price levels + Score breakdown */}
       <div className="grid grid-cols-2 gap-4">
         <div className="rounded-xl border border-slate bg-graphite p-5">
           <div className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">Price levels</div>
@@ -444,6 +449,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       </div>
 
+      {/* Fundamental Metrics */}
       {metrics && (
         <div className="rounded-xl border border-slate/60 bg-graphite/30 p-5">
           <h3 className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">
@@ -491,20 +497,21 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
+      {/* Reasons – excluding News (handled separately below) */}
       <div className="grid md:grid-cols-2 gap-4">
         <ReasonList title="Technical" items={data.reasons.technical} />
-        <ReasonList title="Fundamental" items={fundamentalReasons} />
-        {hasNews && <ReasonList title="News" items={data.reasons.news!} />}
+        <ReasonList title="Fundamental" items={fundamentalReasons} maxItems={4} />
         {data.reasons.prediction && data.reasons.prediction.length > 0 && (
-          <ReasonList title="AI Prediction" items={data.reasons.prediction} />
+          <ReasonList title="AI Prediction" items={data.reasons.prediction} maxItems={4} />
         )}
         {hasEvent && <ReasonList title="Event Tracker" items={data.reasons.event!} />}
         {hasMarket && <ReasonList title="Market Sentiment" items={data.reasons.market!} />}
         {data.reasons.training && data.reasons.training.length > 0 && (
-          <ReasonList title="Training Intelligence" items={data.reasons.training} />
+          <ReasonList title="Training Intelligence" items={data.reasons.training} maxItems={4} />
         )}
       </div>
 
+      {/* Holding period */}
       {(data.holding_period !== "N/A" || data.holding_period_estimate) && (
         <div className="rounded-xl border border-slate bg-graphite px-5 py-4 font-mono text-xs text-mist">
           <div className="flex justify-between">
@@ -520,6 +527,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
+      {/* Long-term hold */}
       {data.long_term_hold && (
         <div className="rounded-xl border border-signal-buy/40 bg-signal-buy/5 px-5 py-4">
           <div className="flex items-center gap-2 font-mono text-xs uppercase tracking-widest text-signal-buy">
@@ -537,17 +545,7 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         </div>
       )}
 
-      {/* ── EVENT UPDATE ── */}
-      {data.event_data && Object.keys(data.event_data).length > 0 && (
-        <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
-          <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">
-            📅 Event Update
-          </h4>
-          <EventDataView data={data.event_data} />
-        </div>
-      )}
-
-      {/* ── NEWS SECTION (using filtered recentNewsItems) ── */}
+      {/* ── NEWS SECTION (v2) ── */}
       {(() => {
         if (recentNewsItems.length === 0) {
           return (
@@ -631,6 +629,20 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
         );
       })()}
 
+      {/* ── EVENT DATA VIEW (from event_data, v2) ── */}
+      {data.event_data && Object.keys(data.event_data).length > 0 && (
+        <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
+          <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">
+            📅 Event Update
+          </h4>
+          <EventDataView data={data.event_data} />
+        </div>
+      )}
+
+      {/* ── EVENT SECTION (fetched separately, v1) ── */}
+      <EventSection symbol={data.symbol} />
+
+      {/* Natural-language summary */}
       {data.natural_language_summary && (
         <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
           <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-2">
@@ -645,8 +657,191 @@ export default function DecisionCard({ data, onBack, onSearchRelated, onAddToWat
   );
 }
 
-// ── Helper Components ──
+// ── EventSection (v1) ──
+function EventSection({ symbol }: { symbol: string }) {
+  const [events, setEvents] = useState<CategorizedEvents | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
 
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(false);
+    api
+      .getSymbolEvents(symbol)
+      .then((r) => { if (!cancelled) setEvents(r); })
+      .catch(() => { if (!cancelled) setError(true); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [symbol]);
+
+  if (loading) {
+    return (
+      <div className="rounded-xl border border-slate/40 bg-graphite/30 p-4 text-xs text-mist/40 font-mono flex items-center gap-2">
+        <span className="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-mist/40 animate-spin" />
+        Loading events...
+      </div>
+    );
+  }
+  if (error || !events) return null;
+  const hasAnything = events.upcoming.length > 0 || events.recent.length > 0 || events.recent_changes.length > 0;
+  if (!hasAnything) return null;
+
+  return (
+    <div className="rounded-xl border border-slate/60 bg-graphite/50 p-5">
+      <h4 className="font-mono text-xs text-mist uppercase tracking-widest mb-3">📅 Event Update</h4>
+
+      {events.recent_changes.length > 0 && (
+        <div className="mb-4 bg-signal-prepare/10 border border-signal-prepare/30 rounded-lg p-3">
+          <div className="font-mono text-[10px] text-signal-prepare uppercase tracking-wider mb-2">
+            Newly Detected
+          </div>
+          <ul className="space-y-1.5">
+            {events.recent_changes.map((c, i) => (
+              <li key={i} className="text-sm text-paper flex gap-2">
+                <span className="text-signal-prepare shrink-0">●</span>
+                <span>{c}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {events.upcoming.length > 0 && (
+        <div className="mb-3">
+          <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-2">Upcoming</div>
+          <ul className="space-y-1.5">
+            {events.upcoming.map((e, i) => (
+              <li key={i} className="text-sm text-mist/80 flex gap-2">
+                <span className="text-slate mt-1 shrink-0">–</span>
+                <span>{e.description}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {events.recent.length > 0 && (
+        <div>
+          <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-2">Previous</div>
+          <ul className="space-y-1.5">
+            {events.recent.slice(0, 5).map((e, i) => (
+              <li key={i} className="text-sm text-mist/70 flex gap-2">
+                <span className="text-slate mt-1 shrink-0">–</span>
+                <span>{e.description}</span>
+                {e.date && <span className="text-mist/30 text-xs ml-auto shrink-0">{e.date}</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── EventDataView (v2) ──
+function EventDataView({ data }: { data: Record<string, unknown> }) {
+  const skipKeys = new Set(['news', 'recent_news', 'symbol']);
+  const entries = Object.entries(data).filter(([key]) => !skipKeys.has(key));
+
+  if (entries.length === 0) {
+    return <p className="text-sm text-mist/40 italic">No additional event data.</p>;
+  }
+
+  return (
+    <div className="space-y-3">
+      {entries.map(([key, value]) => {
+        const label = key.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
+        if (value == null) return null;
+
+        if (Array.isArray(value)) {
+          if (value.length === 0) return null;
+          if (value.every(item => typeof item === 'string')) {
+            return (
+              <div key={key}>
+                <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
+                <ul className="space-y-1">
+                  {value.map((item, i) => (
+                    <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
+                      <span className="text-slate mt-1 shrink-0">–</span>
+                      <span>{item}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            );
+          }
+          if (value.every(item => typeof item === 'object' && item !== null)) {
+            return (
+              <div key={key}>
+                <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
+                <div className="space-y-2">
+                  {value.map((item, idx) => {
+                    const obj = item as Record<string, any>;
+                    const title = obj.title || obj.name || obj.description || obj.event || 'Item';
+                    const details = Object.entries(obj)
+                      .filter(([k]) => !['title', 'name', 'description', 'event'].includes(k))
+                      .map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v}`)
+                      .join(' · ');
+                    return (
+                      <div key={idx} className="border-b border-slate/30 pb-2 last:border-0">
+                        <div className="text-sm text-paper font-medium">{title}</div>
+                        {details && (
+                          <div className="text-xs text-mist/60">{details}</div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          }
+          return (
+            <div key={key}>
+              <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
+              <ul className="space-y-1">
+                {value.map((item, i) => (
+                  <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
+                    <span className="text-slate mt-1 shrink-0">–</span>
+                    <span>{String(item)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          );
+        }
+
+        if (typeof value === 'object' && value !== null) {
+          const obj = value as Record<string, unknown>;
+          return (
+            <div key={key}>
+              <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
+              <div className="bg-ink/30 rounded p-2 space-y-1">
+                {Object.entries(obj).map(([k, v]) => (
+                  <div key={k} className="flex justify-between text-sm">
+                    <span className="text-mist/60 capitalize">{k.replace(/_/g, ' ')}</span>
+                    <span className="text-paper">{String(v)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        }
+
+        let displayValue = String(value);
+        if (typeof value === 'boolean') displayValue = value ? 'Yes' : 'No';
+        return (
+          <div key={key} className="flex justify-between text-sm">
+            <span className="text-mist/50 font-mono text-[10px] uppercase tracking-wider">{label}</span>
+            <span className="text-paper">{displayValue}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── NewsItemWithFundamentals (v2) ──
 function NewsItemWithFundamentals({
   item,
   isExpanded,
@@ -790,106 +985,7 @@ function NewsItemWithFundamentals({
   );
 }
 
-function EventDataView({ data }: { data: Record<string, unknown> }) {
-  const skipKeys = new Set(['news', 'recent_news', 'symbol']);
-  const entries = Object.entries(data).filter(([key]) => !skipKeys.has(key));
-
-  if (entries.length === 0) {
-    return <p className="text-sm text-mist/40 italic">No additional event data.</p>;
-  }
-
-  return (
-    <div className="space-y-3">
-      {entries.map(([key, value]) => {
-        const label = key.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
-        if (value == null) return null;
-
-        if (Array.isArray(value)) {
-          if (value.length === 0) return null;
-          if (value.every(item => typeof item === 'string')) {
-            return (
-              <div key={key}>
-                <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
-                <ul className="space-y-1">
-                  {value.map((item, i) => (
-                    <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
-                      <span className="text-slate mt-1 shrink-0">–</span>
-                      <span>{item}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            );
-          }
-          if (value.every(item => typeof item === 'object' && item !== null)) {
-            return (
-              <div key={key}>
-                <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
-                <div className="space-y-2">
-                  {value.map((item, idx) => {
-                    const obj = item as Record<string, any>;
-                    const title = obj.title || obj.name || obj.description || obj.event || 'Item';
-                    const details = Object.entries(obj)
-                      .filter(([k]) => !['title', 'name', 'description', 'event'].includes(k))
-                      .map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v}`)
-                      .join(' · ');
-                    return (
-                      <div key={idx} className="border-b border-slate/30 pb-2 last:border-0">
-                        <div className="text-sm text-paper font-medium">{title}</div>
-                        {details && (
-                          <div className="text-xs text-mist/60">{details}</div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            );
-          }
-          return (
-            <div key={key}>
-              <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
-              <ul className="space-y-1">
-                {value.map((item, i) => (
-                  <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
-                    <span className="text-slate mt-1 shrink-0">–</span>
-                    <span>{String(item)}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          );
-        }
-
-        if (typeof value === 'object' && value !== null) {
-          const obj = value as Record<string, unknown>;
-          return (
-            <div key={key}>
-              <div className="font-mono text-[10px] text-mist/50 uppercase tracking-wider mb-1">{label}</div>
-              <div className="bg-ink/30 rounded p-2 space-y-1">
-                {Object.entries(obj).map(([k, v]) => (
-                  <div key={k} className="flex justify-between text-sm">
-                    <span className="text-mist/60 capitalize">{k.replace(/_/g, ' ')}</span>
-                    <span className="text-paper">{String(v)}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          );
-        }
-
-        let displayValue = String(value);
-        if (typeof value === 'boolean') displayValue = value ? 'Yes' : 'No';
-        return (
-          <div key={key} className="flex justify-between text-sm">
-            <span className="text-mist/50 font-mono text-[10px] uppercase tracking-wider">{label}</span>
-            <span className="text-paper">{displayValue}</span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
+// ── Helper Components ──
 
 function PriceLevelBar({ close, support, resistance }: { close: number; support: number; resistance: number }) {
   const range = resistance - support;
@@ -931,21 +1027,35 @@ function ScoreBar({ label, value }: { label: string; value: number }) {
   );
 }
 
-function ReasonList({ title, items }: { title: string; items: string[] }) {
+// ReasonList with maxItems and expand (v1 style) but also accepts no maxItems
+function ReasonList({ title, items, maxItems }: { title: string; items: string[]; maxItems?: number }) {
+  const [expanded, setExpanded] = useState(false);
   const hasItems = items && items.length > 0;
+  const shouldTruncate = maxItems != null && items.length > maxItems && !expanded;
+  const visibleItems = shouldTruncate ? items.slice(0, maxItems) : items;
 
   return (
     <div className="rounded-xl border border-slate bg-graphite p-5">
       <h3 className="font-mono text-[10px] text-mist uppercase tracking-widest mb-3">{title}</h3>
       {hasItems ? (
-        <ul className="space-y-2">
-          {items.map((item, i) => (
-            <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
-              <span className="text-slate mt-1 shrink-0">–</span>
-              <span>{item}</span>
-            </li>
-          ))}
-        </ul>
+        <>
+          <ul className="space-y-2">
+            {visibleItems.map((item, i) => (
+              <li key={i} className="text-sm text-mist/80 flex gap-2 leading-relaxed">
+                <span className="text-slate mt-1 shrink-0">–</span>
+                <span>{item}</span>
+              </li>
+            ))}
+          </ul>
+          {maxItems != null && items.length > maxItems && (
+            <button
+              onClick={() => setExpanded(!expanded)}
+              className="mt-2 text-[10px] font-mono uppercase tracking-wider text-mist/40 hover:text-mist/70 transition"
+            >
+              {expanded ? "Show less" : `+${items.length - maxItems} more`}
+            </button>
+          )}
+        </>
       ) : (
         <p className="text-sm text-mist/40 italic">No specific {title.toLowerCase()} insights available</p>
       )}
@@ -962,7 +1072,7 @@ function MetricItem({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** Multi-horizon strip (Short / Mid / Long) — short is primary focus */
+// ── HorizonStrip (v2) ──
 export function HorizonStrip({ data }: { data: any }) {
   const hz = data?.horizons || {};
   const order = ["short", "mid", "long"] as const;
